@@ -19,7 +19,7 @@ import subprocess
 import tempfile
 import os
 from pathlib import Path
-from typing import Callable, Optional, List, Tuple, Dict
+from typing import Callable, Optional, List, Tuple, Dict, Any
 import logging
 from dataclasses import dataclass
 
@@ -82,7 +82,7 @@ class VideoVerticalizer:
         self, 
         frame: np.ndarray, 
         confidence: float = 0.5
-    ) -> Optional[Dict]:
+    ) -> Optional[Dict[str, Any]]:
         """
         Detect the largest person in frame and return structured data.
         
@@ -283,7 +283,7 @@ class VideoVerticalizer:
         target_size: Optional[Tuple[int, int]] = None,
         confidence: float = 0.5,
         progress_callback: Optional[Callable[[float, str], None]] = None
-    ) -> Dict[str, any]:
+    ) -> Dict[str, Any]:
         """
         Convert horizontal video to vertical format with AI tracking.
         
