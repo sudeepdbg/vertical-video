@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from verticalize import VideoVerticalizer
 import time
+from datetime import datetime
 
 st.set_page_config(
     page_title="Video Reframer",
@@ -29,6 +30,20 @@ st.markdown("""
         background-color: #d4edda;
         border: 1px solid #c3e6cb;
         color: #155724;
+    }
+    .info-box {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        background-color: #e7f3ff;
+        border: 1px solid #b3d9ff;
+        color: #004085;
+    }
+    .metric-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 1rem;
+        border-radius: 0.5rem;
+        color: white;
+        text-align: center;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -80,6 +95,8 @@ if 'uploaded_file_name' not in st.session_state:
     st.session_state.uploaded_file_name = None
 if 'processing_complete' not in st.session_state:
     st.session_state.processing_complete = False
+if 'processing_error' not in st.session_state:
+    st.session_state.processing_error = None
 
 def cleanup_temp_files():
     """Clean up temporary files."""
@@ -103,7 +120,7 @@ uploaded_file = st.file_uploader(
 if uploaded_file is not None:
     # Check file size (limit to 100MB)
     if uploaded_file.size > 100 * 1024 * 1024:
-        st.error("File size exceeds 100MB limit. Please upload a smaller video.")
+        st.error("❌ File size exceeds 100MB limit. Please upload a smaller video.")
         uploaded_file = None
     elif st.session_state.uploaded_file_name != uploaded_file.name:
         # Clean up old files
@@ -119,6 +136,7 @@ if uploaded_file is not None:
         
         st.session_state.uploaded_file_name = uploaded_file.name
         st.session_state.processing_complete = False
+        st.session_state.processing_error = None
         st.rerun()
 
 # Main content
@@ -128,19 +146,38 @@ if uploaded_file is not None and st.session_state.input_path:
     with col1:
         st.subheader("📹 Original Video (16:9)")
         st.video(uploaded_file)
-        st.caption(f"Size: {uploaded_file.size / (1024*1024):.1f} MB")
+        
+        # Show file info
+        file_size_mb = uploaded_file.size / (1024*1024)
+        st.caption(f"📁 {uploaded_file.name} • {file_size_mb:.1f} MB")
     
     # Process button
     if not st.session_state.processing_complete:
+        st.markdown("---")
+        
+        # Show settings summary
+        st.markdown(f"""
+        <div class="info-box">
+            <strong>⚙️ Processing Settings:</strong><br>
+            • Detection Interval: {sample_interval} frames<br>
+            • Confidence Threshold: {confidence}<br>
+            • Output Resolution: 1080×1920 (9:16)
+        </div>
+        """, unsafe_allow_html=True)
+        
         if st.button("🎬 Convert to Vertical", type="primary", use_container_width=True):
             progress_bar = st.progress(0)
             status_text = st.empty()
+            start_time = time.time()
             
             try:
                 # Get verticalizer
                 verticalizer = get_verticalizer()
                 
-                status_text.text("Initializing AI model...")
+                status_text.text("⏳ Initializing AI model...")
+                time.sleep(0.5)  # Small delay for UX
+                
+                status_text.text("🔍 Analyzing video and detecting subjects...")
                 
                 # Process video
                 success = verticalizer.process_video(
@@ -152,18 +189,40 @@ if uploaded_file is not None and st.session_state.input_path:
                     progress_callback=lambda p: progress_bar.progress(p)
                 )
                 
+                processing_time = time.time() - start_time
+                
                 if success and os.path.exists(st.session_state.output_path):
                     progress_bar.progress(100)
                     status_text.text("✅ Processing complete!")
+                    
+                    # Show processing stats
+                    output_size = os.path.getsize(st.session_state.output_path)
+                    st.success(f"""
+                        ✅ **Video converted successfully!**<br>
+                        ⏱️ Processing time: {processing_time:.1f} seconds<br>
+                        📦 Output size: {output_size / (1024*1024):.1f} MB
+                    """)
+                    
                     st.session_state.processing_complete = True
                     st.rerun()
                 else:
-                    raise Exception("Video processing failed")
+                    raise Exception("Video processing failed - output file not created")
                     
             except Exception as e:
-                st.error(f"❌ Error: {str(e)}")
-                status_text.text("Processing failed")
+                error_msg = str(e)
+                st.session_state.processing_error = error_msg
+                st.error(f"❌ Error: {error_msg}")
+                status_text.text("❌ Processing failed")
                 progress_bar.empty()
+                
+                # Show troubleshooting tips
+                st.markdown("""
+                **Troubleshooting tips:**
+                - Ensure the video file is not corrupted
+                - Try reducing the video resolution
+                - Check if you have enough disk space
+                - Try with a shorter video first
+                """)
     
     # Show results
     elif st.session_state.processing_complete and os.path.exists(st.session_state.output_path):
@@ -176,7 +235,9 @@ if uploaded_file is not None and st.session_state.input_path:
             st.markdown(f"""
             <div class="success-box">
                 <strong>✅ Conversion Complete!</strong><br>
-                Output size: {output_size / (1024*1024):.1f} MB
+                📦 Output size: {output_size / (1024*1024):.1f} MB<br>
+                🎬 Resolution: 1080×1920<br>
+                📱 Ready for: TikTok, Instagram Reels, YouTube Shorts
             </div>
             """, unsafe_allow_html=True)
             
@@ -191,10 +252,12 @@ if uploaded_file is not None and st.session_state.input_path:
                 )
         
         # Reset button
+        st.markdown("---")
         if st.button("🔄 Convert Another Video", use_container_width=True):
             cleanup_temp_files()
             st.session_state.uploaded_file_name = None
             st.session_state.processing_complete = False
+            st.session_state.processing_error = None
             st.rerun()
 
 else:
@@ -209,11 +272,12 @@ else:
     4. **Download** - Get your vertical video ready for Instagram Reels, TikTok, etc.
     
     ### Tips for best results:
-    - Ensure the main subject is clearly visible
-    - Avoid very fast camera movements
-    - Good lighting improves detection accuracy
+    - ✅ Ensure the main subject is clearly visible
+    - ✅ Avoid very fast camera movements
+    - ✅ Good lighting improves detection accuracy
+    - ✅ Keep videos under 2 minutes for faster processing
     """)
 
 # Footer
 st.divider()
-st.caption("Powered by YOLOv8 • Built with Streamlit")
+st.caption("Powered by YOLOv8 • Built with Streamlit • Processing happens locally on your machine")
