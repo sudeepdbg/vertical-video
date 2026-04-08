@@ -186,7 +186,7 @@ if uploaded_file is not None and st.session_state.input_path:
                     sample_interval=sample_interval,
                     target_size=(1080, 1920),
                     confidence=confidence,
-                    progress_callback=lambda p: progress_bar.progress(p)
+                    progress_callback = lambda progress, message: st.progress(progress)
                 )
                 
                 processing_time = time.time() - start_time
