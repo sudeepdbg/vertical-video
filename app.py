@@ -126,13 +126,13 @@ if uploaded_file is not None and st.session_state.uploaded_file_name != uploaded
 # Main UI
 # ---------------------------------------------------------------------------
 if uploaded_file is not None and st.session_state.input_path:
-    col1, col2 = st.columns(2)
+    col1, col2 = st.columns([3, 2])  # give original more space, vertical less
 
     with col1:
         st.subheader("Original Video (16:9)")
         st.video(uploaded_file)
 
-    # ----- Convert button -----
+    # ----- Convert button (outside columns so it spans full width) -----
     if st.button("🎬 Convert to Vertical", type="primary"):
         st.session_state.processing_done = False
 
@@ -167,8 +167,10 @@ if uploaded_file is not None and st.session_state.input_path:
     if st.session_state.processing_done:
         out_path = st.session_state.output_path
         if out_path and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            with col2:
-                st.subheader("Vertical Video (9:16)")
+            st.subheader("Vertical Video (9:16)")
+            # Constrain to ~35% width so the 9:16 video doesn't stretch horizontally
+            _, v_col, _ = st.columns([1, 2, 1])
+            with v_col:
                 st.video(out_path)
                 with open(out_path, "rb") as f:
                     st.download_button(
