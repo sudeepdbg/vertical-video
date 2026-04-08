@@ -540,7 +540,7 @@ def process_video(
             else:
                 final_clip = video_clip
             
-            # Write final output with audio
+            # Write final output with audio and faststart for streaming playback
             final_clip.write_videofile(
                 output_path,
                 codec="libx264",
@@ -548,7 +548,8 @@ def process_video(
                 fps=fps,
                 verbose=False,
                 logger=None,
-                threads=4,  # Use multiple threads for encoding
+                threads=4,
+                ffmpeg_params=['-movflags', '+faststart']   # ✅ FIX: enables streaming
             )
             
             # Cleanup clips
@@ -557,10 +558,24 @@ def process_video(
             source_clip.close()
             
         except Exception as e:
-            # If audio muxing fails, copy video-only as fallback
+            # If audio muxing fails, copy video-only output with faststart
             print(f"⚠️ Audio muxing failed ({e}), using video-only output", file=sys.stderr)
             import shutil
             shutil.copy2(temp_video_path, output_path)
+            # Re-encode with faststart (using moviepy)
+            try:
+                fallback_clip = VideoFileClip(output_path)
+                fallback_clip.write_videofile(
+                    output_path + ".temp.mp4",
+                    codec="libx264",
+                    verbose=False,
+                    logger=None,
+                    ffmpeg_params=['-movflags', '+faststart']
+                )
+                shutil.move(output_path + ".temp.mp4", output_path)
+                fallback_clip.close()
+            except Exception as ff_err:
+                print(f"⚠️ Could not add faststart to fallback output: {ff_err}", file=sys.stderr)
         
         _progress(1.0, "✅ Complete!")
         
