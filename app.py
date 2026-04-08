@@ -31,6 +31,14 @@ with st.sidebar:
     4. Download your vertical video ready for social media
     """)
 
+# Initialize session state for temp file paths
+if 'input_path' not in st.session_state:
+    st.session_state.input_path = None
+if 'output_path' not in st.session_state:
+    st.session_state.output_path = None
+if 'uploaded_file_name' not in st.session_state:
+    st.session_state.uploaded_file_name = None
+
 # File uploader
 uploaded_file = st.file_uploader(
     "Choose a video file",
@@ -38,15 +46,22 @@ uploaded_file = st.file_uploader(
     help="Upload a horizontal video (16:9) for conversion to vertical format (9:16)"
 )
 
-if uploaded_file is not None:
-    # Create temporary files
+# Reset temp files if a new file is uploaded
+if uploaded_file is not None and (st.session_state.uploaded_file_name != uploaded_file.name):
+    # Clean up old temp files if they exist
+    if st.session_state.input_path and os.path.exists(st.session_state.input_path):
+        os.unlink(st.session_state.input_path)
+    if st.session_state.output_path and os.path.exists(st.session_state.output_path):
+        os.unlink(st.session_state.output_path)
+    # Create new temp files
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_input:
         tmp_input.write(uploaded_file.getvalue())
-        input_path = tmp_input.name
-    
+        st.session_state.input_path = tmp_input.name
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_output:
-        output_path = tmp_output.name
-    
+        st.session_state.output_path = tmp_output.name
+    st.session_state.uploaded_file_name = uploaded_file.name
+
+if uploaded_file is not None and st.session_state.input_path:
     # Display uploaded video
     col1, col2 = st.columns(2)
     with col1:
@@ -60,29 +75,39 @@ if uploaded_file is not None:
             
             try:
                 # Call your processing function
-                process_video(input_path, output_path)
+                process_video(st.session_state.input_path, st.session_state.output_path)
                 
                 progress_bar.progress(100)
-                status.update(label="Processing complete!", state="success")
+                status.update(label="Processing complete!", state="complete")
                 
                 # Display result
                 with col2:
                     st.subheader("Vertical Video (9:16)")
-                    st.video(output_path)
-                    
-                    # Download button
-                    with open(output_path, 'rb') as f:
-                        st.download_button(
-                            label="📥 Download Vertical Video",
-                            data=f,
-                            file_name="vertical_video.mp4",
-                            mime="video/mp4"
-                        )
+                    # Check if output file exists and has content
+                    if os.path.exists(st.session_state.output_path) and os.path.getsize(st.session_state.output_path) > 0:
+                        st.video(st.session_state.output_path)
+                        # Download button
+                        with open(st.session_state.output_path, 'rb') as f:
+                            st.download_button(
+                                label="📥 Download Vertical Video",
+                                data=f,
+                                file_name="vertical_video.mp4",
+                                mime="video/mp4"
+                            )
+                    else:
+                        st.error("Output video file is empty or missing.")
                 
             except Exception as e:
                 st.error(f"Error processing video: {str(e)}")
                 status.update(label=f"Processing failed: {str(e)}", state="error")
-    
-    # Cleanup
-    os.unlink(input_path)
-    os.unlink(output_path)
+
+    # Optional: Add a button to clear temp files manually
+    if st.button("🗑️ Clear uploaded video"):
+        if st.session_state.input_path and os.path.exists(st.session_state.input_path):
+            os.unlink(st.session_state.input_path)
+        if st.session_state.output_path and os.path.exists(st.session_state.output_path):
+            os.unlink(st.session_state.output_path)
+        st.session_state.input_path = None
+        st.session_state.output_path = None
+        st.session_state.uploaded_file_name = None
+        st.rerun()
