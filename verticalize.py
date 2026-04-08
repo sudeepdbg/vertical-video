@@ -4,6 +4,9 @@ from ultralytics import YOLO
 from moviepy.editor import VideoFileClip
 import tempfile
 import os
+from imageio import plugins
+os.environ["IMAGEIO_FFMPEG_EXE"] = plugins.get_ffmpeg_exe()
+import os
 
 def smooth_centers(centers, window=7):
     """Apply moving average to subject center coordinates."""
