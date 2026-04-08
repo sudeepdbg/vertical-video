@@ -1,270 +1,156 @@
-import streamlit as st
+import cv2
+import mediapipe as mp
+import numpy as np
+from pathlib import Path
+import subprocess
 import tempfile
-import os
-from verticalize import process_video
 
-st.set_page_config(
-    page_title="Video Reframer",
-    page_icon="🎬",
-    layout="wide",
-)
+mp_face_detection = mp.solutions.face_detection
+mp_drawing = mp.solutions.drawing_utils
 
-# ── Light theme enforcement (no dark mode) ──────────────────────────────────
-st.markdown("""
-    <style>
-    /* Force light background throughout */
-    .stApp {
-        background-color: #ffffff;
-        color: #1f2937;
-    }
-    /* Clean card-style containers */
-    .video-card {
-        background: #f9fafb;
-        border: 1px solid #e5e7eb;
-        border-radius: 12px;
-        padding: 16px;
-        margin-bottom: 16px;
-    }
-    /* Progress bar styling */
-    .stProgress > div > div {
-        background-color: #6366f1;
-    }
-    /* Button styling */
-    .stButton > button {
-        background-color: #6366f1;
-        color: white;
-        border: none;
-        border-radius: 8px;
-        font-weight: 500;
-    }
-    .stButton > button:hover {
-        background-color: #4f46e5;
-    }
-    /* Subtle header styling */
-    h1, h2, h3 {
-        color: #111827;
-    }
-    </style>
-""", unsafe_allow_html=True)
-
-st.title("🎬 AI Video Reframer")
-st.markdown(
-    "Convert horizontal (16:9) videos to vertical (9:16) with AI-powered subject tracking"
-)
-
-# ---------------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------------
-with st.sidebar:
-    st.header("ℹ️ About")
-    st.markdown(
-        """
-        This app uses AI to detect and track subjects in your video,
-        automatically cropping to vertical format.
-
-        **Supported formats:** MP4, MOV, AVI, MKV  
-        **Max file size:** 500 MB  
-        **Best for:** Short videos under 2 minutes for optimal performance
-        """
-    )
-
-    st.header("🔄 How it works")
-    st.markdown(
-        """
-        1. Upload a horizontal video
-        2. AI detects people and tracks their movement
-        3. Video is cropped to vertical format following the subject
-        4. Download your vertical video ready for social media
-        """
-    )
-
-    st.header("⚙️ Advanced settings")
-    smooth_window = st.slider(
-        "Smoothing window (frames)",
-        min_value=3,
-        max_value=31,
-        value=15,
-        step=2,
-        help="Larger values produce steadier pans but slower reactions to movement.",
-    )
-    confidence = st.slider(
-        "Detection confidence",
-        min_value=0.1,
-        max_value=0.95,
-        value=0.5,
-        step=0.05,
-        help="Lower values detect more people but may cause false positives.",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Session state helpers
-# ---------------------------------------------------------------------------
-def _init_state():
-    defaults = {
-        "input_path": None,
-        "output_path": None,
-        "uploaded_file_name": None,
-        "processing_done": False,
-        "progress_value": 0.0,
-        "processing_status": "",
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-
-def _cleanup_temp_files():
-    for key in ("input_path", "output_path"):
-        path = st.session_state.get(key)
-        if path and os.path.exists(path):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-        st.session_state[key] = None
-
-
-_init_state()
-
-# ---------------------------------------------------------------------------
-# File uploader
-# ---------------------------------------------------------------------------
-ALLOWED_TYPES = ["mp4", "mov", "avi", "mkv"]
-MAX_FILE_MB = 500
-
-uploaded_file = st.file_uploader(
-    "📁 Choose a video file",
-    type=ALLOWED_TYPES,
-    help=f"Upload a horizontal video (16:9) for conversion to vertical format (9:16). Max {MAX_FILE_MB} MB.",
-)
-
-# Detect a new upload and (re)create temp files
-if uploaded_file is not None:
-    file_mb = len(uploaded_file.getvalue()) / (1024 ** 2)
-    if file_mb > MAX_FILE_MB:
-        st.error(f"⚠️ File is {file_mb:.1f} MB — please upload a file under {MAX_FILE_MB} MB.")
-        uploaded_file = None
-
-if uploaded_file is not None and st.session_state.uploaded_file_name != uploaded_file.name:
-    _cleanup_temp_files()
-    st.session_state.processing_done = False
-    st.session_state.progress_value = 0.0
-    st.session_state.processing_status = ""
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_in:
-        tmp_in.write(uploaded_file.getvalue())
-        st.session_state.input_path = tmp_in.name
-
-    tmp_out_fd, tmp_out_path = tempfile.mkstemp(suffix=".mp4")
-    os.close(tmp_out_fd)
-    os.unlink(tmp_out_path)
-    st.session_state.output_path = tmp_out_path
-    st.session_state.uploaded_file_name = uploaded_file.name
-
-# ---------------------------------------------------------------------------
-# Main UI
-# ---------------------------------------------------------------------------
-if uploaded_file is not None and st.session_state.input_path:
+def process_video(input_path: str, output_path: str, progress_callback=None):
+    """
+    Convert horizontal video to vertical with AI-powered face tracking.
+    """
+    cap = cv2.VideoCapture(input_path)
     
-    # ── Video preview section (always visible when file uploaded) ─────────
-    st.markdown('<div class="video-card">', unsafe_allow_html=True)
+    if not cap.isOpened():
+        raise ValueError("Could not open video file")
     
-    # Parallel playback: Original | Vertical (side-by-side)
-    col_orig, col_vert = st.columns(2)
+    # Get video properties
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    with col_orig:
-        st.markdown("##### 📺 Original Video (16:9)")
-        st.video(uploaded_file)
+    # Calculate target dimensions for 9:16 aspect ratio
+    target_height = frame_width * 16 // 9
+    target_width = frame_width
     
-    with col_vert:
-        st.markdown("##### 📱 Vertical Video (9:16)")
-        if st.session_state.processing_done and st.session_state.output_path:
-            out_path = st.session_state.output_path
-            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                st.video(out_path)
-            else:
-                st.info("⏳ Processing… vertical video will appear here")
+    # If target height is larger than original, adjust
+    if target_height > frame_height:
+        target_height = frame_height
+        target_width = frame_height * 9 // 16
+    
+    # Initialize face detection
+    face_detection = mp_face_detection.FaceDetection(
+        model_selection=1,  # Use full-range model
+        min_detection_confidence=0.5
+    )
+    
+    # Create temporary file for processed video
+    temp_output = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+    temp_path = temp_output.name
+    
+    # Video writer setup
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(temp_path, fourcc, fps, (target_width, target_height))
+    
+    frame_count = 0
+    prev_center_x = frame_width // 2  # Default center
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        frame_count += 1
+        
+        # Convert to RGB for MediaPipe
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = face_detection.process(rgb_frame)
+        
+        # Determine crop center
+        if results.detections:
+            # Use the largest face detected
+            largest_face = max(results.detections, 
+                             key=lambda d: d.location_data.relative_bounding_box.width * 
+                                          d.location_data.relative_bounding_box.height)
+            
+            bbox = largest_face.location_data.relative_bounding_box
+            face_center_x = int((bbox.xmin + bbox.width / 2) * frame_width)
+            face_center_y = int((bbox.ymin + bbox.height / 2) * frame_height)
+            
+            # Smooth the movement
+            prev_center_x = int(prev_center_x * 0.7 + face_center_x * 0.3)
+            center_x = prev_center_x
+            center_y = face_center_y
         else:
-            st.info("✨ Click 'Convert' to generate your vertical video")
+            # No face detected - use previous position or center
+            center_x = prev_center_x
+            center_y = frame_height // 2
+        
+        # Calculate crop boundaries
+        half_width = target_width // 2
+        half_height = target_height // 2
+        
+        left = max(0, center_x - half_width)
+        right = min(frame_width, center_x + half_width)
+        top = max(0, center_y - half_height)
+        bottom = min(frame_height, center_y + half_height)
+        
+        # Adjust if crop goes out of bounds
+        if right - left < target_width:
+            if left == 0:
+                right = min(frame_width, left + target_width)
+            else:
+                left = max(0, right - target_width)
+        
+        if bottom - top < target_height:
+            if top == 0:
+                bottom = min(frame_height, top + target_height)
+            else:
+                top = max(0, bottom - target_height)
+        
+        # Crop the frame
+        cropped_frame = frame[top:bottom, left:right]
+        
+        # Resize if needed
+        if cropped_frame.shape[1] != target_width or cropped_frame.shape[0] != target_height:
+            cropped_frame = cv2.resize(cropped_frame, (target_width, target_height), 
+                                       interpolation=cv2.INTER_LINEAR)
+        
+        out.write(cropped_frame)
+        
+        # Update progress
+        if progress_callback:
+            progress = (frame_count / total_frames) * 100
+            progress_callback(progress)
     
-    st.markdown('</div>', unsafe_allow_html=True)
+    # Release resources
+    cap.release()
+    out.release()
+    face_detection.close()
     
-    st.markdown("---")
-    
-    # ── Convert button & progress section ────────────────────────────────
-    if not st.session_state.processing_done:
-        if st.button("🎬 Convert to Vertical", type="primary", use_container_width=True):
-            st.session_state.processing_done = False
-            st.session_state.progress_value = 0.0
+    # Use FFmpeg to ensure proper encoding and audio preservation
+    try:
+        ffmpeg_cmd = [
+            'ffmpeg', '-y',
+            '-i', temp_path,
+            '-i', input_path,
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-movflags', '+faststart',
+            output_path
+        ]
+        
+        # Only use audio from input if it exists
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+        
+        # If FFmpeg fails, just use the OpenCV output
+        if result.returncode != 0:
+            import shutil
+            shutil.copy(temp_path, output_path)
             
-            # Progress container
-            progress_container = st.container()
-            with progress_container:
-                progress_bar = st.progress(0.0)
-                status_text = st.empty()
-                status_text.info("🔍 Initializing AI detection…")
-            
-            try:
-                def update_progress(value: float):
-                    progress_bar.progress(min(value, 1.0))
-                    st.session_state.progress_value = value
-                    if value < 0.3:
-                        status_text.info("🔍 Detecting subjects…")
-                    elif value < 0.9:
-                        status_text.info(f"🎥 Rendering frames… {int(value * 100)}%")
-                    else:
-                        status_text.info("🎵 Finalizing audio…")
-                
-                process_video(
-                    st.session_state.input_path,
-                    st.session_state.output_path,
-                    confidence=confidence,
-                    smooth_window=smooth_window,
-                    progress_callback=update_progress,
-                )
-                
-                progress_bar.progress(1.0)
-                status_text.success("✅ Conversion complete!")
-                st.session_state.processing_done = True
-                st.session_state.progress_value = 1.0
-                
-                # Auto-rerun to show the result
-                st.rerun()
-                
-            except Exception as exc:
-                status_text.error(f"❌ Error: {exc}")
-                st.error(f"Processing failed: {exc}")
+    except Exception as e:
+        # Fallback: just copy the temp file
+        import shutil
+        shutil.copy(temp_path, output_path)
+    finally:
+        # Clean up temp file
+        Path(temp_path).unlink(missing_ok=True)
     
-    # ── Download section (shown after successful processing) ─────────────
-    if st.session_state.processing_done:
-        out_path = st.session_state.output_path
-        if out_path and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            st.success("🎉 Your vertical video is ready!")
-            
-            # Download button with file info
-            file_size_mb = os.path.getsize(out_path) / (1024 ** 2)
-            st.caption(f"📦 Output size: {file_size_mb:.1f} MB")
-            
-            with open(out_path, "rb") as f:
-                st.download_button(
-                    label="📥 Download Vertical Video",
-                    data=f,
-                    file_name=f"vertical_{uploaded_file.name}",
-                    mime="video/mp4",
-                    use_container_width=True,
-                )
-    
-    # ── Clear/reset button ───────────────────────────────────────────────
-    st.markdown("---")
-    if st.button("🗑️ Clear & Start Over", type="secondary"):
-        _cleanup_temp_files()
-        st.session_state.uploaded_file_name = None
-        st.session_state.processing_done = False
-        st.session_state.progress_value = 0.0
-        st.session_state.processing_status = ""
-        st.rerun()
-
-else:
-    # ── Empty state (no file uploaded) ───────────────────────────────────
-    st.info("👆 Upload a video above to get started")
+    return True
