@@ -49,6 +49,34 @@ def detect_largest_person(frame: np.ndarray, model: YOLO, confidence: float = 0.
     return ((best[0] + best[2]) // 2, (best[1] + best[3]) // 2)
 
 
+def saliency_center(frame: np.ndarray) -> tuple[int, int]:
+    """
+    Compute a visually salient center using edge density in a sliding window.
+    Falls back to frame center if the frame is uniform (e.g. black leader).
+    Much better than raw frame center for title cards and non-person scenes.
+    """
+    h, w = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+
+    # Divide frame into a grid and find the column with most edge content
+    grid_cols = 16
+    col_w = w // grid_cols
+    col_scores = []
+    for i in range(grid_cols):
+        region = edges[:, i * col_w: (i + 1) * col_w]
+        col_scores.append(float(region.sum()))
+
+    total = sum(col_scores)
+    if total < 1e-3:
+        # Blank / uniform frame — dead center
+        return (w // 2, h // 2)
+
+    # Weighted centroid of edge activity across columns
+    weighted_x = sum((i + 0.5) * col_w * s for i, s in enumerate(col_scores)) / total
+    return (int(weighted_x), h // 2)
+
+
 # ---------------------------------------------------------------------------
 # Center smoothing / interpolation
 # ---------------------------------------------------------------------------
@@ -187,6 +215,9 @@ def process_video(
     model = _get_model(yolo_weights)
     detected_centers: list[tuple] = []
     detected_indices: list[int] = []
+    # Saliency fallback: richer per-frame visual centers for non-person scenes
+    saliency_centers_fb: list[tuple] = []
+    saliency_indices_fb: list[int] = []
 
     frame_idx = 0
     while True:
@@ -198,13 +229,21 @@ def process_video(
             if center:
                 detected_centers.append(center)
                 detected_indices.append(frame_idx)
+            else:
+                sc = saliency_center(frame)
+                saliency_centers_fb.append(sc)
+                saliency_indices_fb.append(frame_idx)
         frame_idx += 1
     cap.release()
 
     if not detected_centers:
-        # Fall back to frame centre
-        detected_centers = [(orig_w // 2, orig_h // 2)]
-        detected_indices = [0]
+        # No people found — use edge-saliency centers if available
+        if saliency_centers_fb:
+            detected_centers = saliency_centers_fb
+            detected_indices = saliency_indices_fb
+        else:
+            detected_centers = [(orig_w // 2, orig_h // 2)]
+            detected_indices = [0]
 
     # --- Phase 2: interpolate + smooth ----------------------------------------
     all_centers = interpolate_centers(detected_centers, detected_indices, total_frames)
