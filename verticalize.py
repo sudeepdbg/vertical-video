@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Callable, Optional, List, Tuple, Dict, Any
 import logging
 from dataclasses import dataclass
+import time
+import shutil
 
 logging.basicConfig(
     level=logging.INFO,
@@ -270,7 +272,6 @@ class VideoVerticalizer:
             logger.warning(f"⚠ Audio merge failed: {e}")
         
         # Fallback: copy without audio
-        import shutil
         shutil.copy2(video_path, output_path)
         logger.info("✓ Saved video without audio (fallback)")
         return False
@@ -305,8 +306,8 @@ class VideoVerticalizer:
         }
         
         cap = None
+        writer = None
         temp_video_path = None
-        import time
         start_time = time.time()
         
         try:
@@ -361,11 +362,12 @@ class VideoVerticalizer:
             frame_idx = 0
             prev_center = (orig_w // 2, orig_h // 2)
             
-            while True:
+            while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
                     break
                 
+                # Sample frames for detection
                 if frame_idx % sample_interval == 0:
                     detection = self.detect_largest_person(frame, confidence)
                     if detection:
@@ -376,94 +378,112 @@ class VideoVerticalizer:
                         prev_center = constrained
                         stats['detections_found'] += 1
                 
-                frame_idx += 1
+                # Progress update
                 if progress_callback and frame_idx % max(1, total_frames // 100) == 0:
-                    progress_callback(0.15 * (frame_idx / total_frames), "Detecting subjects...")
+                    progress = 0.1 + 0.3 * (frame_idx / total_frames)
+                    progress_callback(progress, f"Detecting: {frame_idx}/{total_frames}")
+                
+                frame_idx += 1
             
             cap.release()
-            
-            # Fallback if no detections
-            if not detected_centers:
-                logger.warning("⚠ No persons detected; using frame center")
-                detected_centers = [(orig_w // 2, orig_h // 2)]
-                detected_indices = [0]
-            
-            logger.info(f"✓ Found {len(detected_centers)} detections in {frame_idx} sampled frames")
+            logger.info(f"Phase 1 complete: {len(detected_centers)} detections in {frame_idx} frames")
             
             # ═══════════════════════════════════════════════════════
-            # PHASE 2: Interpolation + smoothing
+            # PHASE 2: Interpolate and smooth centers
             # ═══════════════════════════════════════════════════════
-            logger.info("Phase 2: Interpolating trajectory...")
+            logger.info("Phase 2: Interpolating and smoothing...")
+            if progress_callback:
+                progress_callback(0.4, "Smoothing tracking path...")
+            
+            # Interpolate missing frames
             all_centers = self.interpolate_centers(
                 detected_centers, detected_indices, total_frames
             )
-            all_centers = self.smooth_centers(all_centers)
+            
+            # Apply smoothing
+            smooth_centers = self.smooth_centers(all_centers)
+            
+            # Final constraint pass for extra stability
+            final_centers = [smooth_centers[0]]
+            for i in range(1, len(smooth_centers)):
+                constrained = self._constrain_movement(final_centers[-1], smooth_centers[i])
+                final_centers.append(constrained)
+            
+            logger.info(f"Phase 2 complete: {len(final_centers)} centers processed")
             
             # ═══════════════════════════════════════════════════════
-            # PHASE 3: Render cropped video
+            # PHASE 3: Render output video with crops
             # ═══════════════════════════════════════════════════════
-            logger.info("Phase 3: Rendering vertical video...")
+            logger.info("Phase 3: Rendering output video...")
             
-            temp_fd, temp_video_path = tempfile.mkstemp(suffix='.mp4', prefix='vertical_')
-            os.close(temp_fd)
+            # Create temp file for video without audio
+            with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+                temp_video_path = tmp.name
             
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264 for better compatibility
-            out = cv2.VideoWriter(temp_video_path, fourcc, fps, self.config.target_size)
+            # Initialize video writer
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(
+                temp_video_path, fourcc, fps, (target_w, target_h)
+            )
+            if not writer.isOpened():
+                return {'success': False, 'error': 'Failed to initialize video writer'}
             
-            if not out.isOpened():
-                raise RuntimeError("Failed to initialize VideoWriter")
-            
+            # Re-open input for second pass
             cap = cv2.VideoCapture(input_path)
-            frame_num = 0
+            frame_idx = 0
             
-            while True:
+            while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
                     break
                 
-                center_x, center_y = all_centers[frame_num]
-                left, top, right, bottom = self._calculate_crop_bounds(
-                    (center_x, center_y), orig_w, orig_h, crop_w, crop_h
+                # Get crop center for this frame
+                center = final_centers[frame_idx] if frame_idx < len(final_centers) else (orig_w // 2, orig_h // 2)
+                
+                # Calculate crop bounds
+                x1, y1, x2, y2 = self._calculate_crop_bounds(
+                    center, orig_w, orig_h, crop_w, crop_h
                 )
                 
-                # Crop → Resize → Write
-                cropped = frame[top:bottom, left:right]
-                resized = cv2.resize(
-                    cropped, 
-                    self.config.target_size, 
-                    interpolation=cv2.INTER_LANCZOS4
-                )
-                out.write(resized)
+                # Extract and resize crop
+                crop = frame[y1:y2, x1:x2]
+                if crop.shape[0] > 0 and crop.shape[1] > 0:
+                    resized = cv2.resize(crop, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+                    writer.write(resized)
+                    stats['frames_processed'] += 1
                 
-                frame_num += 1
-                stats['frames_processed'] = frame_num
+                # Progress update
+                if progress_callback and frame_idx % max(1, total_frames // 100) == 0:
+                    progress = 0.4 + 0.5 * (frame_idx / total_frames)
+                    progress_callback(progress, f"Rendering: {frame_idx}/{total_frames}")
                 
-                if progress_callback and frame_num % max(1, total_frames // 100) == 0:
-                    progress_callback(
-                        0.2 + 0.75 * (frame_num / total_frames), 
-                        f"Rendering: {frame_num}/{total_frames}"
-                    )
+                frame_idx += 1
             
             cap.release()
-            out.release()
+            writer.release()
+            logger.info(f"Phase 3 complete: {stats['frames_processed']} frames rendered")
             
             # ═══════════════════════════════════════════════════════
-            # PHASE 4: Audio merge
+            # PHASE 4: Merge audio (if present)
             # ═══════════════════════════════════════════════════════
-            logger.info("Phase 4: Merging audio...")
             if progress_callback:
-                progress_callback(0.97, "Finalizing...")
+                progress_callback(0.95, "Finalizing output...")
             
             self._add_audio_ffmpeg(temp_video_path, input_path, output_path)
             
+            # Clean up temp file
+            if os.path.exists(temp_video_path):
+                os.unlink(temp_video_path)
+            
             # Final stats
             stats['processing_time_sec'] = round(time.time() - start_time, 2)
-            stats['output_size_mb'] = round(Path(output_path).stat().st_size / 1_048_576, 2)
+            stats['output_resolution'] = f"{target_w}x{target_h}"
+            stats['source_resolution'] = f"{orig_w}x{orig_h}"
             
+            logger.info(f"✓ Processing complete in {stats['processing_time_sec']}s")
             if progress_callback:
-                progress_callback(1.0, "Complete ✓")
+                progress_callback(1.0, "Complete!")
             
-            logger.info(f"✓ Done in {stats['processing_time_sec']}s → {output_path}")
             return {
                 'success': True,
                 'output_path': output_path,
@@ -472,51 +492,122 @@ class VideoVerticalizer:
             
         except Exception as e:
             logger.error(f"✗ Processing failed: {e}", exc_info=True)
+            # Clean up on error
+            if cap and cap.isOpened():
+                cap.release()
+            if writer and writer.isOpened():
+                writer.release()
+            if temp_video_path and os.path.exists(temp_video_path):
+                os.unlink(temp_video_path)
+            
             return {
                 'success': False,
                 'error': str(e),
                 'stats': stats
             }
+    
+    def batch_process(
+        self,
+        input_paths: List[str],
+        output_dir: str,
+        **kwargs
+    ) -> List[Dict[str, Any]]:
+        """
+        Process multiple videos with the same configuration.
         
-        finally:
-            # Cleanup resources
-            if cap and cap.isOpened():
-                cap.release()
-            if temp_video_path and os.path.exists(temp_video_path):
-                try:
-                    os.unlink(temp_video_path)
-                except OSError as e:
-                    logger.warning(f"Cleanup warning: {e}")
+        Args:
+            input_paths: List of input video paths
+            output_dir: Directory for output files
+            **kwargs: Additional args passed to process_video()
+        
+        Returns:
+            List of result dicts for each video
+        """
+        results = []
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        
+        for i, input_path in enumerate(input_paths):
+            # Generate output path
+            input_name = Path(input_path).stem
+            output_path = str(Path(output_dir) / f"{input_name}_vertical.mp4")
+            
+            logger.info(f"[{i+1}/{len(input_paths)}] Processing: {input_path}")
+            
+            result = self.process_video(input_path, output_path, **kwargs)
+            result['input_path'] = input_path
+            results.append(result)
+            
+            if not result['success']:
+                logger.warning(f"Failed: {input_path} - {result.get('error', 'Unknown error')}")
+        
+        return results
 
 
-# ═══════════════════════════════════════════════════════════════════
-# CLI Entry Point (optional)
-# ═══════════════════════════════════════════════════════════════════
-if __name__ == "__main__":
+def main():
+    """CLI entry point for testing."""
     import argparse
     
-    parser = argparse.ArgumentParser(description="AI Video Verticalizer")
-    parser.add_argument("input", help="Input video path")
-    parser.add_argument("output", help="Output vertical video path")
-    parser.add_argument("-m", "--model", default="yolov8n.pt", help="YOLO model path")
-    parser.add_argument("-g", "--gpu", action="store_true", help="Use GPU if available")
-    parser.add_argument("-s", "--sample", type=int, default=15, help="Detection sample interval")
-    parser.add_argument("-c", "--confidence", type=float, default=0.5, help="Detection confidence")
+    parser = argparse.ArgumentParser(description='Convert horizontal videos to vertical format')
+    parser.add_argument('input', help='Input video path or directory')
+    parser.add_argument('-o', '--output', default='output', help='Output path or directory')
+    parser.add_argument('-m', '--model', default='yolov8n.pt', help='YOLO model path')
+    parser.add_argument('-g', '--gpu', action='store_true', help='Use GPU if available')
+    parser.add_argument('-c', '--confidence', type=float, default=0.5, help='Detection confidence (0.0-1.0)')
+    parser.add_argument('-s', '--sample', type=int, default=15, help='Detection sample interval')
+    parser.add_argument('-p', '--padding', type=float, default=0.1, help='Crop padding ratio')
     
     args = parser.parse_args()
     
-    verticalizer = VideoVerticalizer(model_path=args.model, use_gpu=args.gpu)
-    result = verticalizer.process_video(
-        input_path=args.input,
-        output_path=args.output,
-        sample_interval=args.sample,
-        confidence=args.confidence,
-        progress_callback=lambda p, m: print(f"[{p*100:5.1f}%] {m}")
+    # Initialize verticalizer
+    config = CropConfig(padding_ratio=args.padding)
+    verticalizer = VideoVerticalizer(
+        model_path=args.model,
+        use_gpu=args.gpu,
+        crop_config=config
     )
     
-    if result['success']:
-        print(f"\n✓ Success: {result['output_path']}")
-        print(f"  Stats: {result['stats']}")
+    # Handle single file or directory
+    input_path = Path(args.input)
+    if input_path.is_file():
+        # Single file
+        output_path = args.output if args.output.endswith('.mp4') else f"{args.output}/{input_path.stem}_vertical.mp4"
+        result = verticalizer.process_video(
+            str(input_path),
+            output_path,
+            sample_interval=args.sample,
+            confidence=args.confidence,
+            progress_callback=lambda p, m: print(f"[{p*100:.0f}%] {m}")
+        )
+        print(f"\nResult: {'✓ Success' if result['success'] else '✗ Failed'}")
+        if result.get('stats'):
+            print(f"Stats: {result['stats']}")
+        if not result['success'] and result.get('error'):
+            print(f"Error: {result['error']}")
     else:
-        print(f"\n✗ Failed: {result.get('error', 'Unknown error')}")
-        exit(1)
+        # Directory batch mode
+        video_files = list(input_path.glob('*.mp4')) + list(input_path.glob('*.mov'))
+        if not video_files:
+            print(f"No videos found in: {input_path}")
+            return
+        
+        print(f"Found {len(video_files)} videos. Processing...")
+        results = verticalizer.batch_process(
+            [str(f) for f in video_files],
+            args.output,
+            sample_interval=args.sample,
+            confidence=args.confidence,
+            progress_callback=lambda p, m: None  # Suppress per-video progress in batch
+        )
+        
+        # Summary
+        success_count = sum(1 for r in results if r['success'])
+        print(f"\nBatch complete: {success_count}/{len(results)} succeeded")
+        for r in results:
+            status = "✓" if r['success'] else "✗"
+            print(f"  {status} {Path(r['input_path']).name}")
+            if not r['success'] and r.get('error'):
+                print(f"     Error: {r['error'][:80]}...")
+
+
+if __name__ == '__main__':
+    main()
