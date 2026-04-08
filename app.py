@@ -1,190 +1,344 @@
-import streamlit as st
+import cv2
+import numpy as np
+from ultralytics import YOLO
+from moviepy.editor import VideoFileClip
 import tempfile
 import os
-from verticalize import process_video
-
-st.set_page_config(
-    page_title="Video Reframer",
-    page_icon="🎬",
-    layout="wide",
-)
-
-st.title("🎬 AI Video Reframer")
-st.markdown(
-    "Convert horizontal (16:9) videos to vertical (9:16) with AI-powered subject tracking"
-)
 
 # ---------------------------------------------------------------------------
-# Sidebar
+# Constants
 # ---------------------------------------------------------------------------
-with st.sidebar:
-    st.header("About")
-    st.markdown(
-        """
-        This app uses AI to detect and track subjects in your video,
-        automatically cropping to vertical format.
-
-        **Supported formats:** MP4, MOV, AVI, MKV  
-        **Max file size:** 500 MB  
-        **Best for:** Short videos under 2 minutes for optimal performance
-        """
-    )
-
-    st.header("How it works")
-    st.markdown(
-        """
-        1. Upload a horizontal video
-        2. AI detects people and tracks their movement
-        3. Video is cropped to vertical format following the subject
-        4. Download your vertical video ready for social media
-        """
-    )
-
-    st.header("Advanced settings")
-    smooth_window = st.slider(
-        "Smoothing window (frames)",
-        min_value=3,
-        max_value=31,
-        value=15,
-        step=2,
-        help="Larger values produce steadier pans but slower reactions to movement.",
-    )
-    confidence = st.slider(
-        "Detection confidence",
-        min_value=0.1,
-        max_value=0.95,
-        value=0.5,
-        step=0.05,
-        help="Lower values detect more people but may cause false positives.",
-    )
+PERSON_CLASS_ID = 0
+DEFAULT_TARGET_SIZE = (1080, 1920)   # (width, height)  →  9 : 16
+MAX_FILE_SIZE_MB = 500
 
 
 # ---------------------------------------------------------------------------
-# Session state helpers
+# Model loader (cached at module level so it is only loaded once per process)
 # ---------------------------------------------------------------------------
-def _init_state():
-    defaults = {
-        "input_path": None,
-        "output_path": None,
-        "uploaded_file_name": None,
-        "processing_done": False,
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+_model_cache: dict = {}
 
 
-def _cleanup_temp_files():
-    for key in ("input_path", "output_path"):
-        path = st.session_state.get(key)
-        if path and os.path.exists(path):
+def _get_model(weights: str = "yolov8n.pt") -> YOLO:
+    """Load YOLO model once and cache it."""
+    if weights not in _model_cache:
+        _model_cache[weights] = YOLO(weights)
+    return _model_cache[weights]
+
+
+# ---------------------------------------------------------------------------
+# Detection helpers
+# ---------------------------------------------------------------------------
+
+def detect_largest_person(frame: np.ndarray, model: YOLO, confidence: float = 0.5):
+    """Return (cx, cy) of the largest detected person, or None."""
+    results = model(frame, verbose=False)[0]
+    best, best_area = None, 0
+    for box in results.boxes:
+        if int(box.cls[0]) != PERSON_CLASS_ID:
+            continue
+        if float(box.conf[0]) < confidence:
+            continue
+        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+        area = (x2 - x1) * (y2 - y1)
+        if area > best_area:
+            best_area = area
+            best = (x1, y1, x2, y2)
+    if best is None:
+        return None
+    return ((best[0] + best[2]) // 2, (best[1] + best[3]) // 2)
+
+
+def saliency_center(frame: np.ndarray) -> tuple[int, int]:
+    """
+    Find the center of the bounding box enclosing ALL visible content.
+
+    Strategy:
+      1. Threshold the frame to isolate bright content on dark backgrounds
+         (titles, credits) OR dark content on bright backgrounds.
+      2. Find the leftmost and rightmost columns that contain any content.
+      3. Return the midpoint of that span — not a weighted centroid, which
+         drifts toward whichever side has *more* pixels and causes the crop
+         to cut off the opposite side (the Sintel credits bug).
+
+    Falls back to frame center for blank/uniform frames (black leader etc.).
+    """
+    h, w = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Capture both light-on-dark text and dark-on-light text
+    _, bright = cv2.threshold(gray, 30, 255, cv2.THRESH_BINARY)
+    _, dark   = cv2.threshold(gray, 225, 255, cv2.THRESH_BINARY_INV)
+    mask = cv2.bitwise_or(bright, dark)
+
+    # Morphological close: join nearby glyphs into contiguous blobs
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    # Ignore a 5 % border on each side (vignette / safe-area artefacts)
+    border = int(w * 0.05)
+    mask[:, :border] = 0
+    mask[:, w - border:] = 0
+
+    col_proj = np.count_nonzero(mask, axis=0)
+    if col_proj.max() < 1:
+        return (w // 2, h // 2)   # blank frame — dead center
+
+    # Bounding-box midpoint: equidistant from leftmost and rightmost content
+    nonzero_cols = np.where(col_proj > 0)[0]
+    cx = int((int(nonzero_cols[0]) + int(nonzero_cols[-1])) // 2)
+
+    row_proj = np.count_nonzero(mask, axis=1)
+    nonzero_rows = np.where(row_proj > 0)[0]
+    cy = int((int(nonzero_rows[0]) + int(nonzero_rows[-1])) // 2) if len(nonzero_rows) else h // 2
+
+    return (cx, cy)
+
+
+# ---------------------------------------------------------------------------
+# Center smoothing / interpolation
+# ---------------------------------------------------------------------------
+
+def smooth_centers(centers: list[tuple], window: int = 7) -> list[tuple]:
+    """Gaussian-weighted moving average to reduce jitter."""
+    if not centers:
+        return []
+    n = len(centers)
+    xs = np.array([c[0] for c in centers], dtype=float)
+    ys = np.array([c[1] for c in centers], dtype=float)
+
+    # Build a 1-D Gaussian kernel
+    half = window // 2
+    k = np.exp(-0.5 * (np.arange(-half, half + 1) / (half / 2 + 1e-6)) ** 2)
+    k /= k.sum()
+
+    # Reflect-pad and convolve
+    xs_s = np.convolve(np.pad(xs, half, mode="reflect"), k, mode="valid")
+    ys_s = np.convolve(np.pad(ys, half, mode="reflect"), k, mode="valid")
+
+    return [(int(x), int(y)) for x, y in zip(xs_s, ys_s)]
+
+
+def interpolate_centers(
+    detected_centers: list[tuple],
+    detected_indices: list[int],
+    total_frames: int,
+) -> list[tuple]:
+    """Linearly interpolate subject centers for frames without a detection."""
+    if not detected_centers:
+        return [(0, 0)] * total_frames
+
+    all_centers: list[tuple] = []
+    di = detected_indices
+    dc = detected_centers
+
+    for i in range(total_frames):
+        if i <= di[0]:
+            all_centers.append(dc[0])
+            continue
+        if i >= di[-1]:
+            all_centers.append(dc[-1])
+            continue
+        # Binary-search for the surrounding pair
+        lo, hi = 0, len(di) - 1
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if di[mid] <= i:
+                lo = mid
+            else:
+                hi = mid
+        t = (i - di[lo]) / max(di[hi] - di[lo], 1)
+        cx = int(dc[lo][0] + t * (dc[hi][0] - dc[lo][0]))
+        cy = int(dc[lo][1] + t * (dc[hi][1] - dc[lo][1]))
+        all_centers.append((cx, cy))
+
+    return all_centers
+
+
+# ---------------------------------------------------------------------------
+# Crop geometry
+# ---------------------------------------------------------------------------
+
+def _crop_geometry(orig_w: int, orig_h: int, target_w: int, target_h: int):
+    """
+    Return (crop_w, crop_h) that fits inside the original frame
+    while matching target_w / target_h aspect ratio.
+    """
+    target_ratio = target_w / target_h   # e.g. 1080/1920 ≈ 0.5625  (portrait)
+    crop_h = orig_h
+    crop_w = int(round(crop_h * target_ratio))
+    if crop_w > orig_w:
+        crop_w = orig_w
+        crop_h = int(round(crop_w / target_ratio))
+    return crop_w, crop_h
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def process_video(
+    input_path: str,
+    output_path: str,
+    sample_interval: int | None = None,
+    target_size: tuple[int, int] = DEFAULT_TARGET_SIZE,
+    confidence: float = 0.5,
+    smooth_window: int = 15,
+    yolo_weights: str = "yolov8n.pt",
+    progress_callback=None,
+) -> None:
+    """
+    Convert a landscape video to vertical format using AI subject tracking.
+
+    Parameters
+    ----------
+    input_path      : Path to the source video.
+    output_path     : Path for the converted output video.
+    sample_interval : Detect subjects every N frames. Defaults to fps/2 (2 detections/sec).
+    target_size     : Output (width, height). Default is 1080×1920.
+    confidence      : YOLO detection confidence threshold.
+    smooth_window   : Temporal smoothing radius in frames.
+    yolo_weights    : YOLO model weights file.
+    progress_callback : Optional callable(float) receiving 0.0–1.0 progress.
+    """
+    # --- Validate input -------------------------------------------------------
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+    file_mb = os.path.getsize(input_path) / (1024 ** 2)
+    if file_mb > MAX_FILE_SIZE_MB:
+        raise ValueError(f"File size {file_mb:.1f} MB exceeds {MAX_FILE_SIZE_MB} MB limit.")
+
+    # --- Open video -----------------------------------------------------------
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {input_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    if total_frames <= 0:
+        cap.release()
+        raise ValueError("Could not determine frame count — the file may be corrupt.")
+
+    if sample_interval is None:
+        # ~2 detections per second, minimum every frame for very short clips
+        sample_interval = max(1, int(fps / 2))
+
+    target_w, target_h = target_size
+    crop_w, crop_h = _crop_geometry(orig_w, orig_h, target_w, target_h)
+
+    # --- Phase 1: subject detection on sampled frames -------------------------
+    model = _get_model(yolo_weights)
+    detected_centers: list[tuple] = []
+    detected_indices: list[int] = []
+    # Saliency fallback: richer per-frame visual centers for non-person scenes
+    saliency_centers_fb: list[tuple] = []
+    saliency_indices_fb: list[int] = []
+
+    frame_idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_idx % sample_interval == 0:
+            center = detect_largest_person(frame, model, confidence)
+            if center:
+                detected_centers.append(center)
+                detected_indices.append(frame_idx)
+            else:
+                sc = saliency_center(frame)
+                saliency_centers_fb.append(sc)
+                saliency_indices_fb.append(frame_idx)
+        frame_idx += 1
+    cap.release()
+
+    if not detected_centers:
+        # No people found — use edge-saliency centers if available
+        if saliency_centers_fb:
+            detected_centers = saliency_centers_fb
+            detected_indices = saliency_indices_fb
+        else:
+            detected_centers = [(orig_w // 2, orig_h // 2)]
+            detected_indices = [0]
+
+    # --- Phase 2: interpolate + smooth ----------------------------------------
+    all_centers = interpolate_centers(detected_centers, detected_indices, total_frames)
+    all_centers = smooth_centers(all_centers, window=smooth_window)
+
+    # Ensure list is exactly total_frames long (guard against edge cases)
+    if len(all_centers) < total_frames:
+        all_centers += [all_centers[-1]] * (total_frames - len(all_centers))
+
+    # --- Phase 3: render cropped frames to temp file --------------------------
+    temp_video_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            temp_video_path = tmp.name
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out = cv2.VideoWriter(temp_video_path, fourcc, fps, (target_w, target_h))
+
+        cap = cv2.VideoCapture(input_path)
+        frame_num = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            cx, cy = all_centers[frame_num]
+            left = cx - crop_w // 2
+            top = cy - crop_h // 2
+            # Clamp to frame bounds
+            left = max(0, min(left, orig_w - crop_w))
+            top = max(0, min(top, orig_h - crop_h))
+
+            cropped = frame[top: top + crop_h, left: left + crop_w]
+            resized = cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+            out.write(resized)
+
+            frame_num += 1
+            if progress_callback:
+                # Reserve last 10 % for audio mux
+                progress_callback(min(frame_num / total_frames * 0.9, 0.9))
+
+        cap.release()
+        out.release()
+
+        # --- Phase 4: mux audio -----------------------------------------------
+        video_clip = VideoFileClip(temp_video_path)
+        source_clip = VideoFileClip(input_path)
+        audio = source_clip.audio
+
+        if audio is not None:
+            # Trim audio to match video length (prevents mismatch crashes)
+            audio = audio.subclip(0, min(audio.duration, video_clip.duration))
+            final_clip = video_clip.set_audio(audio)
+        else:
+            final_clip = video_clip
+
+        final_clip.write_videofile(
+            output_path,
+            codec="libx264",
+            audio_codec="aac",
+            verbose=False,
+            logger=None,
+        )
+
+        final_clip.close()
+        video_clip.close()
+        source_clip.close()
+
+        if progress_callback:
+            progress_callback(1.0)
+
+        print(f"✅ Saved to {output_path}")
+
+    finally:
+        # Always clean up the temp file even if an error occurred
+        if temp_video_path and os.path.exists(temp_video_path):
             try:
-                os.unlink(path)
+                os.unlink(temp_video_path)
             except OSError:
                 pass
-        st.session_state[key] = None
-
-
-_init_state()
-
-# ---------------------------------------------------------------------------
-# File uploader
-# ---------------------------------------------------------------------------
-ALLOWED_TYPES = ["mp4", "mov", "avi", "mkv"]
-MAX_FILE_MB = 500
-
-uploaded_file = st.file_uploader(
-    "Choose a video file",
-    type=ALLOWED_TYPES,
-    help=f"Upload a horizontal video (16:9) for conversion to vertical format (9:16). Max {MAX_FILE_MB} MB.",
-)
-
-# Detect a new upload and (re)create temp files
-if uploaded_file is not None:
-    file_mb = len(uploaded_file.getvalue()) / (1024 ** 2)
-    if file_mb > MAX_FILE_MB:
-        st.error(f"File is {file_mb:.1f} MB — please upload a file under {MAX_FILE_MB} MB.")
-        uploaded_file = None
-
-if uploaded_file is not None and st.session_state.uploaded_file_name != uploaded_file.name:
-    _cleanup_temp_files()
-    st.session_state.processing_done = False
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_in:
-        tmp_in.write(uploaded_file.getvalue())
-        st.session_state.input_path = tmp_in.name
-
-    # Only create the output path; do NOT pre-create the file so moviepy can write freely
-    tmp_out_fd, tmp_out_path = tempfile.mkstemp(suffix=".mp4")
-    os.close(tmp_out_fd)
-    os.unlink(tmp_out_path)          # Remove the empty file; moviepy will create it
-    st.session_state.output_path = tmp_out_path
-
-    st.session_state.uploaded_file_name = uploaded_file.name
-
-# ---------------------------------------------------------------------------
-# Main UI
-# ---------------------------------------------------------------------------
-if uploaded_file is not None and st.session_state.input_path:
-    col1, col2 = st.columns([3, 2])  # give original more space, vertical less
-
-    with col1:
-        st.subheader("Original Video (16:9)")
-        st.video(uploaded_file)
-
-    # ----- Convert button (outside columns so it spans full width) -----
-    if st.button("🎬 Convert to Vertical", type="primary"):
-        st.session_state.processing_done = False
-
-        with st.status("Processing video…", expanded=True) as status:
-            st.write("🔍 Detecting subjects…")
-            progress_bar = st.progress(0.0)
-
-            def update_progress(value: float):
-                progress_bar.progress(value)
-                if value < 0.9:
-                    status.update(label=f"🎥 Rendering frames… {value*100:.0f}%")
-                else:
-                    status.update(label="🎵 Muxing audio…")
-
-            try:
-                process_video(
-                    st.session_state.input_path,
-                    st.session_state.output_path,
-                    confidence=confidence,
-                    smooth_window=smooth_window,
-                    progress_callback=update_progress,
-                )
-                progress_bar.progress(1.0)
-                status.update(label="✅ Processing complete!", state="complete")
-                st.session_state.processing_done = True
-
-            except Exception as exc:
-                status.update(label=f"❌ Processing failed: {exc}", state="error")
-                st.error(f"Error: {exc}")
-
-    # ----- Show result (persists after button click) -----
-    if st.session_state.processing_done:
-        out_path = st.session_state.output_path
-        if out_path and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            st.subheader("Vertical Video (9:16)")
-            # Constrain to ~35% width so the 9:16 video doesn't stretch horizontally
-            _, v_col, _ = st.columns([1, 2, 1])
-            with v_col:
-                st.video(out_path)
-                with open(out_path, "rb") as f:
-                    st.download_button(
-                        label="📥 Download Vertical Video",
-                        data=f,
-                        file_name="vertical_video.mp4",
-                        mime="video/mp4",
-                    )
-        else:
-            st.error("Output video file is empty or missing — please try again.")
-
-    # ----- Clear button -----
-    if st.button("🗑️ Clear uploaded video"):
-        _cleanup_temp_files()
-        st.session_state.uploaded_file_name = None
-        st.session_state.processing_done = False
-        st.rerun()
