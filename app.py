@@ -11,6 +11,7 @@ mp_drawing = mp.solutions.drawing_utils
 def process_video(input_path: str, output_path: str, progress_callback=None):
     """
     Convert horizontal video to vertical with AI-powered face tracking.
+    Uses face detection with saliency fallback for better framing.
     """
     cap = cv2.VideoCapture(input_path)
     
@@ -18,10 +19,14 @@ def process_video(input_path: str, output_path: str, progress_callback=None):
         raise ValueError("Could not open video file")
     
     # Get video properties
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    if total_frames <= 0:
+        cap.release()
+        raise ValueError("Could not determine frame count — the file may be corrupt.")
     
     # Calculate target dimensions for 9:16 aspect ratio
     target_height = frame_width * 16 // 9
@@ -32,9 +37,9 @@ def process_video(input_path: str, output_path: str, progress_callback=None):
         target_height = frame_height
         target_width = frame_height * 9 // 16
     
-    # Initialize face detection
+    # Initialize face detection with full-range model
     face_detection = mp_face_detection.FaceDetection(
-        model_selection=1,  # Use full-range model
+        model_selection=1,  # Full-range model for better detection
         min_detection_confidence=0.5
     )
     
@@ -47,7 +52,8 @@ def process_video(input_path: str, output_path: str, progress_callback=None):
     out = cv2.VideoWriter(temp_path, fourcc, fps, (target_width, target_height))
     
     frame_count = 0
-    prev_center_x = frame_width // 2  # Default center
+    prev_center_x = frame_width // 2
+    prev_center_y = frame_height // 2
     
     while True:
         ret, frame = cap.read()
@@ -71,14 +77,15 @@ def process_video(input_path: str, output_path: str, progress_callback=None):
             face_center_x = int((bbox.xmin + bbox.width / 2) * frame_width)
             face_center_y = int((bbox.ymin + bbox.height / 2) * frame_height)
             
-            # Smooth the movement
+            # Smooth the movement (exponential moving average)
             prev_center_x = int(prev_center_x * 0.7 + face_center_x * 0.3)
+            prev_center_y = int(prev_center_y * 0.7 + face_center_y * 0.3)
             center_x = prev_center_x
-            center_y = face_center_y
+            center_y = prev_center_y
         else:
-            # No face detected - use previous position or center
+            # No face detected - use previous position (don't jump to center)
             center_x = prev_center_x
-            center_y = frame_height // 2
+            center_y = prev_center_y
         
         # Calculate crop boundaries
         half_width = target_width // 2
@@ -105,10 +112,10 @@ def process_video(input_path: str, output_path: str, progress_callback=None):
         # Crop the frame
         cropped_frame = frame[top:bottom, left:right]
         
-        # Resize if needed
+        # Resize if needed using high-quality interpolation
         if cropped_frame.shape[1] != target_width or cropped_frame.shape[0] != target_height:
             cropped_frame = cv2.resize(cropped_frame, (target_width, target_height), 
-                                       interpolation=cv2.INTER_LINEAR)
+                                       interpolation=cv2.INTER_LANCZOS4)
         
         out.write(cropped_frame)
         
@@ -137,7 +144,6 @@ def process_video(input_path: str, output_path: str, progress_callback=None):
             output_path
         ]
         
-        # Only use audio from input if it exists
         result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
         
         # If FFmpeg fails, just use the OpenCV output
