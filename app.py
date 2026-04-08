@@ -206,15 +206,20 @@ if uploaded_file is not None and st.session_state.input_path:
                 status_text.info("🔍 Initializing AI detection…")
             
             try:
-                def update_progress(value: float):
-                    progress_bar.progress(min(value, 1.0))
-                    st.session_state.progress_value = value
-                    if value < 0.3:
-                        status_text.info("🔍 Detecting subjects…")
-                    elif value < 0.9:
-                        status_text.info(f"🎥 Rendering frames… {int(value * 100)}%")
+                # ✅ FIXED: Callback now accepts two arguments (progress, message)
+                def update_progress(progress: float, message: str = ""):
+                    progress_bar.progress(min(progress, 1.0))
+                    st.session_state.progress_value = progress
+                    if message:
+                        status_text.info(message)
                     else:
-                        status_text.info("🎵 Finalizing audio…")
+                        # default messages based on progress
+                        if progress < 0.3:
+                            status_text.info("🔍 Detecting subjects…")
+                        elif progress < 0.9:
+                            status_text.info(f"🎥 Rendering frames… {int(progress * 100)}%")
+                        else:
+                            status_text.info("🎵 Finalizing audio…")
                 
                 process_video(
                     st.session_state.input_path,
