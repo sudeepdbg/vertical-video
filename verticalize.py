@@ -4,9 +4,6 @@ from ultralytics import YOLO
 from moviepy.editor import VideoFileClip
 import tempfile
 import os
-from imageio import plugins
-os.environ["IMAGEIO_FFMPEG_EXE"] = plugins.get_ffmpeg_exe()
-import os
 
 def smooth_centers(centers, window=7):
     """Apply moving average to subject center coordinates."""
@@ -33,7 +30,6 @@ def detect_largest_person(frame, model, confidence=0.5):
                 persons.append((x1, y1, x2, y2))
     if not persons:
         return None
-    # choose largest bounding box area
     largest = max(persons, key=lambda b: (b[2]-b[0])*(b[3]-b[1]))
     center_x = (largest[0] + largest[2]) // 2
     center_y = (largest[1] + largest[3]) // 2
@@ -42,7 +38,7 @@ def detect_largest_person(frame, model, confidence=0.5):
 def interpolate_centers(detected_centers, detected_indices, total_frames):
     """Linearly interpolate centers for frames without detection."""
     if not detected_centers:
-        return [(0,0)] * total_frames  # fallback, will be overridden
+        return [(0,0)] * total_frames
     all_centers = []
     for i in range(total_frames):
         if i <= detected_indices[0]:
@@ -60,16 +56,6 @@ def interpolate_centers(detected_centers, detected_indices, total_frames):
     return all_centers
 
 def process_video(input_path, output_path, sample_interval=15, target_size=(1080, 1920), progress_callback=None):
-    """
-    Convert horizontal video to vertical (9:16) with subject tracking.
-    
-    Args:
-        input_path: path to input video file
-        output_path: path to save output video
-        sample_interval: run detection every N frames
-        target_size: (width, height) of output vertical video
-        progress_callback: function(progress) where progress is float 0..1
-    """
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {input_path}")
@@ -79,10 +65,9 @@ def process_video(input_path, output_path, sample_interval=15, target_size=(1080
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    # Load YOLO model (nano version for speed)
     model = YOLO('yolov8n.pt')
     
-    # ---- Step 1: detect subject centers on sampled frames ----
+    # Detect subject centers on sampled frames
     detected_centers = []
     detected_indices = []
     frame_idx = 0
@@ -98,30 +83,22 @@ def process_video(input_path, output_path, sample_interval=15, target_size=(1080
         frame_idx += 1
     cap.release()
     
-    # Fallback: if no person ever detected, use frame center
     if not detected_centers:
         frame_center = (orig_w // 2, orig_h // 2)
         detected_centers = [frame_center]
         detected_indices = [0]
     
-    # Interpolate for all frames
     all_centers = interpolate_centers(detected_centers, detected_indices, total_frames)
-    # Smooth the trajectory
     all_centers = smooth_centers(all_centers, window=7)
     
-    # ---- Step 2: crop and write vertical video ----
-    # Determine crop dimensions (9:16 aspect ratio within original frame)
-    target_aspect = target_size[0] / target_size[1]  # 9/16 = 0.5625
-    # We want to crop a region from original that has the same aspect ratio
-    # Keep the full original height, compute width = height * target_aspect
+    # Crop dimensions (9:16 aspect ratio)
+    target_aspect = target_size[0] / target_size[1]
     crop_h = orig_h
     crop_w = int(crop_h * target_aspect)
     if crop_w > orig_w:
-        # If that width exceeds original, reduce crop_h
         crop_w = orig_w
         crop_h = int(crop_w / target_aspect)
     
-    # Prepare video writer (temporary file before adding audio)
     temp_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
     temp_video_path = temp_video.name
     temp_video.close()
@@ -135,28 +112,22 @@ def process_video(input_path, output_path, sample_interval=15, target_size=(1080
         if not ret:
             break
         center_x, center_y = all_centers[frame_num]
-        
-        # Compute crop rectangle (centered on subject)
         left = center_x - crop_w // 2
         top = center_y - crop_h // 2
-        # Clamp to frame boundaries
         left = max(0, min(left, orig_w - crop_w))
         top = max(0, min(top, orig_h - crop_h))
         right = left + crop_w
         bottom = top + crop_h
-        
         cropped = frame[top:bottom, left:right]
-        # Resize to target resolution
         resized = cv2.resize(cropped, target_size, interpolation=cv2.INTER_LANCZOS4)
         out.write(resized)
-        
         frame_num += 1
         if progress_callback:
             progress_callback(frame_num / total_frames)
     cap.release()
     out.release()
     
-    # ---- Step 3: add original audio ----
+    # Add audio
     video_clip = VideoFileClip(temp_video_path)
     audio_clip = VideoFileClip(input_path).audio
     if audio_clip:
@@ -165,8 +136,5 @@ def process_video(input_path, output_path, sample_interval=15, target_size=(1080
         final_clip = video_clip
     final_clip.write_videofile(output_path, codec='libx264', audio_codec='aac', verbose=False, logger=None)
     final_clip.close()
-    
-    # Clean up
     os.unlink(temp_video_path)
-    
-    print(f"✅ Processing complete. Saved to {output_path}")
+    print(f"✅ Saved to {output_path}")
