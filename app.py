@@ -888,15 +888,16 @@ if uploaded_file is not None and st.session_state.input_path:
                         st.rerun()
                 with size_col:
                     if info and st.session_state.output_bytes:
-                        in_mb  = len(uploaded_file.getvalue()) / (1024 ** 2)
-                        out_mb = len(st.session_state.output_bytes) / (1024 ** 2)
-                        delta  = out_mb - in_mb
+                        in_mb      = len(uploaded_file.getvalue()) / (1024 ** 2)
+                        out_mb     = len(st.session_state.output_bytes) / (1024 ** 2)
+                        delta      = out_mb - in_mb
+                        delta_color = "#6aab3a" if delta < 0 else "#9a5a2a"
                         st.markdown(
                             f"<p style='color:#3a3a3a;font-size:12px;"
                             f"text-align:right;margin-top:14px;"
                             f"font-family:Space Grotesk,sans-serif'>"
                             f"Size: {out_mb:.1f} MB  "
-                            f"<span style='color:{\"#6aab3a\" if delta<0 else \"#9a5a2a\"}'>"
+                            f"<span style='color:{delta_color}'>"
                             f"({delta:+.1f} MB)</span></p>",
                             unsafe_allow_html=True,
                         )
