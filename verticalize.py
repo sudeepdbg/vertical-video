@@ -63,6 +63,9 @@ def _ffmpeg_mux_audio_and_encode(
     output_path: str,
     fps: float,
     duration_seconds: float,
+    crf: int = 23,
+    encoder_preset: str = "fast",
+    audio_bitrate: str = "128k",
 ) -> None:
     """
     Single FFmpeg call:
@@ -76,17 +79,17 @@ def _ffmpeg_mux_audio_and_encode(
         "-i", video_only_path,
         "-i", source_audio_path,
         "-map", "0:v:0",
-        "-map", "1:a:0?",           # optional audio — won't fail if absent
+        "-map", "1:a:0?",
         "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
+        "-preset", encoder_preset,
+        "-crf", str(crf),
         "-profile:v", "baseline",
         "-level",   "3.1",
         "-pix_fmt", "yuv420p",
         "-r",       str(fps),
         "-t",       str(duration_seconds),
         "-c:a",     "aac",
-        "-b:a",     "128k",
+        "-b:a",     audio_bitrate,
         "-ac",      "2",
         "-movflags", "+faststart",
         output_path,
@@ -101,14 +104,16 @@ def _ffmpeg_encode_video_only(
     video_only_path: str,
     output_path: str,
     fps: float,
+    crf: int = 23,
+    encoder_preset: str = "fast",
 ) -> None:
     cmd = [
         "ffmpeg", "-y",
         "-i", video_only_path,
         "-map", "0:v:0",
         "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
+        "-preset", encoder_preset,
+        "-crf", str(crf),
         "-profile:v", "baseline",
         "-level",   "3.1",
         "-pix_fmt", "yuv420p",
@@ -462,6 +467,10 @@ def process_video(
     use_optical_flow: bool = True,
     rule_of_thirds: bool = True,
     scene_cut_threshold: float = 0.35,
+    output_fps: Optional[float] = None,       # None = keep source fps
+    crf: int = 23,                             # H.264 quality: 0=lossless, 51=worst
+    encoder_preset: str = "fast",             # ultrafast/fast/medium/slow
+    audio_bitrate: str = "128k",              # AAC audio bitrate
     progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> None:
 
@@ -493,6 +502,9 @@ def process_video(
 
     if not sample_interval:
         sample_interval = max(1, int(fps / 2))
+
+    # Determine output frame rate
+    render_fps = float(output_fps) if output_fps and output_fps > 0 else fps
 
     target_w, target_h = target_size
     crop_w, crop_h = calculate_crop_dimensions(orig_w, orig_h, target_w, target_h)
@@ -609,7 +621,7 @@ def process_video(
 
         # Use MJPG for intermediate — avoids mp4v container fragility
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        writer = cv2.VideoWriter(temp_video, fourcc, fps, (target_w, target_h))
+        writer = cv2.VideoWriter(temp_video, fourcc, render_fps, (target_w, target_h))
         if not writer.isOpened():
             raise ProcessingError("Failed to initialise video encoder.")
 
@@ -641,10 +653,16 @@ def process_video(
 
         if _ffmpeg_has_audio(input_path):
             _ffmpeg_mux_audio_and_encode(
-                temp_video, input_path, temp_final, fps, duration_sec
+                temp_video, input_path, temp_final,
+                render_fps, duration_sec,
+                crf=crf, encoder_preset=encoder_preset,
+                audio_bitrate=audio_bitrate,
             )
         else:
-            _ffmpeg_encode_video_only(temp_video, temp_final, fps)
+            _ffmpeg_encode_video_only(
+                temp_video, temp_final, render_fps,
+                crf=crf, encoder_preset=encoder_preset,
+            )
 
         if not os.path.exists(temp_final) or os.path.getsize(temp_final) < 1000:
             raise ProcessingError("FFmpeg produced an empty output file.")
