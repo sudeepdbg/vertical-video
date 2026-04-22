@@ -3,10 +3,11 @@ verticalize.py
 ──────────────
 Convert landscape video to vertical format using AI subject tracking.
 
-Dependencies: opencv-python, ultralytics, numpy  (NO moviepy)
+Dependencies: opencv-python, ultralytics, numpy
 Audio muxing:  FFmpeg subprocess only
 """
 
+import bisect
 import cv2
 import numpy as np
 from ultralytics import YOLO
@@ -26,11 +27,12 @@ class ProcessingError(Exception):
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-PERSON_CLASS_ID   = 0
-HIGH_PRIO_CLASSES = {0, 2, 3, 5, 7, 15, 16}   # person, car, motorbike, bus, truck, cat, dog
-DEFAULT_TARGET_SIZE = (1080, 1920)
-MAX_FILE_SIZE_MB    = 500
+PERSON_CLASS_ID    = 0
+HIGH_PRIO_CLASSES  = {0, 2, 3, 5, 7, 15, 16}   # person, car, motorbike, bus, truck, cat, dog
+DEFAULT_TARGET_SIZE: Tuple[int, int] = (1080, 1920)
+MAX_FILE_SIZE_MB   = 500
 MIN_FRAME_DIMENSION = 240
+MAX_FRAMES_GUARD   = 216_000  # 1 hour @ 60 fps safety cap
 
 RESOLUTION_PRESETS: Dict[str, Tuple[int, int]] = {
     "1080p  (1080×1920 — Full HD)":  (1080, 1920),
@@ -43,13 +45,16 @@ RESOLUTION_PRESETS: Dict[str, Tuple[int, int]] = {
 # FFmpeg helpers
 # ---------------------------------------------------------------------------
 def _check_ffmpeg() -> None:
-    try:
-        subprocess.run(["ffmpeg", "-version"], check=True,
-                       capture_output=True, text=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        raise ProcessingError(
-            "FFmpeg not found. Please install FFmpeg and ensure it is on your PATH."
-        )
+    """Verify both ffmpeg and ffprobe are on PATH."""
+    for tool in ("ffmpeg", "ffprobe"):
+        try:
+            subprocess.run([tool, "-version"], check=True,
+                           capture_output=True, text=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            raise ProcessingError(
+                f"{tool} not found. Please install FFmpeg (includes ffprobe) "
+                "and ensure it is on your PATH."
+            )
 
 
 def _ffmpeg_mux_audio_and_encode(
@@ -61,7 +66,7 @@ def _ffmpeg_mux_audio_and_encode(
 ) -> None:
     """
     Single FFmpeg call:
-      - Takes rendered video + original audio source
+      - Renders video + original audio
       - Encodes to H.264 baseline + AAC
       - Trims to exact video duration
       - Writes moov atom first (faststart) for browser streaming
@@ -71,8 +76,10 @@ def _ffmpeg_mux_audio_and_encode(
         "-i", video_only_path,
         "-i", source_audio_path,
         "-map", "0:v:0",
-        "-map", "1:a:0?",          # optional audio — won't fail if absent
+        "-map", "1:a:0?",           # optional audio — won't fail if absent
         "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "23",
         "-profile:v", "baseline",
         "-level",   "3.1",
         "-pix_fmt", "yuv420p",
@@ -95,12 +102,13 @@ def _ffmpeg_encode_video_only(
     output_path: str,
     fps: float,
 ) -> None:
-    """Encode video-only to browser-compatible H.264."""
     cmd = [
         "ffmpeg", "-y",
         "-i", video_only_path,
         "-map", "0:v:0",
         "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "23",
         "-profile:v", "baseline",
         "-level",   "3.1",
         "-pix_fmt", "yuv420p",
@@ -124,7 +132,7 @@ def _ffmpeg_has_audio(path: str) -> bool:
         path,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         return "audio" in result.stdout
     except Exception:
         return False
@@ -145,7 +153,7 @@ def get_video_info(path: str) -> Dict[str, Any]:
     duration = total_frames / fps if fps > 0 else 0.0
     return {
         "fps": fps,
-        "total_frames": total_frames,
+        "total_frames": min(total_frames, MAX_FRAMES_GUARD),
         "width": w,
         "height": h,
         "duration_seconds": duration,
@@ -169,7 +177,7 @@ def extract_thumbnail(path: str, time_seconds: float = 1.0) -> Optional[bytes]:
 
 
 # ---------------------------------------------------------------------------
-# Model loader
+# Model loader — returns a plain YOLO; caller should use @st.cache_resource
 # ---------------------------------------------------------------------------
 _model_cache: Dict[str, YOLO] = {}
 
@@ -204,9 +212,9 @@ def detect_subject_center(
     if results.boxes is None or len(results.boxes) == 0:
         return None
 
-    person_pool:  List[Tuple[float, int, int]] = []
-    hiprio_pool:  List[Tuple[float, int, int]] = []
-    all_pool:     List[Tuple[float, int, int]] = []
+    person_pool: List[Tuple[float, int, int]] = []
+    hiprio_pool: List[Tuple[float, int, int]] = []
+    all_pool:    List[Tuple[float, int, int]] = []
 
     for box in results.boxes:
         cls  = int(box.cls[0])
@@ -253,6 +261,7 @@ def optical_flow_center(
             iterations=3, poly_n=5, poly_sigma=1.2, flags=0,
         )
         mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
+        # Mask out 4% border to ignore edge noise
         b = max(1, int(orig_w * 0.04))
         mag[:, :b] = mag[:, orig_w - b:] = 0
         mag[:b, :] = mag[orig_h - b:, :] = 0
@@ -325,30 +334,40 @@ def apply_rule_of_thirds_bias(
 
 
 # ---------------------------------------------------------------------------
-# Smoothing & interpolation
+# Smoothing  (fixed: odd window enforced; correct segment boundary handling)
 # ---------------------------------------------------------------------------
 def smooth_centers(
     centers: List[Tuple[int, int]],
     window: int = 15,
     scene_cuts: Optional[List[int]] = None,
 ) -> List[Tuple[int, int]]:
-    """Gaussian smooth; hard reset at scene-cut boundaries."""
+    """Gaussian-smooth crop path; hard-reset at scene-cut boundaries."""
     if not centers or len(centers) < 3:
         return centers.copy() if centers else []
+
+    # Ensure window is odd
+    window = window if window % 2 == 1 else window + 1
 
     xs = np.array([c[0] for c in centers], dtype=float)
     ys = np.array([c[1] for c in centers], dtype=float)
     cut_set = set(scene_cuts or [])
 
-    def _smooth_segment(x_seg, y_seg, w):
+    def _smooth_segment(x_seg: np.ndarray, y_seg: np.ndarray, w: int):
+        if len(x_seg) < 3:
+            return x_seg.copy(), y_seg.copy()
+        # Make w odd and at most len-2
+        w = min(w, len(x_seg) - 1)
+        w = w if w % 2 == 1 else w - 1
+        if w < 3:
+            return x_seg.copy(), y_seg.copy()
         h2 = w // 2
-        if h2 == 0:
-            return x_seg, y_seg
-        k  = np.exp(-0.5 * (np.arange(-h2, h2 + 1) / (h2 / 2 + 1e-6)) ** 2)
+        sigma = h2 / 2.0 + 1e-6
+        k = np.exp(-0.5 * (np.arange(-h2, h2 + 1) / sigma) ** 2)
         k /= k.sum()
         xp = np.pad(x_seg, h2, mode="reflect")
         yp = np.pad(y_seg, h2, mode="reflect")
-        return np.convolve(xp, k, mode="valid"), np.convolve(yp, k, mode="valid")
+        return (np.convolve(xp, k, mode="valid")[:len(x_seg)],
+                np.convolve(yp, k, mode="valid")[:len(y_seg)])
 
     if not cut_set:
         xs_s, ys_s = _smooth_segment(xs, ys, window)
@@ -359,17 +378,18 @@ def smooth_centers(
     boundaries = [0] + cuts + [len(centers)]
     for i in range(len(boundaries) - 1):
         s, e = boundaries[i], boundaries[i + 1]
-        seg_len = e - s
-        if seg_len < 3:
+        if e - s < 3:
             continue
-        w = min(window, seg_len - (1 if seg_len % 2 == 0 else 0))
-        xs_s, ys_s = _smooth_segment(xs[s:e], ys[s:e], w)
+        xs_s, ys_s = _smooth_segment(xs[s:e], ys[s:e], window)
         result_x[s:e] = xs_s
         result_y[s:e] = ys_s
 
     return [(int(x), int(y)) for x, y in zip(result_x, result_y)]
 
 
+# ---------------------------------------------------------------------------
+# Interpolation  (fixed: O(n log n) via bisect instead of O(n²))
+# ---------------------------------------------------------------------------
 def interpolate_centers(
     detected_centers: List[Tuple[int, int]],
     detected_indices: List[int],
@@ -380,7 +400,9 @@ def interpolate_centers(
     if not detected_centers:
         return [(0, 0)] * total_frames
 
-    result = []
+    result: List[Tuple[int, int]] = []
+    n = len(detected_indices)
+
     for fi in range(total_frames):
         if fi <= detected_indices[0]:
             result.append(detected_centers[0])
@@ -388,21 +410,22 @@ def interpolate_centers(
         if fi >= detected_indices[-1]:
             result.append(detected_centers[-1])
             continue
-        prev_i = 0
-        for j, idx in enumerate(detected_indices):
-            if idx > fi:
-                prev_i = j - 1
-                break
-        next_i = prev_i + 1
-        if next_i >= len(detected_indices):
+
+        # bisect_right gives insertion point → right neighbor index
+        right = bisect.bisect_right(detected_indices, fi)
+        left  = right - 1
+
+        if right >= n:
             result.append(detected_centers[-1])
             continue
-        span = max(detected_indices[next_i] - detected_indices[prev_i], 1)
-        t = (fi - detected_indices[prev_i]) / span
-        cx = int(detected_centers[prev_i][0] + t * (detected_centers[next_i][0] - detected_centers[prev_i][0]))
-        cy = int(detected_centers[prev_i][1] + t * (detected_centers[next_i][1] - detected_centers[prev_i][1]))
+
+        span = max(detected_indices[right] - detected_indices[left], 1)
+        t    = (fi - detected_indices[left]) / span
+        cx   = int(detected_centers[left][0] + t * (detected_centers[right][0] - detected_centers[left][0]))
+        cy   = int(detected_centers[left][1] + t * (detected_centers[right][1] - detected_centers[left][1]))
         result.append((cx, cy))
 
+    # Safety pad
     while len(result) < total_frames:
         result.append(result[-1] if result else (0, 0))
     return result[:total_frames]
@@ -473,27 +496,30 @@ def process_video(
 
     target_w, target_h = target_size
     crop_w, crop_h = calculate_crop_dimensions(orig_w, orig_h, target_w, target_h)
-    _p(0.02, f"📐 Crop {crop_w}×{crop_h} → {target_w}×{target_h}")
+    _p(0.02, f"📐 Crop window {crop_w}×{crop_h} → output {target_w}×{target_h}")
 
     # ── Load model ──────────────────────────────────────────────────────
     _p(0.05, "🤖 Loading AI model…")
     model = _get_model(yolo_weights)
 
-    # ── Phase 1: Single combined detection pass ─────────────────────────
+    # ── Phase 1: Detection pass ─────────────────────────────────────────
     _p(0.08, f"🔎 Analysing {total_frames} frames…")
 
+    # Separate YOLO detections from saliency fallbacks to avoid polluting path
     detected_centers: List[Tuple[int, int]] = []
     detected_indices: List[int]             = []
-    fallback_centers: List[Tuple[int, int]] = []
-    fallback_indices: List[int]             = []
+    saliency_centers: List[Tuple[int, int]] = []
+    saliency_indices: List[int]             = []
     scene_cuts:       List[int]             = []
 
     cap            = cv2.VideoCapture(input_path)
     prev_gray_full: Optional[np.ndarray] = None
-    prev_gray_half: Optional[np.ndarray] = None
+    # optical flow uses its own prev frame, updated every sampled frame
+    prev_gray_flow: Optional[np.ndarray] = None
     frame_idx = 0
+    report_every = max(1, total_frames // 25)
 
-    while True:
+    while frame_idx < total_frames:
         ret, frame = cap.read()
         if not ret:
             break
@@ -503,47 +529,56 @@ def process_video(
         # Scene-change detection (every frame — very cheap)
         if is_scene_change(prev_gray_full, curr_gray_full, scene_cut_threshold):
             scene_cuts.append(frame_idx)
+            prev_gray_flow = None  # reset optical flow across scene cuts
         prev_gray_full = curr_gray_full
 
         if frame_idx % sample_interval == 0:
-            # Single combined YOLO pass — persons + objects together
             center = detect_subject_center(frame, model, confidence)
 
-            # Optical flow fallback
             if center is None and use_optical_flow:
                 small = cv2.resize(curr_gray_full, (orig_w // 2, orig_h // 2))
-                if prev_gray_half is not None:
-                    fc = optical_flow_center(prev_gray_half, small, orig_w // 2, orig_h // 2)
+                if prev_gray_flow is not None:
+                    fc = optical_flow_center(prev_gray_flow, small,
+                                             orig_w // 2, orig_h // 2)
                     if fc is not None:
                         center = (fc[0] * 2, fc[1] * 2)
-                prev_gray_half = small
-            elif use_optical_flow and prev_gray_half is None:
-                prev_gray_half = cv2.resize(curr_gray_full, (orig_w // 2, orig_h // 2))
+                # Always update flow prev for sampled frames
+                prev_gray_flow = small
 
             if center is not None:
                 detected_centers.append(center)
                 detected_indices.append(frame_idx)
             else:
-                fallback_centers.append(saliency_center(frame))
-                fallback_indices.append(frame_idx)
+                saliency_centers.append(saliency_center(frame))
+                saliency_indices.append(frame_idx)
 
         frame_idx += 1
-        if frame_idx % max(1, total_frames // 25) == 0:
+        if frame_idx % report_every == 0:
             _p(0.08 + 0.32 * (frame_idx / total_frames),
                f"🔎 Analysed {frame_idx}/{total_frames} frames…")
 
     cap.release()
-    _p(0.40, f"📍 {len(detected_centers)} tracking anchors · {len(scene_cuts)} scene cuts")
+    _p(0.40,
+       f"📍 {len(detected_centers)} AI anchors · "
+       f"{len(saliency_centers)} saliency fills · "
+       f"{len(scene_cuts)} scene cuts")
 
-    # Merge detected + saliency fallback
+    # Use only YOLO/flow detections for the primary path.
+    # Fill gaps with saliency only where no detection exists.
     if not detected_centers:
-        detected_centers = fallback_centers or [(orig_w // 2, orig_h // 2)]
-        detected_indices = fallback_indices  or [0]
+        # Full fallback: use saliency for everything
+        detected_centers = saliency_centers or [(orig_w // 2, orig_h // 2)]
+        detected_indices = saliency_indices  or [0]
     else:
-        pairs = sorted(zip(
-            detected_indices + fallback_indices,
-            detected_centers + fallback_centers
-        ))
+        # Merge saliency into gaps between detections (do NOT add if nearby detection exists)
+        gap_threshold = sample_interval * 4
+        for si, sc in zip(saliency_indices, saliency_centers):
+            nearest_dist = min(abs(si - di) for di in detected_indices)
+            if nearest_dist > gap_threshold:
+                detected_indices.append(si)
+                detected_centers.append(sc)
+        # Re-sort by frame index
+        pairs = sorted(zip(detected_indices, detected_centers))
         detected_indices = [p[0] for p in pairs]
         detected_centers = [p[1] for p in pairs]
 
@@ -558,25 +593,28 @@ def process_video(
             for cx, cy in all_centers
         ]
 
+    # Guarantee length matches total_frames
     if len(all_centers) < total_frames:
         all_centers += [all_centers[-1]] * (total_frames - len(all_centers))
     all_centers = all_centers[:total_frames]
 
-    # ── Phase 3: Render ──────────────────────────────────────────────────
+    # ── Phase 3: Render frames to temp file ──────────────────────────────
     _p(0.46, "✂️ Rendering vertical frames…")
     temp_video: Optional[str] = None
     temp_final: Optional[str] = None
 
     try:
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".avi", delete=False) as tmp:
             temp_video = tmp.name
 
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        # Use MJPG for intermediate — avoids mp4v container fragility
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
         writer = cv2.VideoWriter(temp_video, fourcc, fps, (target_w, target_h))
         if not writer.isOpened():
             raise ProcessingError("Failed to initialise video encoder.")
 
         cap = cv2.VideoCapture(input_path)
+        report_every_render = max(1, total_frames // 25)
         for frame_num in range(total_frames):
             ret, frame = cap.read()
             if not ret:
@@ -587,17 +625,17 @@ def process_video(
             cropped = frame[top:top + crop_h, left:left + crop_w]
             writer.write(cv2.resize(cropped, (target_w, target_h),
                                     interpolation=cv2.INTER_LANCZOS4))
-            if (frame_num + 1) % max(1, total_frames // 25) == 0:
+            if (frame_num + 1) % report_every_render == 0:
                 _p(0.46 + 0.40 * ((frame_num + 1) / total_frames),
                    f"✂️ Rendered {frame_num + 1}/{total_frames} frames…")
         cap.release()
         writer.release()
 
         if not os.path.exists(temp_video) or os.path.getsize(temp_video) < 1000:
-            raise ProcessingError("Rendered video is empty.")
+            raise ProcessingError("Rendered video file is empty.")
 
         # ── Phase 4: FFmpeg — audio mux + browser encode ─────────────────
-        _p(0.87, "🎵 Muxing audio with FFmpeg…")
+        _p(0.87, "🎵 Muxing audio & encoding with FFmpeg…")
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp2:
             temp_final = tmp2.name
 
@@ -609,20 +647,20 @@ def process_video(
             _ffmpeg_encode_video_only(temp_video, temp_final, fps)
 
         if not os.path.exists(temp_final) or os.path.getsize(temp_final) < 1000:
-            raise ProcessingError("FFmpeg produced an empty output.")
+            raise ProcessingError("FFmpeg produced an empty output file.")
 
         shutil.move(temp_final, output_path)
-        temp_final = None  # moved — don't delete
+        temp_final = None  # moved — don't delete in finally
 
         _p(1.0, "✅ Done!")
         print(
-            f"✅ {output_path}  "
+            f"✅  {output_path}  "
             f"({os.path.getsize(output_path) / 1024 ** 2:.1f} MB)",
             flush=True,
         )
 
     finally:
-        for p in [temp_video, temp_final]:
+        for p in (temp_video, temp_final):
             if p and os.path.exists(p):
                 try:
                     os.unlink(p)
