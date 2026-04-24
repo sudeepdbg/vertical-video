@@ -8,7 +8,8 @@ import tempfile
 import os
 from verticalize import (
     process_video, get_video_info, RESOLUTION_PRESETS,
-    SUBTITLE_STYLES, resolve_target_size, whisper_available,
+    SUBTITLE_STYLES, TRANSLATION_LANGUAGES, resolve_target_size,
+    whisper_available, translation_available,
 )
 
 st.set_page_config(
@@ -212,6 +213,7 @@ def _invalidate_if_changed(cur):
 
 _init()
 _whisper_ok = whisper_available()
+_translate_ok = translation_available()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -418,6 +420,14 @@ with st.container():
               The rest of the app works without it.
             </div>""", unsafe_allow_html=True)
 
+        if _whisper_ok and not _translate_ok:
+            st.markdown("""
+            <div class="rf-info">
+              💡 <strong>Translation not available.</strong>
+              Run <code>pip install deep-translator</code> to enable subtitle translation
+              (e.g. English audio → French subtitles).
+            </div>""", unsafe_allow_html=True)
+
         s1, s2, s3, s4 = st.columns(4, gap="medium")
         with s1:
             burn_subtitles = st.toggle(
@@ -428,6 +438,19 @@ with st.container():
             )
             if not _whisper_ok:
                 burn_subtitles = False
+
+            st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+
+            # Translation toggle — only useful when subtitles are on
+            translate_subtitles = st.toggle(
+                "Translate subtitles 🌐",
+                value=False,
+                disabled=(not _whisper_ok or not _translate_ok or not burn_subtitles),
+                help="Translate burnt-in subtitles to a different language than the audio",
+            )
+            if not burn_subtitles or not _translate_ok:
+                translate_subtitles = False
+
         with s2:
             whisper_model = st.selectbox(
                 "Whisper model",
@@ -435,19 +458,33 @@ with st.container():
                 disabled=not _whisper_ok,
                 help="tiny=fastest/least accurate · medium=slowest/best",
             )
+            whisper_language = st.selectbox(
+                "Audio language (optional)",
+                ["Auto-detect", "en", "hi", "es", "fr", "de", "ja", "zh", "pt", "ar"],
+                disabled=not _whisper_ok,
+                help="Language of the video's audio track. Auto-detect works well for most cases.",
+            )
+            if whisper_language == "Auto-detect":
+                whisper_language = None
+
         with s3:
             subtitle_style_name = st.selectbox(
                 "Caption style",
                 list(SUBTITLE_STYLES.keys()),
                 disabled=not _whisper_ok,
             )
-            whisper_language = st.selectbox(
-                "Language (optional)",
-                ["Auto-detect", "en", "hi", "es", "fr", "de", "ja", "zh", "pt", "ar"],
-                disabled=not _whisper_ok,
+            # Translation language selector
+            subtitle_translate_to_label = st.selectbox(
+                "Translate to",
+                list(TRANSLATION_LANGUAGES.keys()),
+                index=0,
+                disabled=(not _whisper_ok or not _translate_ok or not burn_subtitles or not translate_subtitles),
+                help="Target language for subtitles. Audio stays in its original language — only the text captions are translated.",
             )
-            if whisper_language == "Auto-detect":
-                whisper_language = None
+            subtitle_translate_to = TRANSLATION_LANGUAGES[subtitle_translate_to_label] or None
+            if not translate_subtitles:
+                subtitle_translate_to = None
+
         with s4:
             subtitle_max_chars = st.slider(
                 "Max chars per line", 20, 60, 42, 2,
@@ -464,6 +501,18 @@ with st.container():
                 f'<div class="rf-sub-preview">'
                 f'<div class="rf-sub-text {preview_cls}">Sample caption text</div>'
                 f'</div>',
+                unsafe_allow_html=True
+            )
+
+        # Show translation info banner when active
+        if burn_subtitles and translate_subtitles and subtitle_translate_to:
+            lang_label = subtitle_translate_to_label
+            audio_lang = whisper_language or "auto-detected"
+            st.markdown(
+                f'<div class="rf-info" style="margin-top:8px;">🌐 '
+                f'Audio will be transcribed in <strong>{audio_lang}</strong>, '
+                f'then subtitles translated to <strong>{lang_label}</strong> '
+                f'before burning into the video.</div>',
                 unsafe_allow_html=True
             )
 
@@ -508,6 +557,7 @@ current_settings = dict(
     burn_subtitles=burn_subtitles,
     whisper_model=whisper_model if burn_subtitles else "",
     subtitle_style_name=subtitle_style_name if burn_subtitles else "",
+    subtitle_translate_to=subtitle_translate_to if burn_subtitles else "",
     audio_bitrate_label=audio_bitrate_label, yolo_weights=yolo_weights,
 )
 _invalidate_if_changed(current_settings)
@@ -584,7 +634,12 @@ with col_out:
             eff_w, eff_h = resolve_target_size(resolution_label, info["width"], info["height"])
         else:
             eff_w, eff_h = 1080, 1920
-        sub_note = " · subtitles burned" if st.session_state.srt_bytes else ""
+        sub_note = ""
+        if st.session_state.srt_bytes:
+            if subtitle_translate_to:
+                sub_note = f" · subtitles → {subtitle_translate_to}"
+            else:
+                sub_note = " · subtitles burned"
         st.markdown(
             f'<div class="rf-success"><div class="rf-success-dot"></div>'
             f'<div class="rf-success-text">Done — {eff_w}×{eff_h} · '
@@ -674,7 +729,12 @@ if uploaded_file is not None and st.session_state.input_path:
 
         mode_lbl  = "Talking Head 👤" if tracking_mode == "talking_head" else "Subject 🎯"
         crf_lbl   = "Near-lossless" if crf<=18 else ("Balanced" if crf<=24 else "Compact")
-        sub_lbl   = (f"Whisper {whisper_model}" if burn_subtitles else "None")
+        if burn_subtitles:
+            sub_lbl = f"Whisper {whisper_model}"
+            if subtitle_translate_to:
+                sub_lbl += f" → {subtitle_translate_to}"
+        else:
+            sub_lbl = "None"
         smooth_lbl = f"Adaptive ({smooth_window})" if adaptive_smoothing else str(smooth_window)
 
         st.markdown(f"""
@@ -753,6 +813,7 @@ if uploaded_file is not None and st.session_state.input_path:
                         whisper_language=whisper_language,
                         subtitle_style_name=subtitle_style_name,
                         subtitle_max_chars=subtitle_max_chars,
+                        subtitle_translate_to=subtitle_translate_to,
                         progress_callback=_cb,
                     )
                     prog.progress(1.0)
