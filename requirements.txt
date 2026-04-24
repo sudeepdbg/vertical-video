@@ -5,3 +5,4 @@ numpy>=1.24.0
 moviepy>=1.0.3
 Pillow>=10.0.0
 openai-whisper
+deep-translator
