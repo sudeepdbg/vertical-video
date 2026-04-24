@@ -24,7 +24,6 @@ import sys
 import subprocess
 import shutil
 import json
-import time
 from collections import namedtuple
 from typing import Optional, Callable, List, Tuple, Dict, Any
 
@@ -53,6 +52,7 @@ RESOLUTION_PRESETS: Dict[str, Tuple[int, int]] = {
     "480p   (480×854   — Low)":     (480,  854),
 }
 
+# Subtitle style presets
 SUBTITLE_STYLES: Dict[str, Dict[str, Any]] = {
     "Bold White (TikTok)": {
         "fontsize": 18, "primary_color": "&H00FFFFFF",
@@ -173,7 +173,6 @@ def _seconds_to_srt_time(s: float) -> str:
 def transcribe_to_srt(
     video_path: str, srt_path: str, whisper_model: str = "base",
     language: Optional[str] = None, max_chars_per_line: int = 42,
-    device: str = "auto",
     progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> bool:
     def _p(v, msg=""):
@@ -193,7 +192,7 @@ def transcribe_to_srt(
         if not _extract_audio_wav(video_path, wav_path):
             return False
         _p(0.2, f"📝 Transcribing with Whisper ({whisper_model})…")
-        model = whisper.load_model(whisper_model, device=device)
+        model = whisper.load_model(whisper_model)
         opts: Dict[str, Any] = {"word_timestamps": True, "verbose": False}
         if language:
             opts["language"] = language
@@ -269,12 +268,11 @@ def resolve_target_size(label: str, orig_w: int, orig_h: int) -> Tuple[int, int]
 # AI Models (YOLO & Face)
 # ─────────────────────────────────────────────────────────────────────────────
 _model_cache: Dict[str, YOLO] = {}
-def _get_model(weights: str = "yolov8n.pt", device: str = "auto") -> YOLO:
-    key = f"{weights}_{device}"
-    if key not in _model_cache:
-        try: _model_cache[key] = YOLO(weights)
+def _get_model(weights: str = "yolov8n.pt") -> YOLO:
+    if weights not in _model_cache:
+        try: _model_cache[weights] = YOLO(weights)
         except Exception as e: raise ProcessingError(f"Failed to load '{weights}': {e}")
-    return _model_cache[key]
+    return _model_cache[weights]
 
 _face_net: Optional[cv2.dnn.Net] = None
 _FACE_PROTO = "deploy.prototxt"
@@ -410,7 +408,7 @@ def apply_framing_bias(cx, cy, vx, vy, speed, orig_w, orig_h, crop_w, crop_h, lo
         lx = int(cx + (vx/n) * look_room_frac * crop_w * look)
         ly = int(cy + (vy/n) * look_room_frac * crop_h * look)
     else: lx, ly = cx, cy
-    still = max(0.0, min(1.0, 1.0 - look * 2.0))
+    still = max(0.0, 1.0 - look * 2.0)
     if still > 0.01:
         tx = min([orig_w//3, 2*orig_w//3], key=lambda x: abs(x-cx))
         ty = min([orig_h//3, 2*orig_h//3], key=lambda y: abs(y-cy))
@@ -518,13 +516,11 @@ def process_video(
     encoder_preset: str = "fast",
     audio_bitrate: str = "128k",
     yolo_weights: str = "yolov8n.pt",
-    device: str = "auto",
     burn_subtitles: bool = False,
     whisper_model: str = "base",
     whisper_language: Optional[str] = None,
     subtitle_style_name: str = "Bold White (TikTok)",
     subtitle_max_chars: int = 42,
-    background_mode: str = "crop",
     progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> Dict[str, Any]:
     """Returns metadata dict about the processing result."""
@@ -566,7 +562,7 @@ def process_video(
         srt_fd, srt_path = tempfile.mkstemp(suffix=".srt")
         os.close(srt_fd)
         def sub_cb(v, msg=""): _p(0.02 + v * 0.08, msg)
-        ok = transcribe_to_srt(input_path, srt_path, whisper_model, whisper_language, subtitle_max_chars, device, sub_cb)
+        ok = transcribe_to_srt(input_path, srt_path, whisper_model, whisper_language, subtitle_max_chars, sub_cb)
         if not ok:
             _p(0.10, "⚠️ Transcription failed — continuing without subtitles")
             if os.path.exists(srt_path): os.unlink(srt_path)
@@ -577,7 +573,7 @@ def process_video(
     start_pct = 0.10
     if tracking_mode == "subject":
         _p(start_pct, "🤖 Loading AI model…")
-        model = _get_model(yolo_weights, device)
+        model = _get_model(yolo_weights)
     else:
         model = None
         _p(start_pct, "👤 Talking Head Mode — loading face detector…")
@@ -591,7 +587,6 @@ def process_video(
     prev_gray, prev_flow, frame_idx = None, None, 0
     report_n = max(1, total_frames//25)
     det_phase_end = 0.42
-    start_time = time.time()
 
     while frame_idx < total_frames:
         ret, frame = cap.read()
@@ -630,9 +625,7 @@ def process_video(
         frame_idx += 1
         if frame_idx % report_n == 0:
             pct = start_pct + 0.02 + (det_phase_end - start_pct - 0.02) * (frame_idx/total_frames)
-            elapsed = time.time() - start_time
-            eta = (elapsed / frame_idx) * (total_frames - frame_idx) if frame_idx > 0 else 0
-            _p(pct, f"🔎 {frame_idx}/{total_frames} frames… (ETA: {eta:.0f}s)")
+            _p(pct, f"🔎 {frame_idx}/{total_frames} frames…")
 
     cap.release()
     _p(det_phase_end, f"📍 {len(det_centers)} anchors · {len(scene_cuts)} scene cuts")
@@ -690,18 +683,8 @@ def process_video(
             left = max(0, min(cx-crop_w//2, orig_w-crop_w))
             top  = max(0, min(cy-crop_h//2, orig_h-crop_h))
             crop = frame[top:top+crop_h, left:left+crop_w]
-
-            if background_mode != "crop" and (crop.shape[0] < target_h or crop.shape[1] < target_w):
-                bg = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-                if background_mode == "blur":
-                    bg[:, :] = cv2.GaussianBlur(frame, (0,0), 21)
-                x_off = (target_w - crop.shape[1]) // 2
-                y_off = (target_h - crop.shape[0]) // 2
-                bg[y_off:y_off+crop.shape[0], x_off:x_off+crop.shape[1]] = crop
-                crop = bg
-            elif crop.shape[1] != target_w or crop.shape[0] != target_h:
+            if crop.shape[1] != target_w or crop.shape[0] != target_h:
                 crop = cv2.resize(crop, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
-
             writer.write(crop)
             if (fn+1) % rn2 == 0:
                 _p(0.46 + 0.40*((fn+1)/total_frames), f"✂️ {fn+1}/{total_frames}…")
