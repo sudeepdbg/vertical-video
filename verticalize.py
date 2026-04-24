@@ -299,6 +299,124 @@ def transcribe_to_srt(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Subtitle translation
+# ─────────────────────────────────────────────────────────────────────────────
+def translation_available() -> bool:
+    """Returns True if deep-translator is installed."""
+    try:
+        import deep_translator  # noqa
+        return True
+    except ImportError:
+        return False
+
+
+# Supported target languages for translation (display name → language code)
+TRANSLATION_LANGUAGES: Dict[str, str] = {
+    "None (keep original)": "",
+    "French 🇫🇷":           "fr",
+    "German 🇩🇪":           "de",
+    "Spanish 🇪🇸":          "es",
+    "Italian 🇮🇹":          "it",
+    "Portuguese 🇵🇹":       "pt",
+    "Dutch 🇳🇱":            "nl",
+    "Polish 🇵🇱":           "pl",
+    "Russian 🇷🇺":          "ru",
+    "Japanese 🇯🇵":         "ja",
+    "Korean 🇰🇷":           "ko",
+    "Chinese (Simplified) 🇨🇳": "zh-CN",
+    "Arabic 🇸🇦":           "ar",
+    "Hindi 🇮🇳":            "hi",
+    "Turkish 🇹🇷":          "tr",
+    "Indonesian 🇮🇩":       "id",
+    "Swedish 🇸🇪":          "sv",
+    "Norwegian 🇳🇴":        "no",
+    "Danish 🇩🇰":           "da",
+    "Finnish 🇫🇮":          "fi",
+    "Greek 🇬🇷":            "el",
+    "Hebrew 🇮🇱":           "iw",
+    "Thai 🇹🇭":             "th",
+    "Vietnamese 🇻🇳":       "vi",
+    "Malay 🇲🇾":            "ms",
+    "Ukrainian 🇺🇦":        "uk",
+}
+
+
+def translate_srt(
+    srt_path: str,
+    target_language: str,
+    source_language: str = "auto",
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+) -> bool:
+    """
+    Translates an existing SRT file in-place to target_language using
+    deep-translator (Google Translate backend).
+
+    target_language: BCP-47 code, e.g. "fr", "de", "ja"
+    Returns True on success, False on failure.
+    """
+    def _p(v, msg=""):
+        if progress_callback:
+            try: progress_callback(v, msg)
+            except Exception: pass
+
+    if not translation_available():
+        return False
+
+    if not target_language:
+        return True  # no-op
+
+    try:
+        from deep_translator import GoogleTranslator
+    except ImportError:
+        return False
+
+    try:
+        with open(srt_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Parse SRT blocks: index \n timestamps \n text(s) \n
+        import re
+        blocks = re.split(r"\n\n+", content.strip())
+        translated_blocks = []
+
+        translator = GoogleTranslator(source=source_language, target=target_language)
+
+        for i, block in enumerate(blocks):
+            lines = block.strip().splitlines()
+            if len(lines) < 3:
+                translated_blocks.append(block)
+                continue
+
+            idx_line  = lines[0]   # "1"
+            time_line = lines[1]   # "00:00:01,000 --> 00:00:03,000"
+            text_lines = lines[2:] # actual subtitle text (may be multi-line)
+
+            text = " ".join(text_lines)
+            try:
+                translated = translator.translate(text)
+                if not translated:
+                    translated = text
+            except Exception:
+                translated = text  # fall back to original on error
+
+            translated_blocks.append(f"{idx_line}\n{time_line}\n{translated}")
+
+            if i % 10 == 0:
+                _p(i / len(blocks), f"🌐 Translating… {i}/{len(blocks)} lines")
+
+        translated_content = "\n\n".join(translated_blocks) + "\n"
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write(translated_content)
+
+        _p(1.0, f"✅ Translated {len(translated_blocks)} subtitle blocks to [{target_language}]")
+        return True
+
+    except Exception as e:
+        print(f"Translation failed: {e}", file=sys.stderr)
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Video metadata
 # ─────────────────────────────────────────────────────────────────────────────
 def get_video_info(path: str) -> Dict[str, Any]:
@@ -779,6 +897,7 @@ def process_video(
     whisper_language: Optional[str] = None,
     subtitle_style_name: str = "Bold White (TikTok)",
     subtitle_max_chars: int = 42,
+    subtitle_translate_to: Optional[str] = None,   # BCP-47 code, e.g. "fr", "de"
     # Callback
     progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> Dict[str, Any]:
@@ -860,6 +979,19 @@ def process_video(
                 os.unlink(srt_path)
             srt_path = None
         else:
+            # ── Optional: translate SRT to target language ────────────────
+            if subtitle_translate_to:
+                _p(0.10, f"🌐 Translating subtitles to [{subtitle_translate_to}]…")
+                def trans_cb(v, msg=""):
+                    _p(0.10 + v * 0.05, msg)   # 10–15% of total progress
+
+                t_ok = translate_srt(
+                    srt_path,
+                    target_language=subtitle_translate_to,
+                    progress_callback=trans_cb,
+                )
+                if not t_ok:
+                    _p(0.15, "⚠️ Translation failed — using original language subtitles")
             result_meta["subtitle_path"] = srt_path
 
     # ── Load model ────────────────────────────────────────────────────────
