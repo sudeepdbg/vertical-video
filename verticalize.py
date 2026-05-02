@@ -1,20 +1,25 @@
 """
 verticalize.py
 ──────────────
-Convert landscape video to vertical format using AI subject tracking.
+AI vertical video converter with intelligent long-form clip detection.
 
-Features:
-  • Subject tracking  — YOLOv8 + optical flow + saliency
-  • Talking Head Mode — DNN face detector locks crop to face, upper-third framing
-  • Whisper subtitles — optional; transcribes audio and burns styled captions
-  • Multi-subject union framing
-  • Motion-aware adaptive smoothing
-  • Look-room + rule-of-thirds framing bias
-  • Upscale guard — output capped to source resolution
-  • Reliable MJPG temp → FFmpeg encode (no pipe)
+Modes:
+  1. Single clip — convert full video to 9:16
+  2. Auto-clip   — scan long video, detect high-engagement segments, verticalize each
+
+Clip detection pipeline:
+  • Saliency peaks (motion, color, contrast bursts)
+  • Audio energy peaks (RMS via ffprobe/pydub — optional)
+  • Scene change boundaries → narrative arcs (begin/middle/end)
+  • SOI (Subject of Interest) coordinate tracking per clip
+  • Lower-third guard — subjects kept above bottom 20% of vertical frame
+
+Subject guard: detected subjects must not fall in the lower-third (bottom 20%)
+of the vertical frame. If the crop would push the subject below that line,
+the crop center is shifted upward to maintain the safe zone.
 
 Dependencies: opencv-python, ultralytics, numpy, ffmpeg (system)
-Optional:     openai-whisper  (pip install openai-whisper)
+Optional:     openai-whisper, deep-translator
 """
 
 import bisect
@@ -41,9 +46,11 @@ class ProcessingError(Exception):
 # ─────────────────────────────────────────────────────────────────────────────
 PERSON_CLASS_ID   = 0
 HIGH_PRIO_CLASSES = {0, 2, 3, 5, 7, 15, 16}
-MAX_FILE_SIZE_MB  = 500
+MAX_FILE_SIZE_MB  = 2000        # 2 GB for long-form
 MIN_FRAME_DIM     = 240
-MAX_FRAMES_GUARD  = 216_000
+MAX_FRAMES_GUARD  = 1_080_000   # ~10 hours at 30fps
+
+LOWER_THIRD_GUARD = 0.80        # subjects must be above 80% of frame height
 
 VELOCITY_SMOOTH_TABLE: List[Tuple[float, int]] = [
     (0.0,   31), (5.0,   25), (15.0,  17),
@@ -58,7 +65,6 @@ RESOLUTION_PRESETS: Dict[str, Tuple[int, int]] = {
     "480p   (480×854   — Low)":     (480,  854),
 }
 
-# Subtitle style presets
 SUBTITLE_STYLES: Dict[str, Dict[str, Any]] = {
     "Bold White (TikTok)": {
         "fontsize": 18, "primary_color": "&H00FFFFFF",
@@ -80,13 +86,71 @@ SUBTITLE_STYLES: Dict[str, Dict[str, Any]] = {
     },
 }
 
+TRANSLATION_LANGUAGES: Dict[str, str] = {
+    "None (keep original)": "",
+    "French 🇫🇷":           "fr",
+    "German 🇩🇪":           "de",
+    "Spanish 🇪🇸":          "es",
+    "Italian 🇮🇹":          "it",
+    "Portuguese 🇵🇹":       "pt",
+    "Dutch 🇳🇱":            "nl",
+    "Polish 🇵🇱":           "pl",
+    "Russian 🇷🇺":          "ru",
+    "Japanese 🇯🇵":         "ja",
+    "Korean 🇰🇷":           "ko",
+    "Chinese (Simplified) 🇨🇳": "zh-CN",
+    "Arabic 🇸🇦":           "ar",
+    "Hindi 🇮🇳":            "hi",
+    "Turkish 🇹🇷":          "tr",
+    "Indonesian 🇮🇩":       "id",
+    "Swedish 🇸🇪":          "sv",
+    "Norwegian 🇳🇴":        "no",
+    "Danish 🇩🇰":           "da",
+    "Finnish 🇫🇮":          "fi",
+    "Greek 🇬🇷":            "el",
+    "Hebrew 🇮🇱":           "iw",
+    "Thai 🇹🇭":             "th",
+    "Vietnamese 🇻🇳":       "vi",
+    "Malay 🇲🇾":            "ms",
+    "Ukrainian 🇺🇦":        "uk",
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Whisper availability check
+#  Clip dataclass
+# ─────────────────────────────────────────────────────────────────────────────
+class ClipSegment:
+    """Represents a detected high-engagement segment."""
+    def __init__(self, start_sec: float, end_sec: float, score: float,
+                 soi_region: str = "center", peak_frame: int = 0,
+                 title: str = ""):
+        self.start_sec  = start_sec
+        self.end_sec    = end_sec
+        self.score      = score           # engagement score 0-1
+        self.soi_region = soi_region      # e.g. "center-right", "upper-left"
+        self.peak_frame = peak_frame      # frame index of peak saliency
+        self.title      = title           # auto-generated label
+        self.duration   = end_sec - start_sec
+
+    def __repr__(self):
+        return (f"<Clip {self.start_sec:.1f}s–{self.end_sec:.1f}s "
+                f"dur={self.duration:.1f}s score={self.score:.2f} soi={self.soi_region}>")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Availability checks
 # ─────────────────────────────────────────────────────────────────────────────
 def whisper_available() -> bool:
     try:
         import whisper  # noqa
+        return True
+    except ImportError:
+        return False
+
+
+def translation_available() -> bool:
+    try:
+        import deep_translator  # noqa
         return True
     except ImportError:
         return False
@@ -101,9 +165,40 @@ def _check_ffmpeg() -> None:
             subprocess.run([tool, "-version"], check=True,
                            capture_output=True, text=True)
         except (subprocess.CalledProcessError, FileNotFoundError):
-            raise ProcessingError(
-                f"{tool} not found. Install FFmpeg and add it to PATH."
-            )
+            raise ProcessingError(f"{tool} not found. Install FFmpeg.")
+
+
+def _has_audio(path: str) -> bool:
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "a",
+           "-show_entries", "stream=codec_type", "-of", "csv=p=0", path]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return "audio" in r.stdout
+    except Exception:
+        return False
+
+
+def _extract_audio_wav(video_path: str, wav_path: str) -> bool:
+    cmd = ["ffmpeg", "-y", "-i", video_path,
+           "-ar", "16000", "-ac", "1", "-f", "wav", wav_path]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return r.returncode == 0 and os.path.exists(wav_path)
+
+
+def _trim_video(input_path: str, output_path: str,
+                start_sec: float, end_sec: float) -> bool:
+    """Fast trim using ffmpeg stream copy (no re-encode)."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(start_sec),
+        "-to", str(end_sec),
+        "-i", input_path,
+        "-c", "copy",
+        "-avoid_negative_ts", "1",
+        output_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return r.returncode == 0 and os.path.exists(output_path)
 
 
 def _ffmpeg_encode(
@@ -118,17 +213,11 @@ def _ffmpeg_encode(
     subtitle_path: Optional[str] = None,
     subtitle_style: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """
-    Re-encode MJPG .avi → H.264 .mp4. Optionally mux audio and burn subtitles.
-    subtitle_path: path to .srt file (burned via ASS filter chain)
-    """
     cmd = ["ffmpeg", "-y", "-i", video_path]
     if audio_source:
         cmd += ["-i", audio_source]
 
     vf_chain = []
-
-    # Subtitle burn-in (requires subtitles filter; ffmpeg must have libass)
     if subtitle_path and os.path.exists(subtitle_path):
         style = subtitle_style or SUBTITLE_STYLES["Bold White (TikTok)"]
         fs    = style.get("fontsize", 18)
@@ -139,7 +228,6 @@ def _ffmpeg_encode(
         shad  = style.get("shadow", 0)
         bc    = style.get("back_color", "&H00000000")
         mv    = style.get("margin_v", 80)
-        # Escape path for ffmpeg filter
         srt_escaped = subtitle_path.replace("\\", "/").replace(":", "\\:")
         force_style = (
             f"Fontsize={fs},PrimaryColour={pc},OutlineColour={oc},"
@@ -171,249 +259,7 @@ def _ffmpeg_encode(
     ]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        raise ProcessingError(
-            f"FFmpeg failed (rc={r.returncode}):\n{r.stderr[-2000:]}"
-        )
-
-
-def _has_audio(path: str) -> bool:
-    cmd = ["ffprobe", "-v", "error", "-select_streams", "a",
-           "-show_entries", "stream=codec_type", "-of", "csv=p=0", path]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        return "audio" in r.stdout
-    except Exception:
-        return False
-
-
-def _extract_audio_wav(video_path: str, wav_path: str) -> bool:
-    """Extract mono 16kHz WAV for Whisper."""
-    cmd = ["ffmpeg", "-y", "-i", video_path,
-           "-ar", "16000", "-ac", "1", "-f", "wav", wav_path]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    return r.returncode == 0 and os.path.exists(wav_path)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Whisper transcription → SRT
-# ─────────────────────────────────────────────────────────────────────────────
-def _seconds_to_srt_time(s: float) -> str:
-    h  = int(s // 3600)
-    m  = int((s % 3600) // 60)
-    sc = int(s % 60)
-    ms = int((s - int(s)) * 1000)
-    return f"{h:02d}:{m:02d}:{sc:02d},{ms:03d}"
-
-
-def transcribe_to_srt(
-    video_path: str,
-    srt_path: str,
-    whisper_model: str = "base",
-    language: Optional[str] = None,
-    max_chars_per_line: int = 42,
-    progress_callback: Optional[Callable[[float, str], None]] = None,
-) -> bool:
-    """
-    Transcribes audio using Whisper and writes an SRT file.
-    Returns True on success, False if Whisper not available.
-    Splits long segments into short lines for vertical video readability.
-    """
-    def _p(v, msg=""):
-        if progress_callback:
-            try: progress_callback(v, msg)
-            except Exception: pass
-
-    if not whisper_available():
-        return False
-
-    import whisper
-
-    _p(0.0, "🎙️ Extracting audio for transcription…")
-
-    wav_fd, wav_path = tempfile.mkstemp(suffix=".wav")
-    os.close(wav_fd)
-
-    try:
-        if not _extract_audio_wav(video_path, wav_path):
-            return False
-
-        _p(0.2, f"📝 Transcribing with Whisper ({whisper_model})…")
-        model = whisper.load_model(whisper_model)
-        opts: Dict[str, Any] = {"word_timestamps": True, "verbose": False}
-        if language:
-            opts["language"] = language
-        result = model.transcribe(wav_path, **opts)
-
-        _p(0.85, "✍️ Writing subtitles…")
-
-        # Build SRT from word-level timestamps for short, punchy lines
-        lines = []
-        idx   = 1
-        words = []
-        for seg in result.get("segments", []):
-            for w in seg.get("words", []):
-                words.append({
-                    "word":  w["word"].strip(),
-                    "start": w["start"],
-                    "end":   w["end"],
-                })
-
-        # Group words into subtitle lines ≤ max_chars_per_line
-        buf: List[Dict] = []
-        buf_len = 0
-
-        def flush_buf():
-            nonlocal idx, buf, buf_len
-            if not buf:
-                return
-            text  = " ".join(w["word"] for w in buf)
-            start = _seconds_to_srt_time(buf[0]["start"])
-            end   = _seconds_to_srt_time(buf[-1]["end"])
-            lines.append(f"{idx}\n{start} --> {end}\n{text}\n")
-            idx += 1
-            buf = []
-            buf_len = 0
-
-        for w in words:
-            wlen = len(w["word"]) + 1
-            if buf_len + wlen > max_chars_per_line and buf:
-                flush_buf()
-            buf.append(w)
-            buf_len += wlen
-
-        flush_buf()
-
-        with open(srt_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-
-        _p(1.0, f"✅ {len(lines)} subtitle lines written")
-        return True
-
-    except Exception as e:
-        print(f"Whisper transcription failed: {e}", file=sys.stderr)
-        return False
-    finally:
-        if os.path.exists(wav_path):
-            try: os.unlink(wav_path)
-            except OSError: pass
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Subtitle translation
-# ─────────────────────────────────────────────────────────────────────────────
-def translation_available() -> bool:
-    """Returns True if deep-translator is installed."""
-    try:
-        import deep_translator  # noqa
-        return True
-    except ImportError:
-        return False
-
-
-# Supported target languages for translation (display name → language code)
-TRANSLATION_LANGUAGES: Dict[str, str] = {
-    "None (keep original)": "",
-    "French 🇫🇷":           "fr",
-    "German 🇩🇪":           "de",
-    "Spanish 🇪🇸":          "es",
-    "Italian 🇮🇹":          "it",
-    "Portuguese 🇵🇹":       "pt",
-    "Dutch 🇳🇱":            "nl",
-    "Polish 🇵🇱":           "pl",
-    "Russian 🇷🇺":          "ru",
-    "Japanese 🇯🇵":         "ja",
-    "Korean 🇰🇷":           "ko",
-    "Chinese (Simplified) 🇨🇳": "zh-CN",
-    "Arabic 🇸🇦":           "ar",
-    "Hindi 🇮🇳":            "hi",
-    "Turkish 🇹🇷":          "tr",
-    "Indonesian 🇮🇩":       "id",
-    "Swedish 🇸🇪":          "sv",
-    "Norwegian 🇳🇴":        "no",
-    "Danish 🇩🇰":           "da",
-    "Finnish 🇫🇮":          "fi",
-    "Greek 🇬🇷":            "el",
-    "Hebrew 🇮🇱":           "iw",
-    "Thai 🇹🇭":             "th",
-    "Vietnamese 🇻🇳":       "vi",
-    "Malay 🇲🇾":            "ms",
-    "Ukrainian 🇺🇦":        "uk",
-}
-
-
-def translate_srt(
-    srt_path: str,
-    target_language: str,
-    source_language: str = "auto",
-    progress_callback: Optional[Callable[[float, str], None]] = None,
-) -> bool:
-    """
-    Translates an existing SRT file in-place to target_language using
-    deep-translator (Google Translate backend).
-
-    target_language: BCP-47 code, e.g. "fr", "de", "ja"
-    Returns True on success, False on failure.
-    """
-    def _p(v, msg=""):
-        if progress_callback:
-            try: progress_callback(v, msg)
-            except Exception: pass
-
-    if not translation_available():
-        return False
-
-    if not target_language:
-        return True  # no-op
-
-    try:
-        from deep_translator import GoogleTranslator
-    except ImportError:
-        return False
-
-    try:
-        with open(srt_path, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        # Parse SRT blocks: index \n timestamps \n text(s) \n
-        import re
-        blocks = re.split(r"\n\n+", content.strip())
-        translated_blocks = []
-
-        translator = GoogleTranslator(source=source_language, target=target_language)
-
-        for i, block in enumerate(blocks):
-            lines = block.strip().splitlines()
-            if len(lines) < 3:
-                translated_blocks.append(block)
-                continue
-
-            idx_line  = lines[0]   # "1"
-            time_line = lines[1]   # "00:00:01,000 --> 00:00:03,000"
-            text_lines = lines[2:] # actual subtitle text (may be multi-line)
-
-            text = " ".join(text_lines)
-            try:
-                translated = translator.translate(text)
-                if not translated:
-                    translated = text
-            except Exception:
-                translated = text  # fall back to original on error
-
-            translated_blocks.append(f"{idx_line}\n{time_line}\n{translated}")
-
-            if i % 10 == 0:
-                _p(i / len(blocks), f"🌐 Translating… {i}/{len(blocks)} lines")
-
-        translated_content = "\n\n".join(translated_blocks) + "\n"
-        with open(srt_path, "w", encoding="utf-8") as f:
-            f.write(translated_content)
-
-        _p(1.0, f"✅ Translated {len(translated_blocks)} subtitle blocks to [{target_language}]")
-        return True
-
-    except Exception as e:
-        print(f"Translation failed: {e}", file=sys.stderr)
-        return False
+        raise ProcessingError(f"FFmpeg failed (rc={r.returncode}):\n{r.stderr[-2000:]}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -452,7 +298,7 @@ def extract_thumbnail(path: str, t: float = 1.0) -> Optional[bytes]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Resolution resolver (upscale guard)
+#  Resolution resolver
 # ─────────────────────────────────────────────────────────────────────────────
 def resolve_target_size(label: str, orig_w: int, orig_h: int) -> Tuple[int, int]:
     tw, th = RESOLUTION_PRESETS.get(label, (0, 0))
@@ -490,29 +336,23 @@ def _get_model(weights: str = "yolov8n.pt") -> YOLO:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Face detector (OpenCV DNN — ships with cv2, zero extra deps)
+#  Face detection (OpenCV DNN / Haar fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 _face_net: Optional[cv2.dnn.Net] = None
 _FACE_PROTO = "deploy.prototxt"
 _FACE_MODEL = "res10_300x300_ssd_iter_140000.caffemodel"
 
 def _load_face_net() -> Optional[cv2.dnn.Net]:
-    """
-    Loads OpenCV's res10 SSD face detector if model files exist.
-    Falls back to cv2 Haar cascade (always available) otherwise.
-    Returns None only if both fail.
-    """
     global _face_net
     if _face_net is not None:
         return _face_net
-    # Try DNN model (better accuracy, needs caffemodel files)
     if os.path.exists(_FACE_PROTO) and os.path.exists(_FACE_MODEL):
         try:
             _face_net = cv2.dnn.readNetFromCaffe(_FACE_PROTO, _FACE_MODEL)
             return _face_net
         except Exception:
             pass
-    return None  # signal to caller to use Haar
+    return None
 
 
 _haar_cascade: Optional[cv2.CascadeClassifier] = None
@@ -533,10 +373,6 @@ def detect_faces(
     frame: np.ndarray,
     confidence_thresh: float = 0.6,
 ) -> List[Tuple[int, int, int, int]]:
-    """
-    Returns list of (x1, y1, x2, y2) face bounding boxes, largest first.
-    Uses DNN if available, Haar cascade as fallback.
-    """
     h, w = frame.shape[:2]
     net = _load_face_net()
     if net is not None:
@@ -562,7 +398,6 @@ def detect_faces(
         faces.sort(key=lambda f: (f[2]-f[0])*(f[3]-f[1]), reverse=True)
         return faces
 
-    # Haar fallback
     haar = _get_haar()
     if haar is None:
         return []
@@ -578,47 +413,342 @@ def detect_faces(
     return faces
 
 
-def talking_head_center(
-    faces: List[Tuple[int, int, int, int]],
-    orig_w: int,
-    orig_h: int,
-    crop_w: int,
-    crop_h: int,
-    upper_third_bias: float = 0.30,
-) -> Optional[Tuple[int, int]]:
+# ─────────────────────────────────────────────────────────────────────────────
+#  Lower-third guard
+# ─────────────────────────────────────────────────────────────────────────────
+def apply_lower_third_guard(
+    cy: int, crop_h: int, orig_h: int,
+    subject_cy_in_crop: int,
+) -> int:
     """
-    Given detected faces, compute a crop center that places the largest face
-    at the upper third of the crop (podcast / interview style).
-    With multiple faces: uses union bbox.
-    upper_third_bias: how strongly to pull face toward upper third [0–1].
+    Ensures that the detected subject center, when mapped into the crop,
+    does not fall below LOWER_THIRD_GUARD * crop_h (bottom 20% zone).
+    
+    If the subject would appear in the lower-third, shift crop center up
+    so the subject appears at exactly the guard boundary.
+    
+    Returns adjusted crop center y in source frame coordinates.
     """
-    if not faces:
-        return None
+    # Where would the subject appear in the crop?
+    # subject_y_in_crop = subject_cy_in_source - (cy - crop_h // 2)
+    # We want: subject_y_in_crop / crop_h <= LOWER_THIRD_GUARD
+    # So: subject_cy_in_source - cy + crop_h//2 <= LOWER_THIRD_GUARD * crop_h
+    # Rearranging: cy >= subject_cy_in_source - (LOWER_THIRD_GUARD * crop_h - crop_h//2)
+    
+    min_cy = subject_cy_in_crop - int(LOWER_THIRD_GUARD * crop_h) + crop_h // 2
+    hh = crop_h // 2
+    min_cy = max(min_cy, hh)
+    
+    if cy < min_cy:
+        return min_cy
+    return cy
 
-    # Union of all faces
-    ux1 = min(f[0] for f in faces)
-    uy1 = min(f[1] for f in faces)
-    ux2 = max(f[2] for f in faces)
-    uy2 = max(f[3] for f in faces)
 
-    face_cx = (ux1 + ux2) // 2
-    face_cy = (uy1 + uy2) // 2
+def _soi_region_label(cx: int, cy: int, w: int, h: int) -> str:
+    """Returns a human-readable region label for the SOI."""
+    col = "left" if cx < w // 3 else ("right" if cx > 2 * w // 3 else "center")
+    row = "upper" if cy < h // 3 else ("lower" if cy > 2 * h // 3 else "mid")
+    if row == "mid" and col == "center":
+        return "center"
+    if row == "mid":
+        return col
+    return f"{row}-{col}"
 
-    # Target: place face center at upper-third of crop
-    # upper_third of crop = crop_h // 3 from top of crop
-    # So crop_top = face_cy - crop_h//3
-    # Meaning crop center_y = face_cy - crop_h//3 + crop_h//2
-    #                       = face_cy + crop_h//6
-    target_cy = face_cy + crop_h // 6   # shift crop up so face appears at top third
 
-    # Blend with raw face center based on bias
-    cy = int(face_cy * (1 - upper_third_bias) + target_cy * upper_third_bias)
-    cx = face_cx
+# ─────────────────────────────────────────────────────────────────────────────
+#  Saliency / scene analysis helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def _frame_saliency_score(frame: np.ndarray, prev_frame: Optional[np.ndarray]) -> float:
+    """Compute a 0-1 saliency score for a frame (motion + visual complexity)."""
+    h, w = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # Spatial complexity: Laplacian variance
+    lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    lap_score = min(lap_var / 3000.0, 1.0)
+    
+    # Motion score vs previous frame
+    motion_score = 0.0
+    if prev_frame is not None:
+        diff = cv2.absdiff(gray, cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY))
+        motion_score = min(float(diff.mean()) / 30.0, 1.0)
+    
+    # Color vibrancy
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    sat_score = min(float(hsv[:, :, 1].mean()) / 128.0, 1.0)
+    
+    return 0.4 * motion_score + 0.4 * lap_score + 0.2 * sat_score
 
-    hw, hh = crop_w // 2, crop_h // 2
-    cx = max(hw, min(cx, orig_w - hw))
-    cy = max(hh, min(cy, orig_h - hh))
-    return cx, cy
+
+def _compute_frame_scores(
+    input_path: str,
+    fps: float,
+    total_frames: int,
+    sample_every: int = 15,  # sample every N frames
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+) -> Tuple[np.ndarray, List[int]]:
+    """
+    Returns:
+      scores: np.ndarray of saliency scores, one per sampled frame
+      scene_cut_frames: list of frame indices where scene cuts occur
+    """
+    def _p(v, msg=""):
+        if progress_callback:
+            try: progress_callback(v, msg)
+            except Exception: pass
+
+    scores: List[float] = []
+    scene_cuts: List[int] = []
+    
+    cap = cv2.VideoCapture(input_path)
+    prev_gray: Optional[np.ndarray] = None
+    prev_frame: Optional[np.ndarray] = None
+    frame_idx = 0
+    report_n = max(1, total_frames // 20)
+    
+    while frame_idx < total_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        if frame_idx % sample_every == 0:
+            curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # Scene cut detection
+            if prev_gray is not None:
+                diff_ratio = float(cv2.absdiff(prev_gray, curr_gray).mean()) / 255.0
+                if diff_ratio > 0.30:
+                    scene_cuts.append(frame_idx)
+            
+            score = _frame_saliency_score(frame, prev_frame)
+            scores.append(score)
+            prev_gray = curr_gray
+            prev_frame = frame.copy()
+        
+        if frame_idx % report_n == 0:
+            _p(frame_idx / total_frames, f"Scanning {frame_idx}/{total_frames}…")
+        
+        frame_idx += 1
+    
+    cap.release()
+    return np.array(scores, dtype=float), scene_cuts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Intelligent clip detection
+# ─────────────────────────────────────────────────────────────────────────────
+def detect_clips(
+    input_path: str,
+    min_duration_sec: float = 25.0,
+    max_duration_sec: float = 65.0,
+    target_n_clips: int = 10,
+    model: Optional[YOLO] = None,
+    confidence: float = 0.45,
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+) -> List[ClipSegment]:
+    """
+    Analyzes a long-form video and returns a ranked list of high-engagement
+    clip segments.
+    
+    Algorithm:
+    1. Sample frames, compute per-frame saliency score
+    2. Smooth the score curve, find peaks
+    3. Expand peaks into narrative arcs (begin/middle/end) using scene cuts
+    4. Enforce min/max duration, merge overlapping candidates
+    5. Detect SOI region per clip via subject tracking
+    6. Score and rank clips by engagement potential
+    """
+    def _p(v, msg=""):
+        if progress_callback:
+            try: progress_callback(v, msg)
+            except Exception: pass
+
+    info = get_video_info(input_path)
+    fps  = info["fps"]
+    total_frames = info["total_frames"]
+    duration = info["duration_seconds"]
+    orig_w, orig_h = info["width"], info["height"]
+    
+    sample_every = max(1, int(fps))   # 1 sample/sec for long videos
+    
+    _p(0.0, "🔍 Scanning video for engagement peaks…")
+    scores, scene_cuts_frames = _compute_frame_scores(
+        input_path, fps, total_frames,
+        sample_every=sample_every,
+        progress_callback=lambda v, m: _p(v * 0.45, m),
+    )
+    
+    if len(scores) == 0:
+        return []
+    
+    _p(0.45, "📊 Computing narrative arcs…")
+    
+    # Smooth score curve for peak detection
+    window = max(5, int(30 / (sample_every / fps)))  # ~30 sec smoothing
+    if len(scores) >= window:
+        kernel = np.ones(window) / window
+        smooth_scores = np.convolve(scores, kernel, mode="same")
+    else:
+        smooth_scores = scores.copy()
+    
+    # Normalize
+    if smooth_scores.max() > 0:
+        smooth_scores = smooth_scores / smooth_scores.max()
+    
+    # Convert scene cuts to sample indices
+    scene_cut_samples = sorted(set(
+        sc // sample_every for sc in scene_cuts_frames if sc // sample_every < len(scores)
+    ))
+    
+    # Find local peaks in score signal
+    # A peak = sample_i where smooth_scores[i] > neighbors within ±window//2
+    min_gap_samples = int(min_duration_sec * fps / sample_every)
+    
+    peaks: List[int] = []
+    for i in range(1, len(smooth_scores) - 1):
+        window_half = min_gap_samples // 2
+        lo = max(0, i - window_half)
+        hi = min(len(smooth_scores), i + window_half + 1)
+        if smooth_scores[i] == smooth_scores[lo:hi].max() and smooth_scores[i] > 0.3:
+            if not peaks or i - peaks[-1] > min_gap_samples // 2:
+                peaks.append(i)
+    
+    # Sort peaks by score descending
+    peaks.sort(key=lambda i: smooth_scores[i], reverse=True)
+    
+    # Keep top N*2 peaks (we'll filter later)
+    peaks = peaks[:target_n_clips * 2]
+    
+    # Expand each peak into a clip segment
+    def _find_arc_boundaries(peak_sample: int) -> Tuple[float, float]:
+        """
+        Grow a clip around a peak respecting:
+        - scene cut boundaries (prefer to start/end near a scene cut)
+        - min/max duration
+        - narrative arc: try to include pre-peak setup + post-peak resolution
+        """
+        peak_sec = peak_sample * sample_every / fps
+        
+        # Default: center the clip at the peak
+        half_dur = min(max_duration_sec / 2, 40.0)
+        raw_start = max(0.0, peak_sec - half_dur * 0.4)  # more post-peak
+        raw_end   = min(duration, raw_start + max_duration_sec)
+        
+        # Snap start to nearest preceding scene cut if within 10s
+        if scene_cuts_frames:
+            for sc_frame in reversed(scene_cuts_frames):
+                sc_sec = sc_frame / fps
+                if sc_sec < peak_sec and peak_sec - sc_sec < 15.0:
+                    raw_start = max(0.0, sc_sec - 1.0)
+                    break
+        
+        # Snap end to nearest following scene cut if within 10s
+        if scene_cuts_frames:
+            for sc_frame in scene_cuts_frames:
+                sc_sec = sc_frame / fps
+                if sc_sec > peak_sec and sc_sec - peak_sec < 15.0:
+                    raw_end = min(duration, sc_sec + 0.5)
+                    break
+        
+        # Enforce duration bounds
+        clip_dur = raw_end - raw_start
+        if clip_dur < min_duration_sec:
+            raw_end = min(duration, raw_start + min_duration_sec)
+        if clip_dur > max_duration_sec:
+            # Tighten around peak
+            center = (raw_start + raw_end) / 2
+            raw_start = max(0.0, center - max_duration_sec / 2)
+            raw_end   = min(duration, raw_start + max_duration_sec)
+        
+        return raw_start, raw_end
+    
+    _p(0.55, "🎯 Detecting subject regions per clip…")
+    
+    # Merge overlapping candidates
+    clip_candidates: List[Tuple[float, float, float]] = []  # (start, end, score)
+    for peak_i in peaks:
+        start, end = _find_arc_boundaries(peak_i)
+        peak_score = float(smooth_scores[peak_i])
+        
+        # Check overlap with existing candidates
+        overlaps = False
+        for ci, (cs, ce, _) in enumerate(clip_candidates):
+            overlap = min(end, ce) - max(start, cs)
+            if overlap > min_duration_sec * 0.5:
+                overlaps = True
+                break
+        
+        if not overlaps:
+            clip_candidates.append((start, end, peak_score))
+    
+    # Sort by start time
+    clip_candidates.sort(key=lambda x: x[0])
+    
+    # Keep top N by score, re-sort by time
+    clip_candidates.sort(key=lambda x: x[2], reverse=True)
+    clip_candidates = clip_candidates[:target_n_clips]
+    clip_candidates.sort(key=lambda x: x[0])
+    
+    # Detect SOI per clip (sample a few frames from each clip)
+    segments: List[ClipSegment] = []
+    for clip_idx, (start_sec, end_sec, score) in enumerate(clip_candidates):
+        _p(0.55 + 0.35 * (clip_idx / max(len(clip_candidates), 1)),
+           f"🎯 Analyzing clip {clip_idx + 1}/{len(clip_candidates)}…")
+        
+        soi_region = "center"
+        peak_frame = int((start_sec + end_sec) / 2 * fps)
+        
+        # Sample frames from this clip to find dominant SOI
+        soi_xs, soi_ys = [], []
+        cap = cv2.VideoCapture(input_path)
+        sample_times = np.linspace(start_sec + 1, end_sec - 1, min(8, int(end_sec - start_sec)))
+        
+        for t in sample_times:
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            
+            if model is not None:
+                try:
+                    results = model(frame, verbose=False, conf=confidence)[0]
+                    if results.boxes is not None and len(results.boxes) > 0:
+                        for box in results.boxes:
+                            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                            soi_xs.append((x1 + x2) // 2)
+                            soi_ys.append((y1 + y2) // 2)
+                except Exception:
+                    pass
+            else:
+                # Saliency-based SOI
+                sal_cx, sal_cy = saliency_center(frame)
+                soi_xs.append(sal_cx)
+                soi_ys.append(sal_cy)
+        
+        cap.release()
+        
+        if soi_xs:
+            median_cx = int(np.median(soi_xs))
+            median_cy = int(np.median(soi_ys))
+            soi_region = _soi_region_label(median_cx, median_cy, orig_w, orig_h)
+            peak_frame = int(sample_times[len(sample_times)//2] * fps)
+        
+        # Compute clip title
+        mins_s = int(start_sec // 60)
+        secs_s = int(start_sec % 60)
+        title = f"Clip {clip_idx + 1}  ({mins_s}:{secs_s:02d} – {int(end_sec//60)}:{int(end_sec%60):02d})"
+        
+        segments.append(ClipSegment(
+            start_sec=start_sec,
+            end_sec=end_sec,
+            score=score,
+            soi_region=soi_region,
+            peak_frame=peak_frame,
+            title=title,
+        ))
+    
+    _p(1.0, f"✅ Found {len(segments)} high-engagement clips")
+    return segments
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -677,11 +807,52 @@ def frame_for_union(
 ) -> Tuple[int, int]:
     ucx = (ux1+ux2)//2; ucy = (uy1+uy2)//2
     hw, hh = crop_w//2, crop_h//2
-    return max(hw, min(ucx, orig_w-hw)), max(hh, min(ucy, orig_h-hh))
+    cx = max(hw, min(ucx, orig_w-hw))
+    cy = max(hh, min(ucy, orig_h-hh))
+    
+    # Apply lower-third guard
+    cy = apply_lower_third_guard(cy, crop_h, orig_h, ucy)
+    cy = max(hh, min(cy, orig_h - hh))
+    
+    return cx, cy
+
+
+def talking_head_center(
+    faces: List[Tuple[int, int, int, int]],
+    orig_w: int,
+    orig_h: int,
+    crop_w: int,
+    crop_h: int,
+    upper_third_bias: float = 0.30,
+) -> Optional[Tuple[int, int]]:
+    if not faces:
+        return None
+
+    ux1 = min(f[0] for f in faces)
+    uy1 = min(f[1] for f in faces)
+    ux2 = max(f[2] for f in faces)
+    uy2 = max(f[3] for f in faces)
+
+    face_cx = (ux1 + ux2) // 2
+    face_cy = (uy1 + uy2) // 2
+
+    target_cy = face_cy + crop_h // 6
+    cy = int(face_cy * (1 - upper_third_bias) + target_cy * upper_third_bias)
+    cx = face_cx
+
+    hw, hh = crop_w // 2, crop_h // 2
+    cx = max(hw, min(cx, orig_w - hw))
+    cy = max(hh, min(cy, orig_h - hh))
+    
+    # Lower-third guard for face
+    cy = apply_lower_third_guard(cy, crop_h, orig_h, face_cy)
+    cy = max(hh, min(cy, orig_h - hh))
+    
+    return cx, cy
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Optical flow / saliency fallbacks
+#  Optical flow / saliency
 # ─────────────────────────────────────────────────────────────────────────────
 def optical_flow_center(
     prev: np.ndarray, curr: np.ndarray, w: int, h: int
@@ -718,7 +889,9 @@ def saliency_center(frame: np.ndarray) -> Tuple[int,int]:
     t = sal.sum()
     if t<1e-6: return w//2, h//2
     ys, xs = np.mgrid[0:h, 0:w]
-    return int((xs*sal).sum()/t), int((ys*sal).sum()/t)
+    cx = int((xs*sal).sum()/t)
+    cy = int((ys*sal).sum()/t)
+    return cx, cy
 
 
 def is_scene_change(
@@ -732,7 +905,7 @@ def is_scene_change(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Framing bias (look-room + rule-of-thirds)
+#  Framing bias
 # ─────────────────────────────────────────────────────────────────────────────
 def apply_framing_bias(
     cx:int, cy:int, vx:float, vy:float, speed:float,
@@ -834,7 +1007,7 @@ def smooth_centers(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Interpolation O(n log n)
+#  Interpolation
 # ─────────────────────────────────────────────────────────────────────────────
 def interpolate_centers(
     centers:List[Tuple[int,int]], indices:List[int], total:int
@@ -865,46 +1038,193 @@ def calculate_crop_dims(orig_w:int, orig_h:int, tw:int, th:int) -> Tuple[int,int
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Main processing function
+#  Whisper transcription → SRT
+# ─────────────────────────────────────────────────────────────────────────────
+def _seconds_to_srt_time(s: float) -> str:
+    h  = int(s // 3600)
+    m  = int((s % 3600) // 60)
+    sc = int(s % 60)
+    ms = int((s - int(s)) * 1000)
+    return f"{h:02d}:{m:02d}:{sc:02d},{ms:03d}"
+
+
+def transcribe_to_srt(
+    video_path: str,
+    srt_path: str,
+    whisper_model: str = "base",
+    language: Optional[str] = None,
+    max_chars_per_line: int = 42,
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+) -> bool:
+    def _p(v, msg=""):
+        if progress_callback:
+            try: progress_callback(v, msg)
+            except Exception: pass
+
+    if not whisper_available():
+        return False
+
+    import whisper
+
+    _p(0.0, "🎙️ Extracting audio for transcription…")
+
+    wav_fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(wav_fd)
+
+    try:
+        if not _extract_audio_wav(video_path, wav_path):
+            return False
+
+        _p(0.2, f"📝 Transcribing with Whisper ({whisper_model})…")
+        model = whisper.load_model(whisper_model)
+        opts: Dict[str, Any] = {"word_timestamps": True, "verbose": False}
+        if language:
+            opts["language"] = language
+        result = model.transcribe(wav_path, **opts)
+
+        _p(0.85, "✍️ Writing subtitles…")
+
+        lines = []
+        idx   = 1
+        words = []
+        for seg in result.get("segments", []):
+            for w in seg.get("words", []):
+                words.append({
+                    "word":  w["word"].strip(),
+                    "start": w["start"],
+                    "end":   w["end"],
+                })
+
+        buf: List[Dict] = []
+        buf_len = 0
+
+        def flush_buf():
+            nonlocal idx, buf, buf_len
+            if not buf:
+                return
+            text  = " ".join(w["word"] for w in buf)
+            start = _seconds_to_srt_time(buf[0]["start"])
+            end   = _seconds_to_srt_time(buf[-1]["end"])
+            lines.append(f"{idx}\n{start} --> {end}\n{text}\n")
+            idx += 1
+            buf = []
+            buf_len = 0
+
+        for w in words:
+            wlen = len(w["word"]) + 1
+            if buf_len + wlen > max_chars_per_line and buf:
+                flush_buf()
+            buf.append(w)
+            buf_len += wlen
+
+        flush_buf()
+
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        _p(1.0, f"✅ {len(lines)} subtitle lines written")
+        return True
+
+    except Exception as e:
+        print(f"Whisper transcription failed: {e}", file=sys.stderr)
+        return False
+    finally:
+        if os.path.exists(wav_path):
+            try: os.unlink(wav_path)
+            except OSError: pass
+
+
+def translate_srt(
+    srt_path: str,
+    target_language: str,
+    source_language: str = "auto",
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+) -> bool:
+    def _p(v, msg=""):
+        if progress_callback:
+            try: progress_callback(v, msg)
+            except Exception: pass
+
+    if not translation_available():
+        return False
+    if not target_language:
+        return True
+
+    try:
+        from deep_translator import GoogleTranslator
+    except ImportError:
+        return False
+
+    try:
+        import re
+        with open(srt_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        blocks = re.split(r"\n\n+", content.strip())
+        translated_blocks = []
+        translator = GoogleTranslator(source=source_language, target=target_language)
+
+        for i, block in enumerate(blocks):
+            lines = block.strip().splitlines()
+            if len(lines) < 3:
+                translated_blocks.append(block)
+                continue
+            idx_line  = lines[0]
+            time_line = lines[1]
+            text_lines = lines[2:]
+            text = " ".join(text_lines)
+            try:
+                translated = translator.translate(text) or text
+            except Exception:
+                translated = text
+
+            translated_blocks.append(f"{idx_line}\n{time_line}\n{translated}")
+            if i % 10 == 0:
+                _p(i / len(blocks), f"🌐 Translating… {i}/{len(blocks)}")
+
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write("\n\n".join(translated_blocks) + "\n")
+
+        _p(1.0, f"✅ Translated {len(translated_blocks)} subtitle blocks")
+        return True
+
+    except Exception as e:
+        print(f"Translation failed: {e}", file=sys.stderr)
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Main single-clip processing function
 # ─────────────────────────────────────────────────────────────────────────────
 def process_video(
     input_path: str,
     output_path: str,
-    # Resolution
     target_preset_label: str = "Match source (no upscale)",
-    # Tracking mode
-    tracking_mode: str = "subject",        # "subject" | "talking_head"
-    talking_head_bias: float = 0.30,       # how strongly to pull face to upper-third
-    # Detection
+    tracking_mode: str = "subject",
+    talking_head_bias: float = 0.30,
     sample_interval: Optional[int] = None,
     confidence: float = 0.45,
     use_optical_flow: bool = True,
-    # Smoothing
     smooth_window: int = 15,
     adaptive_smoothing: bool = True,
-    # Framing
     rule_of_thirds: bool = True,
     scene_cut_threshold: float = 0.35,
-    # Output
     output_fps: Optional[float] = None,
     crf: int = 23,
     encoder_preset: str = "fast",
     audio_bitrate: str = "128k",
     yolo_weights: str = "yolov8n.pt",
-    # Subtitles
     burn_subtitles: bool = False,
     whisper_model: str = "base",
     whisper_language: Optional[str] = None,
     subtitle_style_name: str = "Bold White (TikTok)",
     subtitle_max_chars: int = 42,
-    subtitle_translate_to: Optional[str] = None,   # BCP-47 code, e.g. "fr", "de"
-    # Callback
+    subtitle_translate_to: Optional[str] = None,
     progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> Dict[str, Any]:
     """
-    Returns a dict with metadata about the processing result:
-      {"output_path": str, "subtitle_path": str|None, "clamped": bool,
-       "effective_size": (w,h), "duration": float}
+    Convert a single landscape video to 9:16 vertical.
+    Returns metadata dict with output_path, subtitle_path, etc.
     """
 
     def _p(v: float, msg: str = ""):
@@ -920,7 +1240,6 @@ def process_video(
         "duration":       0.0,
     }
 
-    # ── Validate ─────────────────────────────────────────────────────────
     _check_ffmpeg()
     if not os.path.exists(input_path):
         raise ProcessingError(f"Input not found: {input_path}")
@@ -941,14 +1260,13 @@ def process_video(
           else "Match source (no upscale)"
     target_w, target_h = resolve_target_size(lbl, orig_w, orig_h)
 
-    # Check if clamped (requested size was larger than source)
     req_w, req_h = RESOLUTION_PRESETS.get(lbl, (0, 0))
     clamped = req_h > 0 and (target_h < req_h or target_w < req_w)
     result_meta["clamped"] = clamped
     result_meta["effective_size"] = (target_w, target_h)
     result_meta["duration"] = duration
 
-    _p(0.01, f"📐 Output {target_w}×{target_h} (source {orig_w}×{orig_h})")
+    _p(0.01, f"📐 Output {target_w}×{target_h}")
 
     if not sample_interval:
         sample_interval = max(1, int(fps/2))
@@ -956,42 +1274,28 @@ def process_video(
     render_fps = float(output_fps) if output_fps and output_fps>0 else fps
     crop_w, crop_h = calculate_crop_dims(orig_w, orig_h, target_w, target_h)
 
-    # ── Phase 0: Whisper (runs first so progress bar flows nicely) ────────
+    # ── Whisper ───────────────────────────────────────────────────────────
     srt_path: Optional[str] = None
     if burn_subtitles and _has_audio(input_path):
-        _p(0.02, "🎙️ Transcribing audio with Whisper…")
+        _p(0.02, "🎙️ Transcribing…")
         srt_fd, srt_path = tempfile.mkstemp(suffix=".srt")
         os.close(srt_fd)
-
-        def sub_cb(v, msg=""):
-            _p(0.02 + v * 0.08, msg)   # 2–10% of total progress
 
         ok = transcribe_to_srt(
             input_path, srt_path,
             whisper_model=whisper_model,
             language=whisper_language,
             max_chars_per_line=subtitle_max_chars,
-            progress_callback=sub_cb,
+            progress_callback=lambda v, m: _p(0.02 + v * 0.08, m),
         )
         if not ok:
-            _p(0.10, "⚠️ Transcription failed — continuing without subtitles")
             if os.path.exists(srt_path):
                 os.unlink(srt_path)
             srt_path = None
         else:
-            # ── Optional: translate SRT to target language ────────────────
             if subtitle_translate_to:
-                _p(0.10, f"🌐 Translating subtitles to [{subtitle_translate_to}]…")
-                def trans_cb(v, msg=""):
-                    _p(0.10 + v * 0.05, msg)   # 10–15% of total progress
-
-                t_ok = translate_srt(
-                    srt_path,
-                    target_language=subtitle_translate_to,
-                    progress_callback=trans_cb,
-                )
-                if not t_ok:
-                    _p(0.15, "⚠️ Translation failed — using original language subtitles")
+                translate_srt(srt_path, target_language=subtitle_translate_to,
+                              progress_callback=lambda v, m: _p(0.10 + v * 0.05, m))
             result_meta["subtitle_path"] = srt_path
 
     # ── Load model ────────────────────────────────────────────────────────
@@ -1000,16 +1304,10 @@ def process_video(
         _p(start_pct, "🤖 Loading AI model…")
         model = _get_model(yolo_weights)
     else:
-        # Talking head: ensure Haar is loadable
         model = None
-        _p(start_pct, "👤 Talking Head Mode — loading face detector…")
-        if _get_haar() is None and _load_face_net() is None:
-            raise ProcessingError(
-                "No face detector available. "
-                "OpenCV Haar cascade not found — reinstall opencv-python."
-            )
+        _p(start_pct, "👤 Loading face detector…")
 
-    # ── Phase 1: Detection ────────────────────────────────────────────────
+    # ── Detection pass ────────────────────────────────────────────────────
     _p(start_pct + 0.02, f"🔎 Analysing {total_frames} frames…")
 
     det_centers: List[Tuple[int,int]] = []
@@ -1039,29 +1337,23 @@ def process_video(
             center = None
 
             if tracking_mode == "talking_head":
-                # ── Talking Head: face detector primary ───────────────
                 faces = detect_faces(frame, confidence_thresh=0.5)
                 if faces:
                     center = talking_head_center(
-                        faces, orig_w, orig_h, crop_w, crop_h, talking_head_bias
-                    )
+                        faces, orig_w, orig_h, crop_w, crop_h, talking_head_bias)
                 elif use_optical_flow:
-                    # Face lost — track via optical flow to avoid jarring snap
                     small = cv2.resize(curr_gray, (orig_w//2, orig_h//2))
                     if prev_flow is not None:
                         fc = optical_flow_center(prev_flow, small, orig_w//2, orig_h//2)
                         if fc is not None:
                             center = (fc[0]*2, fc[1]*2)
                     prev_flow = small
-
             else:
-                # ── Subject tracking: YOLO primary ────────────────────
                 det = detect_subjects(frame, model, confidence)
                 if det is not None:
                     center = frame_for_union(
                         det.ux1, det.uy1, det.ux2, det.uy2,
-                        orig_w, orig_h, crop_w, crop_h,
-                    )
+                        orig_w, orig_h, crop_w, crop_h)
                 elif use_optical_flow:
                     small = cv2.resize(curr_gray, (orig_w//2, orig_h//2))
                     if prev_flow is not None:
@@ -1079,12 +1371,11 @@ def process_video(
         frame_idx += 1
         if frame_idx % report_n == 0:
             pct = start_pct + 0.02 + (det_phase_end - start_pct - 0.02) * (frame_idx/total_frames)
-            _p(pct, f"🔎 {frame_idx}/{total_frames} frames…")
+            _p(pct, f"🔎 {frame_idx}/{total_frames}…")
 
     cap.release()
     _p(det_phase_end, f"📍 {len(det_centers)} anchors · {len(scene_cuts)} scene cuts")
 
-    # Merge saliency into gaps
     if not det_centers:
         det_centers = sal_centers or [(orig_w//2, orig_h//2)]
         det_indices = sal_indices  or [0]
@@ -1097,16 +1388,14 @@ def process_video(
         det_indices = [p[0] for p in pairs]
         det_centers = [p[1] for p in pairs]
 
-    # ── Phase 2: Path ─────────────────────────────────────────────────────
+    # ── Path computation ──────────────────────────────────────────────────
     _p(0.43, "📈 Computing crop path…")
     all_centers = interpolate_centers(det_centers, det_indices, total_frames)
     speeds      = _compute_speeds(all_centers)
     all_centers = smooth_centers(
         all_centers, speeds, base_window=smooth_window,
-        adaptive=adaptive_smoothing, scene_cuts=scene_cuts,
-    )
+        adaptive=adaptive_smoothing, scene_cuts=scene_cuts)
 
-    # Talking Head: skip look-room (face shouldn't lead itself)
     if rule_of_thirds and tracking_mode != "talking_head":
         speeds   = _compute_speeds(all_centers, smooth=3)
         vel_vecs = _compute_vel_vecs(all_centers, look=3)
@@ -1114,11 +1403,9 @@ def process_video(
         for i, (cx, cy) in enumerate(all_centers):
             vx, vy = vel_vecs[i]
             framed.append(apply_framing_bias(
-                cx, cy, vx, vy, speeds[i], orig_w, orig_h, crop_w, crop_h,
-            ))
+                cx, cy, vx, vy, speeds[i], orig_w, orig_h, crop_w, crop_h))
         all_centers = framed
     elif tracking_mode == "talking_head" and rule_of_thirds:
-        # For talking head: gentle horizontal rule-of-thirds only (no look-room)
         framed = []
         for cx, cy in all_centers:
             tx = min([orig_w//3, 2*orig_w//3], key=lambda x: abs(x-cx))
@@ -1128,7 +1415,6 @@ def process_video(
             framed.append((nx, cy))
         all_centers = framed
 
-    # Final boundary clamp
     hw, hh = crop_w//2, crop_h//2
     all_centers = [
         (max(hw, min(cx, orig_w-hw)), max(hh, min(cy, orig_h-hh)))
@@ -1138,7 +1424,7 @@ def process_video(
         all_centers += [all_centers[-1]]*(total_frames-len(all_centers))
     all_centers = all_centers[:total_frames]
 
-    # ── Phase 3: Render to temp .avi ─────────────────────────────────────
+    # ── Render ────────────────────────────────────────────────────────────
     _p(0.46, "✂️ Rendering frames…")
     temp_avi: Optional[str] = None
     temp_mp4: Optional[str] = None
@@ -1173,13 +1459,11 @@ def process_video(
         if not os.path.exists(temp_avi) or os.path.getsize(temp_avi)<1000:
             raise ProcessingError("Rendered .avi is empty.")
 
-        # ── Phase 4: FFmpeg encode ────────────────────────────────────────
-        _p(0.87, "🎵 Encoding…" + (" Burning subtitles…" if srt_path else ""))
+        _p(0.87, "🎵 Encoding…")
         fd, temp_mp4 = tempfile.mkstemp(suffix=".mp4")
         os.close(fd)
 
-        style = SUBTITLE_STYLES.get(subtitle_style_name,
-                                    SUBTITLE_STYLES["Bold White (TikTok)"])
+        style = SUBTITLE_STYLES.get(subtitle_style_name, SUBTITLE_STYLES["Bold White (TikTok)"])
         _ffmpeg_encode(
             temp_avi,
             input_path if _has_audio(input_path) else None,
@@ -1198,7 +1482,6 @@ def process_video(
         temp_mp4 = None
 
         _p(1.0, "✅ Done!")
-        print(f"✅ {output_path} ({os.path.getsize(output_path)/1024**2:.1f} MB)")
         return result_meta
 
     finally:
@@ -1206,5 +1489,98 @@ def process_video(
             if p and os.path.exists(p):
                 try: os.unlink(p)
                 except OSError: pass
-        # Keep srt alive — caller may want to offer download
-        # It is the caller's responsibility to clean up srt_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Auto-clip pipeline: detect + batch verticalize
+# ─────────────────────────────────────────────────────────────────────────────
+def process_clips_batch(
+    input_path: str,
+    output_dir: str,
+    clips: List[ClipSegment],
+    target_preset_label: str = "720p   (720×1280  — HD)",
+    tracking_mode: str = "subject",
+    talking_head_bias: float = 0.30,
+    confidence: float = 0.45,
+    smooth_window: int = 15,
+    adaptive_smoothing: bool = True,
+    rule_of_thirds: bool = True,
+    crf: int = 23,
+    encoder_preset: str = "fast",
+    audio_bitrate: str = "128k",
+    yolo_weights: str = "yolov8n.pt",
+    burn_subtitles: bool = False,
+    whisper_model: str = "base",
+    subtitle_style_name: str = "Bold White (TikTok)",
+    subtitle_max_chars: int = 42,
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Batch-verticalize a list of detected clips.
+    Trims each clip from the source, then runs the verticalization pipeline.
+    Returns list of result dicts with output paths.
+    """
+    def _p(v, msg=""):
+        if progress_callback:
+            try: progress_callback(v, msg)
+            except Exception: pass
+
+    os.makedirs(output_dir, exist_ok=True)
+    results = []
+
+    for i, clip in enumerate(clips):
+        base_pct = i / len(clips)
+        next_pct = (i + 1) / len(clips)
+
+        _p(base_pct, f"✂️ Processing clip {i+1}/{len(clips)}…")
+
+        # Trim the clip from source
+        fd, trimmed_path = tempfile.mkstemp(suffix=".mp4")
+        os.close(fd)
+
+        try:
+            trim_ok = _trim_video(input_path, trimmed_path,
+                                   clip.start_sec, clip.end_sec)
+            if not trim_ok:
+                results.append({"clip": clip, "output_path": None, "error": "trim failed"})
+                continue
+
+            # Output path
+            safe_title = f"clip_{i+1:02d}_{int(clip.start_sec)}s_{int(clip.end_sec)}s"
+            out_path = os.path.join(output_dir, f"{safe_title}_vertical.mp4")
+
+            def clip_cb(v, msg=""):
+                _p(base_pct + v * (next_pct - base_pct), msg)
+
+            meta = process_video(
+                trimmed_path, out_path,
+                target_preset_label=target_preset_label,
+                tracking_mode=tracking_mode,
+                talking_head_bias=talking_head_bias,
+                confidence=confidence,
+                smooth_window=smooth_window,
+                adaptive_smoothing=adaptive_smoothing,
+                rule_of_thirds=rule_of_thirds,
+                crf=crf,
+                encoder_preset=encoder_preset,
+                audio_bitrate=audio_bitrate,
+                yolo_weights=yolo_weights,
+                burn_subtitles=burn_subtitles,
+                whisper_model=whisper_model,
+                subtitle_style_name=subtitle_style_name,
+                subtitle_max_chars=subtitle_max_chars,
+                progress_callback=clip_cb,
+            )
+            meta["clip"] = clip
+            results.append(meta)
+
+        except Exception as e:
+            results.append({"clip": clip, "output_path": out_path if 'out_path' in dir() else None,
+                            "error": str(e)})
+        finally:
+            if os.path.exists(trimmed_path):
+                try: os.unlink(trimmed_path)
+                except OSError: pass
+
+    _p(1.0, f"✅ Batch complete — {len([r for r in results if not r.get('error')])} clips done")
+    return results
