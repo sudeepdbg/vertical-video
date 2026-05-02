@@ -210,6 +210,23 @@ video { border-radius: var(--r) !important; width: 100% !important; }
 }
 .stCaption, small { color:var(--ink3) !important; font-size:10px !important; }
 [data-testid="stHorizontalBlock"] { gap:10px !important; }
+
+/* Radio buttons */
+[data-testid="stRadio"] label { font-size:12px !important; color:var(--ink2) !important; }
+[data-testid="stRadio"] [data-testid="stMarkdownContainer"] p { font-size:12px !important; }
+[data-testid="stRadio"] > div { gap:6px !important; }
+
+/* Vertical video player — 9:16 constrained preview */
+div[style*="max-width:220px"] video {
+  max-height:390px !important;
+  width:100% !important;
+  border-radius:8px !important;
+  display:block !important;
+}
+div[style*="max-width:220px"] [data-testid="stVideo"] {
+  border-radius:8px !important;
+  overflow:hidden !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -227,6 +244,8 @@ _DEFAULTS = dict(
     detected_clips=None, selected_clip_indices=None,
     clip_results=None, scan_done=False,
     clip_out_dir=None,
+    # vertical player: index of the clip currently being previewed (-1 = none)
+    playing_clip_idx=-1,
 )
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -244,6 +263,7 @@ def _cleanup() -> None:
         srt_bytes=None, video_info=None, processing_done=False,
         detected_clips=None, selected_clip_indices=None,
         clip_results=None, scan_done=False, clip_out_dir=None,
+        playing_clip_idx=-1,
     )
 
 
@@ -449,6 +469,11 @@ with tab_adv:
     """, unsafe_allow_html=True)
 
 # Clip settings (auto-clip mode only)
+_CLIP_PRESETS = {
+    "15 sec  (snappy highlight)": (13, 17),
+    "30 sec  (short reel)":       (25, 35),
+    "60 sec  (full segment)":     (50, 65),
+}
 clip_min_dur  = 25
 clip_max_dur  = 60
 clip_target_n = 8
@@ -457,8 +482,17 @@ if app_mode == "autoClip" and tab_clip is not None:
         st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
         cl1, cl2 = st.columns(2, gap="medium")
         with cl1:
-            clip_min_dur = st.slider("Min clip duration (s)", 15, 45, 25, 5)
-            clip_max_dur = st.slider("Max clip duration (s)", 30, 90, 60, 5)
+            preset_label = st.radio(
+                "Clip length preset",
+                list(_CLIP_PRESETS.keys()),
+                index=2,
+                help="Sets the target duration window for each detected clip",
+            )
+            clip_min_dur, clip_max_dur = _CLIP_PRESETS[preset_label]
+            st.markdown(
+                f"<div style='font-size:10px;color:var(--ink3);margin-top:4px;'>"
+                f"Window: {clip_min_dur}s – {clip_max_dur}s</div>",
+                unsafe_allow_html=True)
         with cl2:
             clip_target_n = st.slider("Target # clips", 3, 20, 8, 1)
             st.markdown("""
@@ -621,20 +655,29 @@ with col_out:
                 f"{len(clips)} clips found · {len(sel)} selected</div>",
                 unsafe_allow_html=True)
 
+            # Build index-based results map: clip_index -> result dict
+            # (reliable across reruns unlike id())
             clip_results_map: dict = {}
             if st.session_state.clip_results:
+                # clip_results are stored in selection order; map by start_sec key
                 for r in st.session_state.clip_results:
                     clip_obj = r.get("clip")
                     if clip_obj is not None:
-                        clip_results_map[id(clip_obj)] = r
+                        # Key = (start_sec, end_sec) tuple — stable across reruns
+                        clip_results_map[(round(clip_obj.start_sec, 1),
+                                          round(clip_obj.end_sec, 1))] = r
+
+            playing_idx = st.session_state.playing_clip_idx
 
             for ci, clip in enumerate(clips):
                 score_pct = int(clip.score * 100)
                 score_cls = "h" if clip.score > 0.7 else ("m" if clip.score > 0.4 else "")
                 is_sel    = ci in sel
+                is_playing = (playing_idx == ci)
 
-                # Check if this clip has a finished result
-                result_for_clip = clip_results_map.get(id(clip))
+                # Stable key lookup
+                clip_key = (round(clip.start_sec, 1), round(clip.end_sec, 1))
+                result_for_clip = clip_results_map.get(clip_key)
                 is_done = (
                     result_for_clip is not None
                     and not result_for_clip.get("error")
@@ -642,10 +685,10 @@ with col_out:
                     and os.path.exists(result_for_clip["output_path"])
                 )
 
-                mins_s = int(clip.start_sec // 60)
-                secs_s = int(clip.start_sec % 60)
-                mins_e = int(clip.end_sec // 60)
-                secs_e = int(clip.end_sec % 60)
+                mins_s   = int(clip.start_sec // 60)
+                secs_s   = int(clip.start_sec % 60)
+                mins_e   = int(clip.end_sec // 60)
+                secs_e   = int(clip.end_sec % 60)
                 time_str = f"{mins_s}:{secs_s:02d} → {mins_e}:{secs_e:02d}"
 
                 card_cls = "rf-ccard" + (" done" if is_done else (" sel" if is_sel else ""))
@@ -663,20 +706,16 @@ with col_out:
                   {done_tag}
                 </div>""", unsafe_allow_html=True)
 
-                cb_col, dl_col = st.columns([2, 1])
-                with cb_col:
-                    if not is_done:
-                        toggled = st.checkbox(
-                            "✓ Selected" if is_sel else "Include",
-                            value=is_sel, key=f"csel_{ci}")
-                        if toggled != is_sel:
-                            if toggled:
-                                st.session_state.selected_clip_indices.add(ci)
-                            else:
-                                st.session_state.selected_clip_indices.discard(ci)
+                if is_done:
+                    # Row: Play toggle | Download
+                    btn_col, dl_col = st.columns([1, 1])
+                    with btn_col:
+                        play_label = "⏹ Close player" if is_playing else "▶ Play vertical"
+                        if st.button(play_label, key=f"play_{ci}",
+                                     type="secondary", use_container_width=True):
+                            st.session_state.playing_clip_idx = -1 if is_playing else ci
                             st.rerun()
-                with dl_col:
-                    if is_done:
+                    with dl_col:
                         try:
                             with open(result_for_clip["output_path"], "rb") as f:
                                 clip_bytes = f.read()
@@ -689,6 +728,39 @@ with col_out:
                                 use_container_width=True)
                         except Exception:
                             pass
+
+                    # Vertical player — only shown for the active clip
+                    if is_playing:
+                        try:
+                            with open(result_for_clip["output_path"], "rb") as f:
+                                clip_bytes_play = f.read()
+                            st.markdown(
+                                "<div style='"
+                                "background:#111;border-radius:10px;overflow:hidden;"
+                                "max-width:220px;margin:8px auto 4px;"
+                                "box-shadow:0 4px 20px rgba(0,0,0,0.25);'>"
+                                "<div style='text-align:center;padding:6px 0 2px;"
+                                "font-size:10px;font-weight:700;color:#666;"
+                                "letter-spacing:.08em;text-transform:uppercase;'>9:16 Preview</div>",
+                                unsafe_allow_html=True)
+                            st.video(clip_bytes_play, format="video/mp4")
+                            st.markdown("</div>", unsafe_allow_html=True)
+                        except Exception:
+                            pass
+
+                else:
+                    # Not yet converted — show include checkbox
+                    cb_col, _ = st.columns([2, 1])
+                    with cb_col:
+                        toggled = st.checkbox(
+                            "✓ Selected" if is_sel else "Include",
+                            value=is_sel, key=f"csel_{ci}")
+                        if toggled != is_sel:
+                            if toggled:
+                                st.session_state.selected_clip_indices.add(ci)
+                            else:
+                                st.session_state.selected_clip_indices.discard(ci)
+                            st.rerun()
         else:
             st.markdown("""
             <div class="rf-empty">
