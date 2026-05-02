@@ -2,7 +2,5 @@ streamlit>=1.28.0
 opencv-python-headless>=4.8.0
 ultralytics>=8.0.0
 numpy>=1.24.0
-moviepy>=1.0.3
-Pillow>=10.0.0
-openai-whisper
-deep-translator
+openai-whisper>=1.0.0
+deep-translator>=1.11.0
