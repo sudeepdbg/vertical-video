@@ -3,7 +3,7 @@ verticalize.py
 ──────────────
 AI Video Verticalizer · Subject Tracking · Long-Form Auto-Clip Extraction
 • YOLOv8 + Optical Flow + Saliency
-• Talking Head Mode (DNN/Haar face lock)
+• Talking Head Mode (DNN face lock)
 • Whisper subtitles + translation
 • Auto-Clip Detection (Saliency Peaks + Narrative Arch)
 • Lower-Third Safe Zone Enforcement
@@ -22,16 +22,17 @@ import re
 from collections import namedtuple
 from typing import Optional, Callable, List, Tuple, Dict, Any
 
-─────────────────────────────────────────────────────────────────────────────
-# Classes & Constants
-─────────────────────────────────────────────────────────────────────────────
-class ProcessingError(Exception): pass
+# ─────────────────────────────────────────────────────────────────────────
+# CLASSES & CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────
+class ProcessingError(Exception):
+    pass
 
 ClipSegment = namedtuple("ClipSegment", ["start_sec", "end_sec", "duration", "score", "soi_region"])
 
 PERSON_CLASS_ID   = 0
 HIGH_PRIO_CLASSES = {0, 2, 3, 5, 7, 15, 16}
-MAX_FILE_SIZE_MB  = 2000  # Increased for long-form support
+MAX_FILE_SIZE_MB  = 2000
 MIN_FRAME_DIM     = 240
 MAX_FRAMES_GUARD  = 500_000
 VELOCITY_SMOOTH_TABLE: List[Tuple[float, int]] = [
@@ -58,9 +59,9 @@ TRANSLATION_LANGUAGES: Dict[str, str] = {
     "Greek 🇬🇷": "el", "Hebrew 🇮🇱": "iw", "Thai 🇹🇭": "th", "Vietnamese 🇻🇳": "vi", "Malay 🇲🇾": "ms", "Ukrainian 🇺🇦": "uk"
 }
 
-─────────────────────────────────────────────────────────────────────────────
-# Helpers (FFmpeg, Whisper, Face, YOLO, Smoothing, etc.)
-─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# HELPERS (FFMPEG, WHISPER, FACE, SMOOTHING)
+# ─────────────────────────────────────────────────────────────────────────
 def whisper_available() -> bool:
     try: import whisper; return True
     except ImportError: return False
@@ -110,8 +111,7 @@ def transcribe_to_srt(video_path: str, srt_path: str, whisper_model: str="base",
     if not whisper_available(): return False
     import whisper
     _p(0.0, "🎙️ Extracting audio…")
-    _, wav = tempfile.mkstemp(suffix=".wav")
-    os.close(_)
+    _, wav = tempfile.mkstemp(suffix=".wav"); os.close(_)
     try:
         if not _extract_audio_wav(video_path, wav): return False
         _p(0.2, "📝 Transcribing…")
@@ -207,15 +207,6 @@ def detect_faces(frame: np.ndarray, conf_thresh: float=0.6) -> List[Tuple[int,in
     dets = haar.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(max(30,w//20), max(30,h//20)))
     return [(x,y,x+bw,y+bh) for x,y,bw,bh in dets]
 
-def talking_head_center(faces, orig_w, orig_h, crop_w, crop_h, upper_third_bias=0.30):
-    if not faces: return None
-    ux1, uy1, ux2, uy2 = min(f[0] for f in faces), min(f[1] for f in faces), max(f[2] for f in faces), max(f[3] for f in faces)
-    face_cx, face_cy = (ux1+ux2)//2, (uy1+uy2)//2
-    target_cy = face_cy + crop_h // 6
-    cy = int(face_cy*(1-upper_third_bias) + target_cy*upper_third_bias)
-    hw, hh = crop_w//2, crop_h//2
-    return max(hw, min(face_cx, orig_w-hw)), max(hh, min(cy, orig_h-hh))
-
 def get_video_info(p: str) -> Dict[str, Any]:
     cap = cv2.VideoCapture(p)
     if not cap.isOpened(): raise ProcessingError(f"Cannot open: {p}")
@@ -240,9 +231,9 @@ def calculate_crop_dims(ow, oh, tw, th) -> Tuple[int, int]:
     else: cw, ch = ow, int(round(ow/r))
     return min(cw, ow), min(ch, oh)
 
-─────────────────────────────────────────────────────────────────────────────
-# Core Tracking & Processing Logic
-─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# CORE TRACKING & PROCESSING LOGIC
+# ─────────────────────────────────────────────────────────────────────────
 DetectionResult = namedtuple("DetectionResult", ["cx","cy","ux1","uy1","ux2","uy2","count"])
 
 def detect_subjects(frame: np.ndarray, model: YOLO, conf: float=0.45) -> Optional[DetectionResult]:
@@ -301,68 +292,28 @@ def is_scene_change(prev, curr, thr=0.35):
     if prev is None: return False
     return float(cv2.absdiff(prev, curr).mean())/255.0 > thr
 
-def _compute_speeds(centers: List[Tuple[int,int]], smooth:int=5) -> List[float]:
-    n = len(centers)
-    if n<2: return [0.0]*n
-    raw = [0.0] + [float(np.sqrt((centers[i][0]-centers[i-1][0])**2+(centers[i][1]-centers[i-1][1])**2)) for i in range(1, n)]
-    w   = min(smooth, n)
-    return np.convolve(raw, np.ones(w)/w, mode="same").tolist()
-
-def _compute_vel_vecs(centers: List[Tuple[int,int]], look:int=4) -> List[Tuple[float,float]]:
-    n = len(centers); out = []
-    for i in range(n):
-        j = min(i+look, n-1); k = max(i-look, 0); span = j-k
-        out.append(((centers[j][0]-centers[k][0])/span, (centers[j][1]-centers[k][1])/span) if span>0 else (0.0,0.0))
-    return out
-
-def apply_framing_bias(cx, cy, vx, vy, speed, ow, oh, cw, ch, look_room_frac=0.18, rot_bias=0.25):
-    hw, hh = cw//2, ch//2
-    look = min(speed/40.0, 1.0)
-    if look > 0.05:
-        n = speed+1e-9
-        lx = int(cx+(vx/n)*look_room_frac*cw*look)
-        ly = int(cy+(vy/n)*look_room_frac*ch*look)
-    else: lx, ly = cx, cy
-    still = max(0.0, 1.0-look*2)
-    if still > 0.01:
-        tx = min([ow//3, 2*ow//3], key=lambda x: abs(x-cx))
-        ty = min([oh//3, 2*oh//3], key=lambda y: abs(y-cy))
-        rx = int(cx+rot_bias*still*(tx-cx))
-        ry = int(cy+rot_bias*still*(ty-cy))
-    else: rx, ry = cx, cy
-    nx = int(lx*look + rx*(1.0-look))
-    ny = int(ly*look + ry*(1.0-look))
-    return max(hw, min(nx, ow-hw)), max(hh, min(ny, oh-hh))
-
-def _gauss_seg(xs, ys, window):
-    n = len(xs)
-    if n<3: return xs.copy(), ys.copy()
-    w = min(window, n-1); w = w if w%2==1 else w-1
-    if w<3: return xs.copy(), ys.copy()
-    h2=w//2; sigma=h2/2.0+1e-9
-    k=np.exp(-0.5*(np.arange(-h2,h2+1)/sigma)**2); k/=k.sum()
-    return np.convolve(np.pad(xs,h2,"reflect"),k,"valid")[:n], np.convolve(np.pad(ys,h2,"reflect"),k,"valid")[:n]
-
 def smooth_centers(centers, speeds, base_w=15, adaptive=True, cuts=None):
     if len(centers)<3: return centers[:]
     n, xs, ys, spd = len(centers), np.array([c[0] for c in centers], float), np.array([c[1] for c in centers], float), np.array(speeds[:n], float)
     if len(spd)<n: spd=np.pad(spd,(0,n-len(spd)),'edge')
     bounds = [0] + sorted(cuts or []) + [n]
     rx, ry = xs.copy(), ys.copy()
-    t = VELOCITY_SMOOTH_TABLE
     for i in range(len(bounds)-1):
         s, e = bounds[i], bounds[i+1]
         if e-s<3: continue
         w = base_w
         if adaptive and np.median(spd[s:e])>0:
             sp = float(np.median(spd[s:e]))
+            t = VELOCITY_SMOOTH_TABLE
             if sp<=t[0][0]: w=t[0][1]
             elif sp>=t[-1][0]: w=t[-1][1]
             else:
                 for j in range(len(t)-1):
                     if t[j][0]<=sp<=t[j+1][0]: w=int(t[j][1]+(sp-t[j][0])/(t[j+1][0]-t[j][0])*(t[j+1][1]-t[j][1])); break
         w = max(3, w-1 if w%2==0 else w)
-        rx[s:e], ry[s:e] = _gauss_seg(xs[s:e], ys[s:e], w)
+        k = np.exp(-0.5*(np.arange(-w//2, w//2+1)/(w/4.0+1e-9))**2); k/=k.sum()
+        rx[s:e] = np.convolve(np.pad(xs[s:e], w//2, 'reflect'), k, 'valid')[:e-s]
+        ry[s:e] = np.convolve(np.pad(ys[s:e], w//2, 'reflect'), k, 'valid')[:e-s]
     return [(int(x),int(y)) for x,y in zip(rx,ry)]
 
 def interpolate_centers(centers, indices, total):
@@ -378,9 +329,9 @@ def interpolate_centers(centers, indices, total):
             res.append((int(centers[l][0]+t*(centers[r][0]-centers[l][0])), int(centers[l][1]+t*(centers[r][1]-centers[l][1]))))
     return res[:total]
 
-─────────────────────────────────────────────────────────────────────────────
-# LONG FORM: Detect Clips & Process Batch
-─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# LONG FORM: DETECT CLIPS & PROCESS BATCH
+# ─────────────────────────────────────────────────────────────────────────
 def detect_clips(video_path: str, min_duration_sec: float = 30.0, max_duration_sec: float = 60.0, target_n_clips: int = 8, confidence: float = 0.45, progress_callback: Optional[Callable] = None) -> List[ClipSegment]:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened(): raise ProcessingError("Cannot open video")
@@ -388,7 +339,6 @@ def detect_clips(video_path: str, min_duration_sec: float = 30.0, max_duration_s
     step = max(1, int(fps))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     samples = range(0, total, step)
-    scores, prev_g = [], None
     try: model = _get_model("yolov8n.pt")
     except: model = None
 
@@ -397,6 +347,7 @@ def detect_clips(video_path: str, min_duration_sec: float = 30.0, max_duration_s
     _p(0.0, "🔍 Analyzing engagement…")
     
     idxs, scs = [], []
+    prev_g = None
     for i, fi in enumerate(samples):
         ret, frm = cap.read()
         if not ret: break
@@ -418,6 +369,7 @@ def detect_clips(video_path: str, min_duration_sec: float = 30.0, max_duration_s
 
     arr = np.array(scs)
     if arr.max()>0: arr /= arr.max()
+    
     peaks = []
     thr = 0.35
     for i in range(1, len(arr)-1):
@@ -462,9 +414,9 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
             results.append({"clip": clip, "index": i, "error": str(e)})
     return results
 
-─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
 # MAIN PROCESS FUNCTION
-─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
 def process_video(input_path: str, output_path: str, target_preset_label: str="Match source (no upscale)", tracking_mode: str="subject", talking_head_bias: float=0.30, sample_interval: Optional[int]=None, confidence: float=0.45, use_optical_flow: bool=True, smooth_window: int=15, adaptive_smoothing: bool=True, rule_of_thirds: bool=True, scene_cut_threshold: float=0.35, output_fps: Optional[float]=None, crf: int=23, encoder_preset: str="fast", audio_bitrate: str="128k", yolo_weights: str="yolov8n.pt", burn_subtitles: bool=False, whisper_model: str="base", whisper_language: Optional[str]=None, subtitle_style_name: str="Bold White (TikTok)", subtitle_max_chars: int=42, subtitle_translate_to: Optional[str]=None, progress_callback: Optional[Callable]=None, start_sec: float=0.0, end_sec: Optional[float]=None, avoid_lower_third: bool=True) -> Dict[str, Any]:
     def _p(v,m=""):
         if progress_callback: progress_callback(min(v,1.0), m)
@@ -497,8 +449,7 @@ def process_video(input_path: str, output_path: str, target_preset_label: str="M
     srt_path = None
     if burn_subtitles and _has_audio(input_path):
         _p(0.02, "🎙️ Transcribing…")
-        _, srt_path = tempfile.mkstemp(suffix=".srt")
-        os.close(_)
+        _, srt_path = tempfile.mkstemp(suffix=".srt"); os.close(_)
         ok = transcribe_to_srt(input_path, srt_path, whisper_model, whisper_language, subtitle_max_chars, lambda v,m: _p(0.02+v*0.08, m))
         if not ok: srt_path = None
         elif subtitle_translate_to:
@@ -509,7 +460,7 @@ def process_video(input_path: str, output_path: str, target_preset_label: str="M
     _p(0.15, "🤖 Loading model…" if tracking_mode=="subject" else "👤 Loading face detector…")
     model = _get_model(yolo_weights) if tracking_mode=="subject" else None
     if tracking_mode=="talking_head" and not _get_haar() and not _load_face_net():
-        raise ProcessingError("No face detector available. Reinstall opencv-python.")
+        raise ProcessingError("No face detector available.")
 
     _p(0.18, f"🔎 Analyzing {process_frames} frames…")
     det_c, det_i, sal_c, sal_i, cuts = [], [], [], [], []
@@ -530,16 +481,20 @@ def process_video(input_path: str, output_path: str, target_preset_label: str="M
             c = None
             if tracking_mode=="talking_head":
                 faces = detect_faces(frm, conf_thresh=0.5)
-                if faces: c = talking_head_center(faces, ow, oh, cw, ch, talking_head_bias)
+                if faces: 
+                    ux1,uy1,ux2,uy2 = min(f[0] for f in faces), min(f[1] for f in faces), max(f[2] for f in faces), max(f[3] for f in faces)
+                    cx = (ux1+ux2)//2
+                    cy = int((uy1+uy2)//2 + ch//6)
+                    c = (cx, cy)
                 elif use_optical_flow and prev_f is not None:
-                    fc = optical_flow_center(prev_f, g, ow, oh)
+                    fc = optical_flow_center(prev_f, g, ow//2, oh//2)
                     if fc: c = (fc[0]*2, fc[1]*2)
                 prev_f = g
             else:
                 d = detect_subjects(frm, model, confidence)
                 if d: c = frame_for_union(d.ux1, d.uy1, d.ux2, d.uy2, ow, oh, cw, ch)
                 elif use_optical_flow and prev_f is not None:
-                    fc = optical_flow_center(prev_f, g, ow, oh)
+                    fc = optical_flow_center(prev_f, g, ow//2, oh//2)
                     if fc: c = (fc[0]*2, fc[1]*2)
                 prev_f = g
             if c: det_c.append(c); det_i.append(fid-seg_start_f)
@@ -557,20 +512,21 @@ def process_video(input_path: str, output_path: str, target_preset_label: str="M
 
     _p(0.53, f"📍 {len(det_c)} anchors")
     all_c = interpolate_centers(det_c, det_i, process_frames)
-    spd = _compute_speeds(all_c)
+    spd = [0.0] + [float(np.sqrt((all_c[i][0]-all_c[i-1][0])**2+(all_c[i][1]-all_c[i-1][1])**2)) for i in range(1, len(all_c))]
     all_c = smooth_centers(all_c, spd, smooth_window, adaptive_smoothing, cuts)
-
+    
+    # ⬇️ LOWER-THIRD CONSTRAINT: Keep crop center in top 75% of frame
     if avoid_lower_third:
         safe_max_cy = int(oh * 0.75)
         all_c = [(x, min(y, safe_max_cy)) for x,y in all_c]
 
     if rule_of_thirds and tracking_mode != "talking_head":
-        speeds = _compute_speeds(all_c, 3)
-        vel_vecs = _compute_vel_vecs(all_c, 3)
-        all_c = [apply_framing_bias(cx, cy, vx, vy, speeds[i], ow, oh, cw, ch) for i, (cx, cy) in enumerate(all_c)]
-    elif tracking_mode == "talking_head" and rule_of_thirds:
-        all_c = [(int(cx + 0.15*(min([ow//3, 2*ow//3], key=lambda x: abs(x-cx))-cx)), cy) for cx, cy in all_c]
-
+        framed = []
+        for cx, cy in all_c:
+            tx = min([ow//3, 2*ow//3], key=lambda x: abs(x-cx))
+            framed.append((int(cx + 0.15*(tx-cx)), cy))
+        all_c = framed
+        
     hw, hh = cw//2, ch//2
     all_c = [(max(hw, min(cx, ow-hw)), max(hh, min(cy, oh-hh))) for cx, cy in all_c]
     all_c = (all_c + [all_c[-1]]*max(0, process_frames-len(all_c)))[:process_frames]
