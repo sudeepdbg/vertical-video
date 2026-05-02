@@ -1,1551 +1,988 @@
 """
-verticalize.py
-──────────────
-Convert landscape video to 9:16 vertical with AI subject tracking.
-
-Modes:
-  • Subject tracking  — YOLOv8 + optical flow
-  • Talking Head Mode — DNN/Haar face detector, upper-third framing
-  • Auto-clip detect  — scan long video, find high-engagement segments
-  • Lower-third guard — subjects kept above bottom 20% of vertical frame
-
-Dependencies: opencv-python, ultralytics, numpy, ffmpeg (system)
-Optional:     openai-whisper, deep-translator
+app.py — Reframe · AI Vertical Video Studio
+Mobile-first · Light theme · Single Clip + Auto-Clip modes
 """
 
-from __future__ import annotations
-
-import bisect
-import cv2
-import numpy as np
-from ultralytics import YOLO
+import streamlit as st
 import tempfile
 import os
-import sys
-import subprocess
-import shutil
-from collections import namedtuple
-from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from verticalize import (
+    process_video, get_video_info, detect_clips, process_clips_batch,
+    RESOLUTION_PRESETS, SUBTITLE_STYLES, TRANSLATION_LANGUAGES,
+    resolve_target_size, whisper_available, translation_available,
+    ClipSegment,
+)
 
-# ─────────────────────────────────────────────────────────────────────────────
-class ProcessingError(Exception):
-    pass
+st.set_page_config(
+    page_title="Reframe",
+    page_icon="📱",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
+# ─── CSS ─────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=DM+Serif+Display:ital@0;1&display=swap');
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Constants
-# ─────────────────────────────────────────────────────────────────────────────
-PERSON_CLASS_ID   = 0
-HIGH_PRIO_CLASSES = {0, 2, 3, 5, 7, 15, 16}
-MAX_FILE_SIZE_MB  = 2000
-MIN_FRAME_DIM     = 240
-MAX_FRAMES_GUARD  = 1_080_000
-
-# Subjects must appear above this fraction of vertical crop height
-LOWER_THIRD_GUARD = 0.80   # bottom 20% is reserved for platform UI
-
-VELOCITY_SMOOTH_TABLE: List[Tuple[float, int]] = [
-    (0.0,   31), (5.0,   25), (15.0,  17),
-    (30.0,  11), (60.0,   7), (120.0,  3),
-]
-
-RESOLUTION_PRESETS: Dict[str, Tuple[int, int]] = {
-    "Match source (no upscale)":    (0, 0),
-    "1080p  (1080×1920 — Full HD)": (1080, 1920),
-    "720p   (720×1280  — HD)":      (720,  1280),
-    "540p   (540×960   — SD)":      (540,  960),
-    "480p   (480×854   — Low)":     (480,  854),
+:root {
+  --bg:       #f8f7f4;
+  --surf:     #ffffff;
+  --surf2:    #f0ede8;
+  --surf3:    #e8e4dd;
+  --ink:      #18150f;
+  --ink2:     #5c5449;
+  --ink3:     #9c9080;
+  --bdr:      #e2ddd6;
+  --bdr2:     #ccc6bc;
+  --acc:      #e05a1a;
+  --acc-l:    #fdf1eb;
+  --acc-d:    #b84511;
+  --grn:      #1e7a4f;
+  --grn-l:    #edf7f1;
+  --pur:      #5b3fc7;
+  --pur-l:    #f1eefb;
+  --amb:      #c87800;
+  --amb-l:    #fdf6e7;
+  --r:        12px;
+  --rs:       8px;
 }
-
-SUBTITLE_STYLES: Dict[str, Dict[str, Any]] = {
-    "Bold White (TikTok)": {
-        "fontsize": 18, "primary_color": "&H00FFFFFF",
-        "outline_color": "&H00000000", "outline": 2,
-        "bold": 1, "shadow": 0, "back_color": "&H00000000",
-        "margin_v": 80,
-    },
-    "Yellow (Classic)": {
-        "fontsize": 16, "primary_color": "&H0000FFFF",
-        "outline_color": "&H00000000", "outline": 2,
-        "bold": 1, "shadow": 1, "back_color": "&H00000000",
-        "margin_v": 80,
-    },
-    "Box (Accessible)": {
-        "fontsize": 15, "primary_color": "&H00FFFFFF",
-        "outline_color": "&H00000000", "outline": 0,
-        "bold": 0, "shadow": 0, "back_color": "&H80000000",
-        "margin_v": 80,
-    },
+*, *::before, *::after { box-sizing: border-box; }
+html, body, [class*="css"] {
+  font-family: 'DM Sans', sans-serif !important;
+  background: var(--bg) !important;
+  color: var(--ink) !important;
 }
+.stApp { background: var(--bg) !important; }
+.main .block-container { padding: 0 !important; max-width: 100% !important; }
+#MainMenu, footer, header,
+[data-testid="stToolbar"],
+[data-testid="collapsedControl"],
+section[data-testid="stSidebar"] { display: none !important; }
 
-TRANSLATION_LANGUAGES: Dict[str, str] = {
-    "None (keep original)": "",
-    "French 🇫🇷":           "fr",
-    "German 🇩🇪":           "de",
-    "Spanish 🇪🇸":          "es",
-    "Italian 🇮🇹":          "it",
-    "Portuguese 🇵🇹":       "pt",
-    "Dutch 🇳🇱":            "nl",
-    "Polish 🇵🇱":           "pl",
-    "Russian 🇷🇺":          "ru",
-    "Japanese 🇯🇵":         "ja",
-    "Korean 🇰🇷":           "ko",
-    "Chinese (Simplified) 🇨🇳": "zh-CN",
-    "Arabic 🇸🇦":           "ar",
-    "Hindi 🇮🇳":            "hi",
-    "Turkish 🇹🇷":          "tr",
-    "Indonesian 🇮🇩":       "id",
-    "Swedish 🇸🇪":          "sv",
-    "Norwegian 🇳🇴":        "no",
-    "Danish 🇩🇰":           "da",
-    "Finnish 🇫🇮":          "fi",
-    "Greek 🇬🇷":            "el",
-    "Hebrew 🇮🇱":           "iw",
-    "Thai 🇹🇭":             "th",
-    "Vietnamese 🇻🇳":       "vi",
-    "Malay 🇲🇾":            "ms",
-    "Ukrainian 🇺🇦":        "uk",
+/* Topbar */
+.rf-top { height:52px; background:var(--surf); border-bottom:1px solid var(--bdr);
+  display:flex; align-items:center; justify-content:space-between;
+  padding:0 20px; position:sticky; top:0; z-index:200; }
+.rf-logo { display:flex; align-items:center; gap:9px; }
+.rf-mark { width:28px; height:28px; border-radius:8px; background:var(--ink);
+  display:flex; align-items:center; justify-content:center; }
+.rf-name { font-family:'DM Serif Display',serif; font-size:17px; color:var(--ink); letter-spacing:-0.01em; }
+.rf-tag  { font-size:11px; color:var(--ink3); }
+
+/* Section label */
+.rf-sec { font-size:10px; font-weight:700; letter-spacing:0.13em; text-transform:uppercase;
+  color:var(--ink3); margin-bottom:10px; display:flex; align-items:center; gap:8px; }
+.rf-sec::after { content:''; flex:1; height:1px; background:var(--bdr); }
+
+/* Mode description */
+.rf-mode-box { border-radius:var(--r); padding:10px 14px; display:flex; gap:10px; align-items:flex-start; margin-top:8px; }
+.rf-mode-box.acc { background:var(--surf2); border:1.5px solid var(--bdr); }
+.rf-mode-box.pur { background:var(--pur-l); border:1.5px solid var(--pur); }
+.rf-mode-h { font-size:12px; font-weight:700; margin-bottom:2px; }
+.rf-mode-h.acc { color:var(--ink); }
+.rf-mode-h.pur { color:var(--pur); }
+.rf-mode-s { font-size:11px; color:var(--ink2); line-height:1.5; }
+
+/* Upload */
+[data-testid="stFileUploader"] {
+  background: var(--surf) !important;
+  border: 2px dashed var(--bdr2) !important;
+  border-radius: var(--r) !important;
 }
+[data-testid="stFileUploader"]:hover {
+  border-color: var(--acc) !important;
+  background: var(--acc-l) !important;
+}
+[data-testid="stFileUploadDropzone"] { padding: 22px 14px !important; }
+[data-testid="stFileUploadDropzone"] * {
+  color: var(--ink3) !important;
+  font-family: 'DM Sans', sans-serif !important;
+  font-size: 12px !important;
+}
+[data-testid="stVideo"] { border-radius: var(--r) !important; overflow: hidden !important; }
+video { border-radius: var(--r) !important; width: 100% !important; }
+
+/* Metrics */
+.rf-metrics { display:grid; grid-template-columns:repeat(4,1fr);
+  gap:1px; background:var(--bdr); border:1px solid var(--bdr);
+  border-radius:var(--r); overflow:hidden; }
+.rf-m { background:var(--surf); padding:10px 12px; }
+.rf-ml { font-size:9px; font-weight:700; letter-spacing:0.1em; text-transform:uppercase; color:var(--ink3); margin-bottom:3px; }
+.rf-mv { font-family:'DM Serif Display',serif; font-size:16px; color:var(--ink); letter-spacing:-0.02em; }
+.rf-mv.a { color:var(--acc); }
+
+/* Callouts */
+.rf-ok  { background:var(--grn-l); border:1px solid #9fd4b8; border-radius:var(--rs);
+  padding:9px 12px; font-size:12px; color:var(--grn); display:flex; align-items:center;
+  gap:8px; font-weight:600; margin-bottom:8px; }
+.rf-warn { background:#fff8ec; border:1px solid #f5cc80; border-radius:var(--rs);
+  padding:9px 12px; font-size:12px; color:#8a5a10; margin-bottom:8px; }
+.rf-info { background:#eef3ff; border:1px solid #b0bef5; border-radius:var(--rs);
+  padding:9px 12px; font-size:12px; color:#2a3fa0; margin-bottom:8px; }
+.rf-purp { background:var(--pur-l); border:1px solid #c8b8f0; border-radius:var(--rs);
+  padding:9px 12px; font-size:12px; color:var(--pur); margin-bottom:8px; }
+
+/* Empty state */
+.rf-empty { background:var(--surf); border:2px dashed var(--bdr2); border-radius:var(--r);
+  padding:40px 20px; text-align:center; display:flex; flex-direction:column;
+  align-items:center; gap:7px; min-height:180px; justify-content:center; }
+.rf-empty-icon { width:44px; height:44px; background:var(--surf2); border:1.5px solid var(--bdr);
+  border-radius:12px; font-size:20px; display:flex; align-items:center; justify-content:center; margin-bottom:3px; }
+.rf-empty-h { font-family:'DM Serif Display',serif; font-size:15px; color:var(--ink3); }
+.rf-empty-s { font-size:11px; color:var(--ink3); opacity:0.7; }
+
+/* Clip cards */
+.rf-ccard { background:var(--surf); border:1.5px solid var(--bdr); border-radius:var(--r);
+  padding:12px; margin-bottom:8px; position:relative; }
+.rf-ccard.sel  { border-color:var(--acc); background:var(--acc-l); }
+.rf-ccard.done { border-color:var(--grn); background:var(--grn-l); }
+.rf-cscore { position:absolute; top:10px; right:10px; font-size:10px; font-weight:700;
+  padding:2px 7px; border-radius:99px; color:#fff; background:var(--ink); }
+.rf-cscore.h { background:var(--acc); }
+.rf-cscore.m { background:var(--amb); }
+.rf-ctitle { font-size:11px; font-weight:700; color:var(--ink); margin-bottom:4px; padding-right:50px; }
+.rf-cmeta  { font-size:10px; color:var(--ink3); line-height:1.5; }
+.rf-cdur   { display:inline-block; background:var(--surf2); border:1px solid var(--bdr);
+  border-radius:4px; font-size:10px; font-weight:700; color:var(--ink2); padding:1px 6px; margin-top:5px; }
+.rf-csoi   { display:inline-block; background:var(--pur-l); border:1px solid #c8b8f0;
+  border-radius:4px; font-size:10px; font-weight:600; color:var(--pur); padding:1px 6px; margin-top:5px; margin-left:4px; }
+
+/* Buttons */
+.stButton>button { font-family:'DM Sans',sans-serif !important; border-radius:var(--rs) !important; font-weight:600 !important; font-size:13px !important; transition:all 0.15s !important; }
+.stButton>button[kind="primary"]   { background:var(--ink) !important; color:#fff !important; border:none !important; padding:10px 20px !important; }
+.stButton>button[kind="primary"]:hover  { background:#000 !important; transform:translateY(-1px) !important; }
+.stButton>button[kind="primary"]:disabled { background:var(--bdr2) !important; color:var(--ink3) !important; transform:none !important; }
+.stButton>button[kind="secondary"] { background:var(--surf) !important; color:var(--ink2) !important; border:1.5px solid var(--bdr2) !important; }
+.stButton>button[kind="secondary"]:hover { border-color:var(--acc) !important; color:var(--acc) !important; }
+.stDownloadButton>button { background:var(--grn) !important; color:#fff !important; border:none !important;
+  border-radius:var(--rs) !important; font-family:'DM Sans',sans-serif !important; font-weight:600 !important;
+  font-size:13px !important; padding:10px 18px !important; width:100% !important; transition:all 0.15s !important; }
+.stDownloadButton>button:hover { background:#165c3a !important; transform:translateY(-1px) !important; }
+
+.stProgress>div>div>div { background:var(--acc) !important; border-radius:99px; }
+.stProgress>div>div { background:var(--bdr) !important; border-radius:99px; height:3px !important; }
+.stProgress>div { height:3px !important; }
+
+/* Form controls */
+[data-baseweb="select"]>div { background:var(--surf) !important; border-color:var(--bdr2) !important; border-radius:var(--rs) !important; font-family:'DM Sans',sans-serif !important; font-size:13px !important; }
+[data-baseweb="select"] * { color:var(--ink) !important; }
+[data-baseweb="popover"],[data-baseweb="menu"] { background:var(--surf) !important; border:1px solid var(--bdr) !important; border-radius:10px !important; }
+[data-baseweb="option"] { background:var(--surf) !important; color:var(--ink2) !important; font-size:13px !important; }
+[data-baseweb="option"]:hover { background:var(--acc-l) !important; color:var(--acc) !important; }
+[data-baseweb="tab-list"] { background:var(--surf2) !important; border-radius:var(--rs) !important; padding:3px !important; gap:2px !important; border:none !important; }
+[data-baseweb="tab"] { background:transparent !important; border-radius:6px !important; font-family:'DM Sans',sans-serif !important; font-size:12px !important; font-weight:600 !important; color:var(--ink3) !important; padding:6px 11px !important; border:none !important; }
+[aria-selected="true"][data-baseweb="tab"] { background:var(--surf) !important; color:var(--ink) !important; }
+[data-baseweb="tab-highlight"],[data-baseweb="tab-border"] { display:none !important; }
+.stSlider label { font-size:12px !important; color:var(--ink2) !important; font-weight:600 !important; }
+.stSlider [role="slider"] { background:var(--acc) !important; border:2px solid #fff !important; }
+.stSlider [data-testid="stSliderTrackFill"] { background:var(--acc) !important; }
+.stSlider>div>div { background:var(--bdr) !important; }
+[data-testid="stSliderValue"] { color:var(--acc) !important; font-size:11px !important; font-weight:700 !important; }
+[data-testid="stToggleSwitch"]>div { background:var(--bdr2) !important; }
+[data-testid="stToggleSwitch"][aria-checked="true"]>div { background:var(--acc) !important; }
+
+/* Chip */
+.rf-chip { display:inline-flex; align-items:center; gap:6px; background:var(--surf2);
+  border:1px solid var(--bdr); border-radius:6px; padding:4px 9px; font-size:11px; color:var(--ink2); }
+.rf-chip strong { color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:200px; }
+
+/* Safe-zone badge */
+.rf-safe { display:inline-flex; align-items:center; gap:4px; background:var(--grn-l);
+  border:1px solid #9fd4b8; border-radius:4px; padding:2px 7px;
+  font-size:10px; font-weight:600; color:var(--grn); }
+
+/* Footer */
+.rf-foot { margin-top:32px; padding:12px 20px; border-top:1px solid var(--bdr);
+  display:flex; align-items:center; justify-content:space-between; }
+.rf-tech { display:flex; gap:5px; flex-wrap:wrap; }
+.rf-tech span { font-size:9px; font-weight:700; letter-spacing:0.1em; text-transform:uppercase;
+  padding:3px 7px; border:1px solid var(--bdr); border-radius:4px; color:var(--ink3); }
+
+/* Layout panels */
+.rf-panel  { padding:14px 20px; }
+.rf-panelr { padding:14px 20px 14px 10px; }
+
+@media (max-width:768px) {
+  .rf-panel, .rf-panelr { padding:12px 14px; }
+  .rf-metrics { grid-template-columns:repeat(2,1fr); }
+}
+.stCaption, small { color:var(--ink3) !important; font-size:10px !important; }
+[data-testid="stHorizontalBlock"] { gap:10px !important; }
+</style>
+""", unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Clip segment
+#  Session state init
 # ─────────────────────────────────────────────────────────────────────────────
-class ClipSegment:
-    """Represents a detected high-engagement segment."""
-    def __init__(self, start_sec: float, end_sec: float, score: float,
-                 soi_region: str = "center", peak_frame: int = 0, title: str = ""):
-        self.start_sec  = start_sec
-        self.end_sec    = end_sec
-        self.score      = score
-        self.soi_region = soi_region
-        self.peak_frame = peak_frame
-        self.title      = title
-        self.duration   = end_sec - start_sec
-
-    def __repr__(self) -> str:
-        return (f"<Clip {self.start_sec:.1f}s–{self.end_sec:.1f}s "
-                f"dur={self.duration:.1f}s score={self.score:.2f} soi={self.soi_region}>")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Optional dependency checks
-# ─────────────────────────────────────────────────────────────────────────────
-def whisper_available() -> bool:
-    try:
-        import whisper  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-def translation_available() -> bool:
-    try:
-        import deep_translator  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  FFmpeg helpers
-# ─────────────────────────────────────────────────────────────────────────────
-def _check_ffmpeg() -> None:
-    for tool in ("ffmpeg", "ffprobe"):
-        try:
-            subprocess.run([tool, "-version"], check=True, capture_output=True, text=True)
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            raise ProcessingError(f"{tool} not found. Install FFmpeg and add it to PATH.")
-
-
-def _has_audio(path: str) -> bool:
-    cmd = ["ffprobe", "-v", "error", "-select_streams", "a",
-           "-show_entries", "stream=codec_type", "-of", "csv=p=0", path]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        return "audio" in r.stdout
-    except Exception:
-        return False
-
-
-def _extract_audio_wav(video_path: str, wav_path: str) -> bool:
-    cmd = ["ffmpeg", "-y", "-i", video_path,
-           "-ar", "16000", "-ac", "1", "-f", "wav", wav_path]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    return r.returncode == 0 and os.path.exists(wav_path)
-
-
-def _trim_video(input_path: str, output_path: str,
-                start_sec: float, end_sec: float) -> bool:
-    """Fast stream-copy trim."""
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(start_sec),
-        "-to", str(end_sec),
-        "-i", input_path,
-        "-c", "copy",
-        "-avoid_negative_ts", "1",
-        output_path,
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    return r.returncode == 0 and os.path.exists(output_path)
-
-
-def _ffmpeg_encode(
-    video_path: str,
-    audio_source: Optional[str],
-    output_path: str,
-    fps: float,
-    duration: float,
-    crf: int = 23,
-    preset: str = "fast",
-    audio_bitrate: str = "128k",
-    subtitle_path: Optional[str] = None,
-    subtitle_style: Optional[Dict[str, Any]] = None,
-) -> None:
-    cmd = ["ffmpeg", "-y", "-i", video_path]
-    if audio_source:
-        cmd += ["-i", audio_source]
-
-    vf_chain: List[str] = []
-
-    if subtitle_path and os.path.exists(subtitle_path):
-        style = subtitle_style or SUBTITLE_STYLES["Bold White (TikTok)"]
-        fs    = style.get("fontsize", 18)
-        pc    = style.get("primary_color", "&H00FFFFFF")
-        oc    = style.get("outline_color", "&H00000000")
-        ol    = style.get("outline", 2)
-        bold  = style.get("bold", 1)
-        shad  = style.get("shadow", 0)
-        bc    = style.get("back_color", "&H00000000")
-        mv    = style.get("margin_v", 80)
-        srt_esc = subtitle_path.replace("\\", "/").replace(":", "\\:")
-        force_style = (
-            f"Fontsize={fs},PrimaryColour={pc},OutlineColour={oc},"
-            f"Outline={ol},Bold={bold},Shadow={shad},"
-            f"BackColour={bc},MarginV={mv},Alignment=2"
-        )
-        vf_chain.append(f"subtitles='{srt_esc}':force_style='{force_style}'")
-
-    cmd += ["-map", "0:v:0"]
-    if audio_source:
-        cmd += ["-map", "1:a:0?", "-c:a", "aac", "-b:a", audio_bitrate, "-ac", "2"]
-    else:
-        cmd += ["-an"]
-
-    if vf_chain:
-        cmd += ["-vf", ",".join(vf_chain)]
-
-    cmd += [
-        "-c:v", "libx264",
-        "-preset", preset,
-        "-crf", str(crf),
-        "-profile:v", "baseline",
-        "-level", "3.1",
-        "-pix_fmt", "yuv420p",
-        "-r", str(fps),
-        "-t", str(duration),
-        "-movflags", "+faststart",
-        output_path,
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise ProcessingError(f"FFmpeg failed (rc={r.returncode}):\n{r.stderr[-2000:]}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Video metadata
-# ─────────────────────────────────────────────────────────────────────────────
-def get_video_info(path: str) -> Dict[str, Any]:
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise ProcessingError(f"Cannot open video: {path}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    nf  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap.release()
-    return {
-        "fps": fps,
-        "total_frames": min(nf, MAX_FRAMES_GUARD),
-        "width": w, "height": h,
-        "duration_seconds": nf / fps if fps > 0 else 0.0,
-        "is_landscape": w > h,
-    }
-
-
-def extract_thumbnail(path: str, t: float = 1.0) -> Optional[bytes]:
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        return None
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    cap.set(cv2.CAP_PROP_POS_FRAMES, int(t * fps))
-    ret, frame = cap.read()
-    cap.release()
-    if not ret:
-        return None
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    return buf.tobytes() if ok else None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Resolution resolver (upscale guard)
-# ─────────────────────────────────────────────────────────────────────────────
-def resolve_target_size(label: str, orig_w: int, orig_h: int) -> Tuple[int, int]:
-    tw, th = RESOLUTION_PRESETS.get(label, (0, 0))
-    if tw == 0 and th == 0:
-        cw = int(orig_h * 9 / 16)
-        if cw > orig_w:
-            cw = orig_w
-            ch = int(cw * 16 / 9)
-        else:
-            ch = orig_h
-        return cw - (cw % 2), ch - (ch % 2)
-    if th > orig_h:
-        scale = orig_h / th
-        tw = int(tw * scale)
-        th = int(orig_h)
-    if tw > orig_w:
-        scale = orig_w / tw
-        tw = int(orig_w)
-        th = int(th * scale)
-    return max(tw - (tw % 2), 2), max(th - (th % 2), 2)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  YOLO model cache
-# ─────────────────────────────────────────────────────────────────────────────
-_model_cache: Dict[str, Any] = {}   # str -> YOLO, no cv2 type at module level
-
-
-def _get_model(weights: str = "yolov8n.pt") -> Any:
-    if weights not in _model_cache:
-        try:
-            _model_cache[weights] = YOLO(weights)
-        except Exception as e:
-            raise ProcessingError(f"Failed to load '{weights}': {e}")
-    return _model_cache[weights]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Face detection  (DNN → Haar fallback)
-#  NOTE: module-level variables use plain 'None' — no cv2 type annotations
-#        here to avoid AttributeError when cv2 is not fully loaded yet.
-# ─────────────────────────────────────────────────────────────────────────────
-_face_net = None          # cv2.dnn.Net instance once loaded
-_haar_cascade = None      # cv2.CascadeClassifier instance once loaded
-
-_FACE_PROTO = "deploy.prototxt"
-_FACE_MODEL = "res10_300x300_ssd_iter_140000.caffemodel"
-
-
-def _load_face_net() -> Optional[Any]:
-    global _face_net
-    if _face_net is not None:
-        return _face_net
-    if os.path.exists(_FACE_PROTO) and os.path.exists(_FACE_MODEL):
-        try:
-            _face_net = cv2.dnn.readNetFromCaffe(_FACE_PROTO, _FACE_MODEL)
-            return _face_net
-        except Exception:
-            pass
-    return None
-
-
-def _get_haar() -> Optional[Any]:
-    global _haar_cascade
-    if _haar_cascade is not None:
-        return _haar_cascade
-    path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    if os.path.exists(path):
-        casc = cv2.CascadeClassifier(path)
-        if not casc.empty():
-            _haar_cascade = casc
-            return _haar_cascade
-    return None
-
-
-def detect_faces(frame: np.ndarray,
-                 confidence_thresh: float = 0.6) -> List[Tuple[int, int, int, int]]:
-    """Return list of (x1,y1,x2,y2) face bboxes, largest first."""
-    h, w = frame.shape[:2]
-    net = _load_face_net()
-    if net is not None:
-        blob = cv2.dnn.blobFromImage(
-            cv2.resize(frame, (300, 300)), 1.0, (300, 300),
-            (104.0, 177.0, 123.0), swapRB=False)
-        net.setInput(blob)
-        dets = net.forward()
-        faces: List[Tuple[int, int, int, int]] = []
-        for i in range(dets.shape[2]):
-            conf = float(dets[0, 0, i, 2])
-            if conf < confidence_thresh:
-                continue
-            x1 = max(0, int(dets[0, 0, i, 3] * w))
-            y1 = max(0, int(dets[0, 0, i, 4] * h))
-            x2 = min(w, int(dets[0, 0, i, 5] * w))
-            y2 = min(h, int(dets[0, 0, i, 6] * h))
-            if x2 > x1 and y2 > y1:
-                faces.append((x1, y1, x2, y2))
-        faces.sort(key=lambda f: (f[2] - f[0]) * (f[3] - f[1]), reverse=True)
-        return faces
-
-    haar = _get_haar()
-    if haar is None:
-        return []
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    raw = haar.detectMultiScale(
-        gray, scaleFactor=1.1, minNeighbors=5,
-        minSize=(max(30, w // 20), max(30, h // 20)))
-    if len(raw) == 0:
-        return []
-    faces2 = [(x, y, x + bw, y + bh) for (x, y, bw, bh) in raw]
-    faces2.sort(key=lambda f: (f[2] - f[0]) * (f[3] - f[1]), reverse=True)
-    return faces2
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Lower-third guard
-# ─────────────────────────────────────────────────────────────────────────────
-def _apply_lower_third_guard(cy: int, crop_h: int, subject_cy_src: int) -> int:
-    """
-    Ensure the subject does not appear in the bottom (1-LOWER_THIRD_GUARD)
-    fraction of the crop frame.
-
-    Formula: subject_y_in_crop = subject_cy_src - (cy - crop_h//2)
-    We require: subject_y_in_crop <= LOWER_THIRD_GUARD * crop_h
-    => cy >= subject_cy_src - LOWER_THIRD_GUARD * crop_h + crop_h//2
-    """
-    min_cy = subject_cy_src - int(LOWER_THIRD_GUARD * crop_h) + crop_h // 2
-    return max(cy, min_cy)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  SOI region label
-# ─────────────────────────────────────────────────────────────────────────────
-def _soi_region_label(cx: int, cy: int, w: int, h: int) -> str:
-    col = "left" if cx < w // 3 else ("right" if cx > 2 * w // 3 else "center")
-    row = "upper" if cy < h // 3 else ("lower" if cy > 2 * h // 3 else "mid")
-    if row == "mid" and col == "center":
-        return "center"
-    if row == "mid":
-        return col
-    return f"{row}-{col}"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Talking-head crop center
-# ─────────────────────────────────────────────────────────────────────────────
-def talking_head_center(
-    faces: List[Tuple[int, int, int, int]],
-    orig_w: int,
-    orig_h: int,
-    crop_w: int,
-    crop_h: int,
-    upper_third_bias: float = 0.30,
-) -> Optional[Tuple[int, int]]:
-    if not faces:
-        return None
-
-    ux1 = min(f[0] for f in faces)
-    uy1 = min(f[1] for f in faces)
-    ux2 = max(f[2] for f in faces)
-    uy2 = max(f[3] for f in faces)
-
-    face_cx = (ux1 + ux2) // 2
-    face_cy = (uy1 + uy2) // 2
-
-    # Pull crop up so face lands at upper-third
-    target_cy = face_cy + crop_h // 6
-    cy = int(face_cy * (1 - upper_third_bias) + target_cy * upper_third_bias)
-    cx = face_cx
-
-    hw, hh = crop_w // 2, crop_h // 2
-    cx = max(hw, min(cx, orig_w - hw))
-    cy = max(hh, min(cy, orig_h - hh))
-
-    # Lower-third guard
-    cy = _apply_lower_third_guard(cy, crop_h, face_cy)
-    cy = max(hh, min(cy, orig_h - hh))
-
-    return cx, cy
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Subject detection (YOLO)
-# ─────────────────────────────────────────────────────────────────────────────
-DetectionResult = namedtuple("DetectionResult",
-    ["cx", "cy", "ux1", "uy1", "ux2", "uy2", "count"])
-
-
-def detect_subjects(
-    frame: np.ndarray,
-    model: Any,
-    confidence: float = 0.45,
-) -> Optional[DetectionResult]:
-    try:
-        results = model(frame, verbose=False, conf=confidence)[0]
-    except Exception as e:
-        print(f"⚠ Detection: {e}", file=sys.stderr)
-        return None
-    if results.boxes is None or len(results.boxes) == 0:
-        return None
-
-    person_pool: List[Tuple[float, int, int, int, int]] = []
-    hiprio_pool: List[Tuple[float, int, int, int, int]] = []
-    all_pool:    List[Tuple[float, int, int, int, int]] = []
-
-    for box in results.boxes:
-        cls  = int(box.cls[0])
-        conf = float(box.conf[0])
-        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-        weight = max(1, (x2 - x1) * (y2 - y1)) * conf
-        entry  = (weight, x1, y1, x2, y2)
-        if cls == PERSON_CLASS_ID:
-            person_pool.append(entry)
-        elif cls in HIGH_PRIO_CLASSES:
-            hiprio_pool.append(entry)
-        all_pool.append(entry)
-
-    pool = person_pool or hiprio_pool or all_pool
-    if not pool:
-        return None
-    tw = sum(e[0] for e in pool)
-    if tw == 0:
-        return None
-    cx = int(sum(e[0] * (e[1] + e[3]) / 2 for e in pool) / tw)
-    cy = int(sum(e[0] * (e[2] + e[4]) / 2 for e in pool) / tw)
-    return DetectionResult(
-        cx, cy,
-        min(e[1] for e in pool), min(e[2] for e in pool),
-        max(e[3] for e in pool), max(e[4] for e in pool),
-        len(pool),
-    )
-
-
-def frame_for_union(
-    ux1: int, uy1: int, ux2: int, uy2: int,
-    orig_w: int, orig_h: int,
-    crop_w: int, crop_h: int,
-) -> Tuple[int, int]:
-    ucx = (ux1 + ux2) // 2
-    ucy = (uy1 + uy2) // 2
-    hw, hh = crop_w // 2, crop_h // 2
-    cx = max(hw, min(ucx, orig_w - hw))
-    cy = max(hh, min(ucy, orig_h - hh))
-    cy = _apply_lower_third_guard(cy, crop_h, ucy)
-    cy = max(hh, min(cy, orig_h - hh))
-    return cx, cy
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Optical flow / saliency
-# ─────────────────────────────────────────────────────────────────────────────
-def optical_flow_center(
-    prev: np.ndarray, curr: np.ndarray, w: int, h: int
-) -> Optional[Tuple[int, int]]:
-    if prev is None or curr is None:
-        return None
-    try:
-        flow = cv2.calcOpticalFlowFarneback(
-            prev, curr, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-        mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
-        b = max(1, int(w * 0.04))
-        mag[:, :b] = mag[:, w - b:] = mag[:b, :] = mag[h - b:, :] = 0
-        if mag.max() < 0.8:
-            return None
-        t = mag.sum()
-        if t == 0:
-            return None
-        ys, xs = np.mgrid[0:h, 0:w]
-        return int((xs * mag).sum() / t), int((ys * mag).sum() / t)
-    except Exception:
-        return None
-
-
-def saliency_center(frame: np.ndarray) -> Tuple[int, int]:
-    h, w = frame.shape[:2]
-    if w < MIN_FRAME_DIM or h < MIN_FRAME_DIM:
-        return w // 2, h // 2
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    lap  = cv2.GaussianBlur(
-        np.abs(cv2.Laplacian(gray, cv2.CV_64F)).astype(np.float32), (31, 31), 0)
-    sat  = cv2.GaussianBlur(
-        cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:, :, 1].astype(np.float32), (31, 31), 0)
-    sal  = lap / (lap.max() + 1e-6) + sat / (sat.max() + 1e-6)
-    b    = max(1, int(w * 0.05))
-    sal[:, :b] = sal[:, w - b:] = sal[:b, :] = sal[h - b:, :] = 0
-    t = sal.sum()
-    if t < 1e-6:
-        return w // 2, h // 2
-    ys, xs = np.mgrid[0:h, 0:w]
-    return int((xs * sal).sum() / t), int((ys * sal).sum() / t)
-
-
-def is_scene_change(
-    prev: Optional[np.ndarray], curr: np.ndarray, threshold: float = 0.35
-) -> bool:
-    if prev is None:
-        return False
-    try:
-        return float(cv2.absdiff(prev, curr).mean()) / 255.0 > threshold
-    except Exception:
-        return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Framing bias (look-room + rule-of-thirds)
-# ─────────────────────────────────────────────────────────────────────────────
-def apply_framing_bias(
-    cx: int, cy: int, vx: float, vy: float, speed: float,
-    orig_w: int, orig_h: int, crop_w: int, crop_h: int,
-    look_room_frac: float = 0.18, rot_bias: float = 0.25,
-) -> Tuple[int, int]:
-    hw, hh = crop_w // 2, crop_h // 2
-    look = min(speed / 40.0, 1.0)
-    if look > 0.05:
-        n  = speed + 1e-9
-        lx = int(cx + (vx / n) * look_room_frac * crop_w * look)
-        ly = int(cy + (vy / n) * look_room_frac * crop_h * look)
-    else:
-        lx, ly = cx, cy
-    still = max(0.0, 1.0 - look * 2)
-    if still > 0.01:
-        tx = min([orig_w // 3, 2 * orig_w // 3], key=lambda x: abs(x - cx))
-        ty = min([orig_h // 3, 2 * orig_h // 3], key=lambda y: abs(y - cy))
-        rx = int(cx + rot_bias * still * (tx - cx))
-        ry = int(cy + rot_bias * still * (ty - cy))
-    else:
-        rx, ry = cx, cy
-    nx = int(lx * look + rx * (1.0 - look))
-    ny = int(ly * look + ry * (1.0 - look))
-    return max(hw, min(nx, orig_w - hw)), max(hh, min(ny, orig_h - hh))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Velocity helpers
-# ─────────────────────────────────────────────────────────────────────────────
-def _compute_speeds(centers: List[Tuple[int, int]], smooth: int = 5) -> List[float]:
-    n = len(centers)
-    if n < 2:
-        return [0.0] * n
-    raw = [0.0] + [
-        float(np.sqrt((centers[i][0] - centers[i-1][0]) ** 2 +
-                      (centers[i][1] - centers[i-1][1]) ** 2))
-        for i in range(1, n)]
-    w = min(smooth, n)
-    return np.convolve(raw, np.ones(w) / w, mode="same").tolist()
-
-
-def _compute_vel_vecs(centers: List[Tuple[int, int]], look: int = 4) -> List[Tuple[float, float]]:
-    n = len(centers)
-    out = []
-    for i in range(n):
-        j = min(i + look, n - 1)
-        k = max(i - look, 0)
-        span = j - k
-        if span > 0:
-            out.append(((centers[j][0] - centers[k][0]) / span,
-                        (centers[j][1] - centers[k][1]) / span))
-        else:
-            out.append((0.0, 0.0))
-    return out
-
-
-def _vel_to_window(speed: float) -> int:
-    t = VELOCITY_SMOOTH_TABLE
-    if speed <= t[0][0]:  return t[0][1]
-    if speed >= t[-1][0]: return t[-1][1]
-    for i in range(len(t) - 1):
-        v0, w0 = t[i]; v1, w1 = t[i + 1]
-        if v0 <= speed <= v1:
-            tt = (speed - v0) / (v1 - v0 + 1e-9)
-            w  = int(w0 + tt * (w1 - w0))
-            return w if w % 2 == 1 else w + 1
-    return 15
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Smoothing
-# ─────────────────────────────────────────────────────────────────────────────
-def _gauss_seg(xs: np.ndarray, ys: np.ndarray,
-               window: int) -> Tuple[np.ndarray, np.ndarray]:
-    n = len(xs)
-    if n < 3:
-        return xs.copy(), ys.copy()
-    w = min(window, n - 1)
-    w = w if w % 2 == 1 else w - 1
-    if w < 3:
-        return xs.copy(), ys.copy()
-    h2    = w // 2
-    sigma = h2 / 2.0 + 1e-9
-    k     = np.exp(-0.5 * (np.arange(-h2, h2 + 1) / sigma) ** 2)
-    k    /= k.sum()
-    sx = np.convolve(np.pad(xs, h2, "reflect"), k, "valid")[:n]
-    sy = np.convolve(np.pad(ys, h2, "reflect"), k, "valid")[:n]
-    return sx, sy
-
-
-def smooth_centers(
-    centers: List[Tuple[int, int]],
-    speeds: List[float],
-    base_window: int = 15,
-    adaptive: bool = True,
-    scene_cuts: Optional[List[int]] = None,
-) -> List[Tuple[int, int]]:
-    if not centers or len(centers) < 3:
-        return list(centers) if centers else []
-    n   = len(centers)
-    xs  = np.array([c[0] for c in centers], dtype=float)
-    ys  = np.array([c[1] for c in centers], dtype=float)
-    spd = np.array(speeds[:n], dtype=float)
-    if len(spd) < n:
-        spd = np.pad(spd, (0, n - len(spd)), mode="edge")
-    cuts   = set(scene_cuts or [])
-    bounds = [0] + sorted(cuts) + [n]
-    rx, ry = xs.copy(), ys.copy()
-    for i in range(len(bounds) - 1):
-        s, e = bounds[i], bounds[i + 1]
-        if e - s < 3:
-            continue
-        w = _vel_to_window(float(np.median(spd[s:e]))) if adaptive else base_window
-        xs_s, ys_s = _gauss_seg(xs[s:e], ys[s:e], w)
-        rx[s:e] = xs_s
-        ry[s:e] = ys_s
-    return [(int(x), int(y)) for x, y in zip(rx, ry)]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Interpolation
-# ─────────────────────────────────────────────────────────────────────────────
-def interpolate_centers(
-    centers: List[Tuple[int, int]],
-    indices: List[int],
-    total: int,
-) -> List[Tuple[int, int]]:
-    if total <= 0: return []
-    if not centers: return [(0, 0)] * total
-    n      = len(indices)
-    result: List[Tuple[int, int]] = []
-    for fi in range(total):
-        if fi <= indices[0]:
-            result.append(centers[0]); continue
-        if fi >= indices[-1]:
-            result.append(centers[-1]); continue
-        r = bisect.bisect_right(indices, fi)
-        l = r - 1
-        if r >= n:
-            result.append(centers[-1]); continue
-        span = max(indices[r] - indices[l], 1)
-        t    = (fi - indices[l]) / span
-        result.append((int(centers[l][0] + t * (centers[r][0] - centers[l][0])),
-                       int(centers[l][1] + t * (centers[r][1] - centers[l][1]))))
-    while len(result) < total:
-        result.append(result[-1] if result else (0, 0))
-    return result[:total]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Crop geometry
-# ─────────────────────────────────────────────────────────────────────────────
-def calculate_crop_dims(orig_w: int, orig_h: int, tw: int, th: int) -> Tuple[int, int]:
-    ratio = tw / th
-    if (orig_w / orig_h) > ratio:
-        ch = orig_h; cw = int(round(ch * ratio))
-    else:
-        cw = orig_w; ch = int(round(cw / ratio))
-    return min(cw, orig_w), min(ch, orig_h)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Whisper → SRT
-# ─────────────────────────────────────────────────────────────────────────────
-def _seconds_to_srt_time(s: float) -> str:
-    h  = int(s // 3600)
-    m  = int((s % 3600) // 60)
-    sc = int(s % 60)
-    ms = int((s - int(s)) * 1000)
-    return f"{h:02d}:{m:02d}:{sc:02d},{ms:03d}"
-
-
-def transcribe_to_srt(
-    video_path: str,
-    srt_path: str,
-    whisper_model: str = "base",
-    language: Optional[str] = None,
-    max_chars_per_line: int = 42,
-    progress_callback: Optional[Callable[[float, str], None]] = None,
-) -> bool:
-    def _p(v: float, msg: str = "") -> None:
-        if progress_callback:
-            try: progress_callback(v, msg)
-            except Exception: pass
-
-    if not whisper_available():
-        return False
-
-    import whisper  # type: ignore
-
-    _p(0.0, "🎙️ Extracting audio…")
-    wav_fd, wav_path = tempfile.mkstemp(suffix=".wav")
-    os.close(wav_fd)
-
-    try:
-        if not _extract_audio_wav(video_path, wav_path):
-            return False
-
-        _p(0.2, f"📝 Transcribing with Whisper ({whisper_model})…")
-        model = whisper.load_model(whisper_model)
-        opts: Dict[str, Any] = {"word_timestamps": True, "verbose": False}
-        if language:
-            opts["language"] = language
-        result = model.transcribe(wav_path, **opts)
-
-        _p(0.85, "✍️ Writing subtitles…")
-
-        lines: List[str] = []
-        idx   = 1
-        words: List[Dict[str, Any]] = []
-        for seg in result.get("segments", []):
-            for w in seg.get("words", []):
-                words.append({
-                    "word":  w["word"].strip(),
-                    "start": w["start"],
-                    "end":   w["end"],
-                })
-
-        buf: List[Dict[str, Any]] = []
-        buf_len = 0
-
-        def flush_buf() -> None:
-            nonlocal idx, buf, buf_len
-            if not buf: return
-            text  = " ".join(w["word"] for w in buf)
-            start = _seconds_to_srt_time(buf[0]["start"])
-            end   = _seconds_to_srt_time(buf[-1]["end"])
-            lines.append(f"{idx}\n{start} --> {end}\n{text}\n")
-            idx += 1
-            buf    = []
-            buf_len = 0
-
-        for w in words:
-            wlen = len(w["word"]) + 1
-            if buf_len + wlen > max_chars_per_line and buf:
-                flush_buf()
-            buf.append(w)
-            buf_len += wlen
-        flush_buf()
-
-        with open(srt_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-
-        _p(1.0, f"✅ {len(lines)} subtitle lines written")
-        return True
-
-    except Exception as e:
-        print(f"Whisper transcription failed: {e}", file=sys.stderr)
-        return False
-    finally:
-        if os.path.exists(wav_path):
-            try: os.unlink(wav_path)
+_DEFAULTS = dict(
+    input_path=None, uploaded_file_name=None, video_info=None,
+    app_mode="single", tracking_mode="subject",
+    # single-clip
+    output_path=None, processing_done=False,
+    output_bytes=None, srt_bytes=None, last_settings=None,
+    # auto-clip
+    detected_clips=None, selected_clip_indices=None,
+    clip_results=None, scan_done=False,
+    clip_out_dir=None,
+)
+for _k, _v in _DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+
+def _cleanup() -> None:
+    for key in ("input_path", "output_path"):
+        p = st.session_state.get(key)
+        if p and os.path.exists(p):
+            try: os.unlink(p)
             except OSError: pass
-
-
-def translate_srt(
-    srt_path: str,
-    target_language: str,
-    source_language: str = "auto",
-    progress_callback: Optional[Callable[[float, str], None]] = None,
-) -> bool:
-    def _p(v: float, msg: str = "") -> None:
-        if progress_callback:
-            try: progress_callback(v, msg)
-            except Exception: pass
-
-    if not translation_available() or not target_language:
-        return bool(not target_language)  # True if no translation needed
-
-    try:
-        from deep_translator import GoogleTranslator  # type: ignore
-    except ImportError:
-        return False
-
-    try:
-        import re
-        with open(srt_path, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        blocks = re.split(r"\n\n+", content.strip())
-        translated_blocks: List[str] = []
-        translator = GoogleTranslator(source=source_language, target=target_language)
-
-        for i, block in enumerate(blocks):
-            ls = block.strip().splitlines()
-            if len(ls) < 3:
-                translated_blocks.append(block)
-                continue
-            text = " ".join(ls[2:])
-            try:
-                translated = translator.translate(text) or text
-            except Exception:
-                translated = text
-            translated_blocks.append(f"{ls[0]}\n{ls[1]}\n{translated}")
-            if i % 10 == 0:
-                _p(i / max(len(blocks), 1), f"🌐 Translating… {i}/{len(blocks)}")
-
-        with open(srt_path, "w", encoding="utf-8") as f:
-            f.write("\n\n".join(translated_blocks) + "\n")
-
-        _p(1.0, f"✅ Translated {len(translated_blocks)} subtitle blocks to [{target_language}]")
-        return True
-
-    except Exception as e:
-        print(f"Translation failed: {e}", file=sys.stderr)
-        return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Frame saliency score (for clip detection)
-# ─────────────────────────────────────────────────────────────────────────────
-def _frame_saliency_score(
-    frame: np.ndarray,
-    prev_frame: Optional[np.ndarray],
-) -> float:
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-    lap_var   = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    lap_score = min(lap_var / 3000.0, 1.0)
-
-    motion_score = 0.0
-    if prev_frame is not None:
-        diff = cv2.absdiff(gray, cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY))
-        motion_score = min(float(diff.mean()) / 30.0, 1.0)
-
-    hsv       = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    sat_score = min(float(hsv[:, :, 1].mean()) / 128.0, 1.0)
-
-    return 0.4 * motion_score + 0.4 * lap_score + 0.2 * sat_score
-
-
-def _compute_frame_scores(
-    input_path: str,
-    fps: float,
-    total_frames: int,
-    sample_every: int = 15,
-    progress_callback: Optional[Callable[[float, str], None]] = None,
-) -> Tuple[np.ndarray, List[int]]:
-    def _p(v: float, msg: str = "") -> None:
-        if progress_callback:
-            try: progress_callback(v, msg)
-            except Exception: pass
-
-    scores:      List[float] = []
-    scene_cuts:  List[int]   = []
-    prev_gray:   Optional[np.ndarray] = None
-    prev_frame:  Optional[np.ndarray] = None
-    frame_idx    = 0
-    report_n     = max(1, total_frames // 20)
-
-    cap = cv2.VideoCapture(input_path)
-    while frame_idx < total_frames:
-        ret, frame = cap.read()
-        if not ret: break
-
-        if frame_idx % sample_every == 0:
-            curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            if prev_gray is not None:
-                diff_ratio = float(cv2.absdiff(prev_gray, curr_gray).mean()) / 255.0
-                if diff_ratio > 0.30:
-                    scene_cuts.append(frame_idx)
-            scores.append(_frame_saliency_score(frame, prev_frame))
-            prev_gray  = curr_gray
-            prev_frame = frame.copy()
-
-        if frame_idx % report_n == 0:
-            _p(frame_idx / total_frames, f"Scanning {frame_idx}/{total_frames}…")
-
-        frame_idx += 1
-
-    cap.release()
-    return np.array(scores, dtype=float), scene_cuts
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Clip detection
-# ─────────────────────────────────────────────────────────────────────────────
-def detect_clips(
-    input_path: str,
-    min_duration_sec: float = 25.0,
-    max_duration_sec: float = 65.0,
-    target_n_clips: int = 10,
-    model: Optional[Any] = None,
-    confidence: float = 0.45,
-    progress_callback: Optional[Callable[[float, str], None]] = None,
-) -> List[ClipSegment]:
-    """
-    Scan a long video, detect high-engagement segments with narrative arcs.
-
-    Pipeline:
-      1. Sample frames, compute per-frame saliency score
-      2. Smooth, find peaks
-      3. Expand peaks into arcs snapping to scene-cut boundaries
-      4. Merge overlaps, rank by score
-      5. Detect SOI region per clip
-    """
-    def _p(v: float, msg: str = "") -> None:
-        if progress_callback:
-            try: progress_callback(v, msg)
-            except Exception: pass
-
-    info = get_video_info(input_path)
-    fps          = info["fps"]
-    total_frames = info["total_frames"]
-    duration     = info["duration_seconds"]
-    orig_w, orig_h = info["width"], info["height"]
-
-    sample_every = max(1, int(fps))   # 1 sample per second
-
-    _p(0.0, "🔍 Scanning for engagement peaks…")
-    scores, scene_cuts_frames = _compute_frame_scores(
-        input_path, fps, total_frames,
-        sample_every=sample_every,
-        progress_callback=lambda v, m: _p(v * 0.45, m),
+    st.session_state.update(
+        input_path=None, output_path=None, output_bytes=None,
+        srt_bytes=None, video_info=None, processing_done=False,
+        detected_clips=None, selected_clip_indices=None,
+        clip_results=None, scan_done=False, clip_out_dir=None,
     )
 
-    if len(scores) == 0:
-        return []
 
-    _p(0.45, "📊 Computing narrative arcs…")
+def _new_out() -> None:
+    fd, p = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd); os.unlink(p)
+    st.session_state.output_path = p
 
-    # Smooth
-    window = max(5, int(30 / (sample_every / fps)))
-    if len(scores) >= window:
-        smooth_scores = np.convolve(scores, np.ones(window) / window, mode="same")
+
+def _invalidate_if_changed(cur: dict) -> None:
+    if st.session_state.processing_done and st.session_state.last_settings != cur:
+        st.session_state.processing_done = False
+        st.session_state.output_bytes    = None
+        st.session_state.srt_bytes       = None
+
+
+_whisper_ok   = whisper_available()
+_translate_ok = translation_available()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Top bar
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="rf-top">
+  <div class="rf-logo">
+    <div class="rf-mark">
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+        <rect x="1" y="1" width="5" height="12" rx="1.5" fill="white"/>
+        <rect x="8" y="4" width="5" height="9"  rx="1.5" fill="white" opacity="0.5"/>
+      </svg>
+    </div>
+    <span class="rf-name">Reframe</span>
+  </div>
+  <span class="rf-tag">AI Vertical Video</span>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  App-mode selector
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("<div style='padding:0 20px'>", unsafe_allow_html=True)
+st.markdown('<div class="rf-sec">Mode</div>', unsafe_allow_html=True)
+mc1, mc2 = st.columns(2, gap="small")
+with mc1:
+    if st.button("📱  Single Clip", type="secondary", use_container_width=True):
+        st.session_state.app_mode = "single"
+with mc2:
+    if st.button("🎬  Auto-Clip  ✦", type="secondary", use_container_width=True):
+        st.session_state.app_mode = "autoClip"
+app_mode = st.session_state.app_mode
+
+if app_mode == "single":
+    st.markdown("""
+    <div class="rf-mode-box acc">
+      <span style="font-size:16px">📱</span>
+      <div>
+        <div class="rf-mode-h acc">Single Clip</div>
+        <div class="rf-mode-s">
+          Upload any landscape video. AI tracks your subject and converts to 9:16 in one pass.
+          Subject tracking (YOLOv8) or face-locked Talking Head mode.
+        </div>
+      </div>
+    </div>""", unsafe_allow_html=True)
+else:
+    st.markdown("""
+    <div class="rf-mode-box pur">
+      <span style="font-size:16px">🎬</span>
+      <div>
+        <div class="rf-mode-h pur">Auto-Clip  <span style="background:var(--acc);color:#fff;font-size:9px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;padding:2px 6px;border-radius:99px;">AI</span></div>
+        <div class="rf-mode-s">
+          Upload a 30–90 min video. AI scans for saliency peaks, detects
+          narrative arcs (beginning · middle · end), identifies the SOI
+          coordinate region per clip, enforces the lower-third safe zone,
+          then verticalizes every selected clip.
+        </div>
+      </div>
+    </div>""", unsafe_allow_html=True)
+st.markdown("</div>", unsafe_allow_html=True)
+
+st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Tracking mode + settings
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("<div style='padding:0 20px'>", unsafe_allow_html=True)
+st.markdown('<div class="rf-sec">Tracking Mode</div>', unsafe_allow_html=True)
+tm1, tm2 = st.columns(2, gap="small")
+with tm1:
+    if st.button("🎯  Subject Tracking", type="secondary", use_container_width=True):
+        st.session_state.tracking_mode = "subject"
+with tm2:
+    if st.button("👤  Talking Head  ✦", type="secondary", use_container_width=True):
+        st.session_state.tracking_mode = "talking_head"
+tracking_mode = st.session_state.tracking_mode
+
+# Settings tabs
+tab_list = ["🎞 Output", "🎯 Tracking", "📝 Subtitles", "⚙ Advanced"]
+if app_mode == "autoClip":
+    tab_list.append("✂️ Clips")
+
+if app_mode == "autoClip":
+    tab_out, tab_trk, tab_sub, tab_adv, tab_clip = st.tabs(tab_list)
+else:
+    tab_out, tab_trk, tab_sub, tab_adv = st.tabs(tab_list)
+    tab_clip = None  # not used in single mode
+
+with tab_out:
+    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+    o1, o2 = st.columns(2, gap="medium")
+    with o1:
+        resolution_label = st.selectbox("Resolution", list(RESOLUTION_PRESETS.keys()), index=0)
+        fps_label = st.selectbox("Frame rate",
+            ["Source (keep original)", "60 fps", "30 fps", "25 fps", "24 fps"], index=0)
+    with o2:
+        crf = st.slider("Quality (CRF)", 15, 35, 23, 1)
+        st.caption("18 = near-lossless  ·  28 = compact")
+        encoder_preset_label = st.selectbox("Speed",
+            ["ultrafast", "fast", "medium", "slow"], index=1)
+    _fps_map = {"Source (keep original)": None,
+                "60 fps": 60.0, "30 fps": 30.0, "25 fps": 25.0, "24 fps": 24.0}
+    output_fps = _fps_map[fps_label]
+
+with tab_trk:
+    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+    if tracking_mode == "talking_head":
+        th1, th2 = st.columns(2, gap="medium")
+        with th1:
+            talking_head_bias = st.slider("Upper-third pull", 0.0, 1.0, 0.30, 0.05)
+            st.caption("0 = centered face  ·  1 = upper third")
+            smooth_window = st.slider("Smoothness", 3, 31, 21, 2)
+        with th2:
+            adaptive_smoothing  = st.toggle("Adaptive smoothing", value=False)
+            use_optical_flow    = st.toggle("Optical flow bridge", value=True)
+            rule_of_thirds      = st.toggle("Horizontal rule-of-thirds", value=True)
+        confidence          = 0.5
+        scene_cut_threshold = 0.35
     else:
-        smooth_scores = scores.copy()
+        t1, t2 = st.columns(2, gap="medium")
+        with t1:
+            adaptive_smoothing  = st.toggle("Adaptive smoothing", value=True)
+            smooth_window       = st.slider("Smoothness", 3, 31, 15, 2)
+            confidence          = st.slider("Detection confidence", 0.10, 0.95, 0.45, 0.05)
+        with t2:
+            use_optical_flow    = st.toggle("Optical flow fallback", value=True)
+            rule_of_thirds      = st.toggle("Look-room / Rule-of-thirds", value=True)
+            scene_cut_threshold = st.slider("Scene-cut sensitivity", 0.10, 0.60, 0.35, 0.05)
+        talking_head_bias = 0.30
 
-    if smooth_scores.max() > 0:
-        smooth_scores = smooth_scores / smooth_scores.max()
+with tab_sub:
+    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+    if not _whisper_ok:
+        st.markdown('<div class="rf-purp">⚠️ Install <code>openai-whisper</code> to enable subtitles.</div>',
+                    unsafe_allow_html=True)
+    s1, s2 = st.columns(2, gap="medium")
+    with s1:
+        burn_subtitles = st.toggle("Burn subtitles", value=False, disabled=not _whisper_ok)
+        if not _whisper_ok:
+            burn_subtitles = False
+        translate_subtitles = st.toggle("Translate 🌐", value=False,
+            disabled=(not _whisper_ok or not _translate_ok or not burn_subtitles))
+        if not burn_subtitles or not _translate_ok:
+            translate_subtitles = False
+        whisper_model = st.selectbox("Whisper model",
+            ["tiny", "base", "small", "medium"], index=1, disabled=not _whisper_ok)
+    with s2:
+        subtitle_style_name = st.selectbox("Style", list(SUBTITLE_STYLES.keys()),
+                                           disabled=not _whisper_ok)
+        whisper_language_raw = st.selectbox("Audio language",
+            ["Auto-detect", "en", "hi", "es", "fr", "de", "ja", "zh", "pt", "ar"],
+            disabled=not _whisper_ok)
+        whisper_language = None if whisper_language_raw == "Auto-detect" else whisper_language_raw
+        subtitle_max_chars = st.slider("Max chars/line", 20, 60, 42, 2, disabled=not _whisper_ok)
+        subtitle_translate_label = st.selectbox("Translate to",
+            list(TRANSLATION_LANGUAGES.keys()), index=0,
+            disabled=(not _whisper_ok or not _translate_ok
+                      or not burn_subtitles or not translate_subtitles))
+        subtitle_translate_to = TRANSLATION_LANGUAGES[subtitle_translate_label] or None
+        if not translate_subtitles:
+            subtitle_translate_to = None
 
-    min_gap_samples = max(1, int(min_duration_sec * fps / sample_every))
-
-    # Local peak detection
-    peaks: List[int] = []
-    for i in range(1, len(smooth_scores) - 1):
-        wh  = min_gap_samples // 2
-        lo  = max(0, i - wh)
-        hi  = min(len(smooth_scores), i + wh + 1)
-        if smooth_scores[i] == smooth_scores[lo:hi].max() and smooth_scores[i] > 0.3:
-            if not peaks or i - peaks[-1] > min_gap_samples // 2:
-                peaks.append(i)
-
-    peaks.sort(key=lambda i: smooth_scores[i], reverse=True)
-    peaks = peaks[:target_n_clips * 2]
-
-    def _arc_boundaries(peak_sample: int) -> Tuple[float, float]:
-        peak_sec = peak_sample * sample_every / fps
-        raw_start = max(0.0, peak_sec - max_duration_sec * 0.4)
-        raw_end   = min(duration, raw_start + max_duration_sec)
-
-        # Snap start to nearest preceding scene cut within 15 s
-        for sc in reversed(scene_cuts_frames):
-            sc_sec = sc / fps
-            if 0 < peak_sec - sc_sec < 15.0:
-                raw_start = max(0.0, sc_sec - 1.0)
-                break
-
-        # Snap end to nearest following scene cut within 15 s
-        for sc in scene_cuts_frames:
-            sc_sec = sc / fps
-            if 0 < sc_sec - peak_sec < 15.0:
-                raw_end = min(duration, sc_sec + 0.5)
-                break
-
-        clip_dur = raw_end - raw_start
-        if clip_dur < min_duration_sec:
-            raw_end = min(duration, raw_start + min_duration_sec)
-        elif clip_dur > max_duration_sec:
-            center    = (raw_start + raw_end) / 2
-            raw_start = max(0.0, center - max_duration_sec / 2)
-            raw_end   = min(duration, raw_start + max_duration_sec)
-
-        return raw_start, raw_end
-
-    clip_candidates: List[Tuple[float, float, float]] = []
-    for peak_i in peaks:
-        start, end  = _arc_boundaries(peak_i)
-        peak_score  = float(smooth_scores[peak_i])
-        overlaps    = any(
-            min(end, ce) - max(start, cs) > min_duration_sec * 0.5
-            for cs, ce, _ in clip_candidates
-        )
-        if not overlaps:
-            clip_candidates.append((start, end, peak_score))
-
-    clip_candidates.sort(key=lambda x: x[2], reverse=True)
-    clip_candidates = clip_candidates[:target_n_clips]
-    clip_candidates.sort(key=lambda x: x[0])
-
-    _p(0.55, "🎯 Detecting SOI per clip…")
-
-    segments: List[ClipSegment] = []
-    for ci, (start_sec, end_sec, score) in enumerate(clip_candidates):
-        _p(0.55 + 0.35 * (ci / max(len(clip_candidates), 1)),
-           f"🎯 Clip {ci+1}/{len(clip_candidates)}…")
-
-        soi_region = "center"
-        soi_xs:  List[int] = []
-        soi_ys:  List[int] = []
-        n_samples = min(8, max(2, int(end_sec - start_sec)))
-        sample_times = np.linspace(start_sec + 1, end_sec - 1, n_samples)
-
-        cap = cv2.VideoCapture(input_path)
-        for t in sample_times:
-            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-            ret, frame = cap.read()
-            if not ret: continue
-
-            if model is not None:
-                try:
-                    res = model(frame, verbose=False, conf=confidence)[0]
-                    if res.boxes is not None and len(res.boxes) > 0:
-                        for box in res.boxes:
-                            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                            soi_xs.append((x1 + x2) // 2)
-                            soi_ys.append((y1 + y2) // 2)
-                except Exception:
-                    pass
-            else:
-                scx, scy = saliency_center(frame)
-                soi_xs.append(scx)
-                soi_ys.append(scy)
-        cap.release()
-
-        if soi_xs:
-            soi_region = _soi_region_label(
-                int(np.median(soi_xs)), int(np.median(soi_ys)), orig_w, orig_h)
-
-        mins_s = int(start_sec // 60)
-        secs_s = int(start_sec % 60)
-        mins_e = int(end_sec // 60)
-        secs_e = int(end_sec % 60)
-        title  = f"Clip {ci+1}  ({mins_s}:{secs_s:02d} – {mins_e}:{secs_e:02d})"
-
-        segments.append(ClipSegment(
-            start_sec=start_sec, end_sec=end_sec, score=score,
-            soi_region=soi_region,
-            peak_frame=int(sample_times[len(sample_times) // 2] * fps),
-            title=title,
-        ))
-
-    _p(1.0, f"✅ Found {len(segments)} clips")
-    return segments
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Single-video verticalization
-# ─────────────────────────────────────────────────────────────────────────────
-def process_video(
-    input_path: str,
-    output_path: str,
-    target_preset_label: str = "Match source (no upscale)",
-    tracking_mode: str = "subject",
-    talking_head_bias: float = 0.30,
-    sample_interval: Optional[int] = None,
-    confidence: float = 0.45,
-    use_optical_flow: bool = True,
-    smooth_window: int = 15,
-    adaptive_smoothing: bool = True,
-    rule_of_thirds: bool = True,
-    scene_cut_threshold: float = 0.35,
-    output_fps: Optional[float] = None,
-    crf: int = 23,
-    encoder_preset: str = "fast",
-    audio_bitrate: str = "128k",
-    yolo_weights: str = "yolov8n.pt",
-    burn_subtitles: bool = False,
-    whisper_model: str = "base",
-    whisper_language: Optional[str] = None,
-    subtitle_style_name: str = "Bold White (TikTok)",
-    subtitle_max_chars: int = 42,
-    subtitle_translate_to: Optional[str] = None,
-    progress_callback: Optional[Callable[[float, str], None]] = None,
-) -> Dict[str, Any]:
-    """Convert one landscape video to 9:16.  Returns metadata dict."""
-
-    def _p(v: float, msg: str = "") -> None:
-        if progress_callback:
-            try: progress_callback(min(max(v, 0.0), 1.0), msg)
-            except Exception: pass
-
-    result_meta: Dict[str, Any] = {
-        "output_path":    output_path,
-        "subtitle_path":  None,
-        "clamped":        False,
-        "effective_size": (0, 0),
-        "duration":       0.0,
-    }
-
-    _check_ffmpeg()
-    if not os.path.exists(input_path):
-        raise ProcessingError(f"Input not found: {input_path}")
-    if os.path.getsize(input_path) / 1024 ** 2 > MAX_FILE_SIZE_MB:
-        raise ProcessingError(f"File exceeds {MAX_FILE_SIZE_MB} MB limit.")
-
-    info = get_video_info(input_path)
-    fps          = info["fps"]
-    total_frames = info["total_frames"]
-    orig_w, orig_h = info["width"], info["height"]
-    duration     = info["duration_seconds"]
-
-    if total_frames <= 0 or orig_w <= 0 or orig_h <= 0:
-        raise ProcessingError("Corrupt or unreadable video.")
-    if not info["is_landscape"]:
-        raise ProcessingError("Video is already vertical — upload a landscape video.")
-
-    lbl = target_preset_label if target_preset_label in RESOLUTION_PRESETS \
-        else "Match source (no upscale)"
-    target_w, target_h = resolve_target_size(lbl, orig_w, orig_h)
-
-    req_w, req_h = RESOLUTION_PRESETS.get(lbl, (0, 0))
-    clamped = req_h > 0 and (target_h < req_h or target_w < req_w)
-    result_meta.update(clamped=clamped,
-                       effective_size=(target_w, target_h),
-                       duration=duration)
-
-    _p(0.01, f"📐 Output {target_w}×{target_h}")
-
-    if not sample_interval:
-        sample_interval = max(1, int(fps / 2))
-
-    render_fps = float(output_fps) if output_fps and output_fps > 0 else fps
-    crop_w, crop_h = calculate_crop_dims(orig_w, orig_h, target_w, target_h)
-
-    # ── Whisper ─────────────────────────────────────────────────────────
-    srt_path: Optional[str] = None
-    if burn_subtitles and _has_audio(input_path):
-        _p(0.02, "🎙️ Transcribing…")
-        srt_fd, srt_path = tempfile.mkstemp(suffix=".srt")
-        os.close(srt_fd)
-        ok = transcribe_to_srt(
-            input_path, srt_path,
-            whisper_model=whisper_model,
-            language=whisper_language,
-            max_chars_per_line=subtitle_max_chars,
-            progress_callback=lambda v, m: _p(0.02 + v * 0.08, m),
-        )
-        if not ok:
-            if os.path.exists(srt_path):
-                os.unlink(srt_path)
-            srt_path = None
+with tab_adv:
+    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+    a1, a2 = st.columns(2, gap="medium")
+    with a1:
+        audio_bitrate_label = st.selectbox("Audio bitrate",
+            ["64k", "96k", "128k", "192k"], index=2)
+    with a2:
+        if tracking_mode == "subject":
+            yolo_weights = st.selectbox("YOLO model",
+                ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt"], index=0)
         else:
-            if subtitle_translate_to:
-                translate_srt(
-                    srt_path,
-                    target_language=subtitle_translate_to,
-                    progress_callback=lambda v, m: _p(0.10 + v * 0.05, m),
-                )
-            result_meta["subtitle_path"] = srt_path
+            yolo_weights = "yolov8n.pt"
+            st.markdown("""
+            <div class="rf-purp">Talking Head uses OpenCV face detector — YOLO not needed.</div>
+            """, unsafe_allow_html=True)
+    st.markdown("""
+    <div class="rf-safe">✓ Lower-third guard — subjects kept above bottom 20% of frame</div>
+    """, unsafe_allow_html=True)
 
-    # ── Load model ───────────────────────────────────────────────────────
-    start_pct = 0.10
-    model_obj: Optional[Any] = None
-    if tracking_mode == "subject":
-        _p(start_pct, "🤖 Loading YOLO model…")
-        model_obj = _get_model(yolo_weights)
-    else:
-        _p(start_pct, "👤 Loading face detector…")
-        if _get_haar() is None and _load_face_net() is None:
-            raise ProcessingError(
-                "No face detector available. Reinstall opencv-python.")
+# Clip settings (auto-clip mode only)
+clip_min_dur  = 25
+clip_max_dur  = 60
+clip_target_n = 8
+if app_mode == "autoClip" and tab_clip is not None:
+    with tab_clip:
+        st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+        cl1, cl2 = st.columns(2, gap="medium")
+        with cl1:
+            clip_min_dur = st.slider("Min clip duration (s)", 15, 45, 25, 5)
+            clip_max_dur = st.slider("Max clip duration (s)", 30, 90, 60, 5)
+        with cl2:
+            clip_target_n = st.slider("Target # clips", 3, 20, 8, 1)
+            st.markdown("""
+            <div class="rf-info" style="margin-top:8px;">
+            💡 AI detects saliency peaks + scene boundaries to find narrative arcs
+            (beginning · middle · end) in your video.
+            </div>""", unsafe_allow_html=True)
 
-    # ── Detection pass ───────────────────────────────────────────────────
-    _p(start_pct + 0.02, f"🔎 Analysing {total_frames} frames…")
+st.markdown("</div>", unsafe_allow_html=True)  # close settings div
 
-    det_centers: List[Tuple[int, int]] = []
-    det_indices: List[int]             = []
-    sal_centers: List[Tuple[int, int]] = []
-    sal_indices: List[int]             = []
-    scene_cuts:  List[int]             = []
+# Settings fingerprint for change detection
+current_settings = dict(
+    app_mode=app_mode, tracking_mode=tracking_mode,
+    resolution_label=resolution_label, fps_label=fps_label, crf=crf,
+    encoder_preset_label=encoder_preset_label,
+    smooth_window=smooth_window, adaptive_smoothing=adaptive_smoothing,
+    confidence=confidence, use_optical_flow=use_optical_flow,
+    rule_of_thirds=rule_of_thirds, scene_cut_threshold=scene_cut_threshold,
+    talking_head_bias=talking_head_bias,
+    burn_subtitles=burn_subtitles,
+    whisper_model=whisper_model if burn_subtitles else "",
+    audio_bitrate_label=audio_bitrate_label,
+)
+_invalidate_if_changed(current_settings)
 
-    prev_gray: Optional[np.ndarray] = None
-    prev_flow: Optional[np.ndarray] = None
-    frame_idx  = 0
-    report_n   = max(1, total_frames // 25)
-    det_end    = 0.42
-
-    cap = cv2.VideoCapture(input_path)
-    while frame_idx < total_frames:
-        ret, frame = cap.read()
-        if not ret: break
-
-        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if is_scene_change(prev_gray, curr_gray, scene_cut_threshold):
-            scene_cuts.append(frame_idx)
-            prev_flow = None
-        prev_gray = curr_gray
-
-        if frame_idx % sample_interval == 0:
-            center: Optional[Tuple[int, int]] = None
-
-            if tracking_mode == "talking_head":
-                faces = detect_faces(frame, confidence_thresh=0.5)
-                if faces:
-                    center = talking_head_center(
-                        faces, orig_w, orig_h, crop_w, crop_h, talking_head_bias)
-                elif use_optical_flow:
-                    small = cv2.resize(curr_gray, (orig_w // 2, orig_h // 2))
-                    if prev_flow is not None:
-                        fc = optical_flow_center(prev_flow, small, orig_w // 2, orig_h // 2)
-                        if fc is not None:
-                            center = (fc[0] * 2, fc[1] * 2)
-                    prev_flow = small
-            else:
-                det = detect_subjects(frame, model_obj, confidence)
-                if det is not None:
-                    center = frame_for_union(
-                        det.ux1, det.uy1, det.ux2, det.uy2,
-                        orig_w, orig_h, crop_w, crop_h)
-                elif use_optical_flow:
-                    small = cv2.resize(curr_gray, (orig_w // 2, orig_h // 2))
-                    if prev_flow is not None:
-                        fc = optical_flow_center(prev_flow, small, orig_w // 2, orig_h // 2)
-                        if fc is not None:
-                            center = (fc[0] * 2, fc[1] * 2)
-                    prev_flow = small
-
-            if center is not None:
-                det_centers.append(center); det_indices.append(frame_idx)
-            else:
-                sal_centers.append(saliency_center(frame))
-                sal_indices.append(frame_idx)
-
-        frame_idx += 1
-        if frame_idx % report_n == 0:
-            pct = start_pct + 0.02 + (det_end - start_pct - 0.02) * (frame_idx / total_frames)
-            _p(pct, f"🔎 {frame_idx}/{total_frames}…")
-
-    cap.release()
-    _p(det_end, f"📍 {len(det_centers)} anchors · {len(scene_cuts)} cuts")
-
-    # Merge saliency into detection gaps
-    if not det_centers:
-        det_centers = sal_centers or [(orig_w // 2, orig_h // 2)]
-        det_indices = sal_indices  or [0]
-    else:
-        gap = sample_interval * 4
-        for si, sc_center in zip(sal_indices, sal_centers):
-            if not det_indices or min(abs(si - di) for di in det_indices) > gap:
-                det_indices.append(si)
-                det_centers.append(sc_center)
-        pairs = sorted(zip(det_indices, det_centers))
-        det_indices = [p[0] for p in pairs]
-        det_centers = [p[1] for p in pairs]
-
-    # ── Crop path ────────────────────────────────────────────────────────
-    _p(0.43, "📈 Computing crop path…")
-    all_centers = interpolate_centers(det_centers, det_indices, total_frames)
-    speeds      = _compute_speeds(all_centers)
-    all_centers = smooth_centers(
-        all_centers, speeds,
-        base_window=smooth_window,
-        adaptive=adaptive_smoothing,
-        scene_cuts=scene_cuts,
-    )
-
-    if rule_of_thirds and tracking_mode != "talking_head":
-        speeds   = _compute_speeds(all_centers, smooth=3)
-        vel_vecs = _compute_vel_vecs(all_centers, look=3)
-        framed   = [
-            apply_framing_bias(cx, cy, vx, vy, speeds[i],
-                               orig_w, orig_h, crop_w, crop_h)
-            for i, ((cx, cy), (vx, vy)) in enumerate(zip(all_centers, vel_vecs))
-        ]
-        all_centers = framed
-    elif tracking_mode == "talking_head" and rule_of_thirds:
-        hw2, hh2 = crop_w // 2, crop_h // 2
-        framed = []
-        for cx, cy in all_centers:
-            tx = min([orig_w // 3, 2 * orig_w // 3], key=lambda x: abs(x - cx))
-            nx = int(cx + 0.15 * (tx - cx))
-            nx = max(hw2, min(nx, orig_w - hw2))
-            framed.append((nx, cy))
-        all_centers = framed
-
-    hw, hh = crop_w // 2, crop_h // 2
-    all_centers = [
-        (max(hw, min(cx, orig_w - hw)), max(hh, min(cy, orig_h - hh)))
-        for cx, cy in all_centers
-    ]
-    all_centers += [all_centers[-1]] * max(0, total_frames - len(all_centers))
-    all_centers  = all_centers[:total_frames]
-
-    # ── Render → temp AVI → FFmpeg → output MP4 ─────────────────────────
-    _p(0.46, "✂️ Rendering frames…")
-    temp_avi: Optional[str] = None
-    temp_mp4: Optional[str] = None
-
-    try:
-        fd, temp_avi = tempfile.mkstemp(suffix=".avi")
-        os.close(fd)
-
-        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        writer = cv2.VideoWriter(temp_avi, fourcc, render_fps, (target_w, target_h))
-        if not writer.isOpened():
-            raise ProcessingError("cv2.VideoWriter failed to open.")
-
-        cap   = cv2.VideoCapture(input_path)
-        rpt_n = max(1, total_frames // 40)
-        for fn in range(total_frames):
-            ret, frame = cap.read()
-            if not ret: break
-            cx, cy = all_centers[fn]
-            left   = max(0, min(cx - crop_w // 2, orig_w - crop_w))
-            top    = max(0, min(cy - crop_h // 2, orig_h - crop_h))
-            crop   = frame[top:top + crop_h, left:left + crop_w]
-            if crop.shape[1] != target_w or crop.shape[0] != target_h:
-                crop = cv2.resize(crop, (target_w, target_h),
-                                  interpolation=cv2.INTER_LANCZOS4)
-            writer.write(crop)
-            if (fn + 1) % rpt_n == 0:
-                _p(0.46 + 0.40 * ((fn + 1) / total_frames), f"✂️ {fn+1}/{total_frames}…")
-
-        cap.release()
-        writer.release()
-
-        if not os.path.exists(temp_avi) or os.path.getsize(temp_avi) < 1000:
-            raise ProcessingError("Rendered AVI is empty.")
-
-        _p(0.87, "🎵 Encoding…" + (" Burning subtitles…" if srt_path else ""))
-        fd, temp_mp4 = tempfile.mkstemp(suffix=".mp4")
-        os.close(fd)
-
-        style = SUBTITLE_STYLES.get(subtitle_style_name,
-                                    SUBTITLE_STYLES["Bold White (TikTok)"])
-        _ffmpeg_encode(
-            temp_avi,
-            input_path if _has_audio(input_path) else None,
-            temp_mp4,
-            fps=render_fps, duration=duration,
-            crf=crf, preset=encoder_preset,
-            audio_bitrate=audio_bitrate,
-            subtitle_path=srt_path,
-            subtitle_style=style,
-        )
-
-        if not os.path.exists(temp_mp4) or os.path.getsize(temp_mp4) < 1000:
-            raise ProcessingError("FFmpeg produced empty output.")
-
-        shutil.move(temp_mp4, output_path)
-        temp_mp4 = None
-
-        _p(1.0, "✅ Done!")
-        print(f"✅  {output_path}  ({os.path.getsize(output_path)/1024**2:.1f} MB)",
-              file=sys.stderr)
-        return result_meta
-
-    finally:
-        for p in (temp_avi, temp_mp4):
-            if p and os.path.exists(p):
-                try: os.unlink(p)
-                except OSError: pass
-        # srt_path is kept alive — caller reads and then deletes it
+st.markdown("<div style='height:2px;background:var(--bdr);margin:10px 0 0'></div>",
+            unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Batch clip pipeline
+#  Two-column layout: source | output
 # ─────────────────────────────────────────────────────────────────────────────
-def process_clips_batch(
-    input_path: str,
-    output_dir: str,
-    clips: List[ClipSegment],
-    target_preset_label: str = "720p   (720×1280  — HD)",
-    tracking_mode: str = "subject",
-    talking_head_bias: float = 0.30,
-    confidence: float = 0.45,
-    smooth_window: int = 15,
-    adaptive_smoothing: bool = True,
-    rule_of_thirds: bool = True,
-    crf: int = 23,
-    encoder_preset: str = "fast",
-    audio_bitrate: str = "128k",
-    yolo_weights: str = "yolov8n.pt",
-    burn_subtitles: bool = False,
-    whisper_model: str = "base",
-    subtitle_style_name: str = "Bold White (TikTok)",
-    subtitle_max_chars: int = 42,
-    progress_callback: Optional[Callable[[float, str], None]] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Trim each ClipSegment from the source file, then verticalize.
-    Returns a list of result-meta dicts (one per clip).
-    """
-    def _p(v: float, msg: str = "") -> None:
-        if progress_callback:
-            try: progress_callback(v, msg)
-            except Exception: pass
+col_src, col_out = st.columns(2, gap="small")
 
-    os.makedirs(output_dir, exist_ok=True)
-    results: List[Dict[str, Any]] = []
+# ── Source column ─────────────────────────────────────────────────────────────
+with col_src:
+    st.markdown("<div class='rf-panel'>", unsafe_allow_html=True)
+    st.markdown('<div class="rf-sec">Source Video</div>', unsafe_allow_html=True)
 
-    for i, clip in enumerate(clips):
-        base_pct = i / max(len(clips), 1)
-        next_pct = (i + 1) / max(len(clips), 1)
+    max_mb = 2000 if app_mode == "autoClip" else 500
+    uploaded_file = st.file_uploader("Drop video",
+        type=["mp4", "mov", "avi", "mkv"], label_visibility="collapsed")
 
-        _p(base_pct, f"✂️ Processing clip {i+1}/{len(clips)}…")
+    if uploaded_file is not None:
+        mb = len(uploaded_file.getvalue()) / (1024 ** 2)
+        if mb > max_mb:
+            st.markdown(f'<div class="rf-warn">⚠ {mb:.1f} MB — max {max_mb} MB.</div>',
+                        unsafe_allow_html=True)
+            uploaded_file = None
 
-        trimmed_path: Optional[str] = None
-        out_path: Optional[str] = None
-
+    if (uploaded_file is not None
+            and st.session_state.uploaded_file_name != uploaded_file.name):
+        _cleanup()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp.write(uploaded_file.getvalue())
+            st.session_state.input_path = tmp.name
+        _new_out()
+        st.session_state.uploaded_file_name = uploaded_file.name
         try:
-            fd, trimmed_path = tempfile.mkstemp(suffix=".mp4")
-            os.close(fd)
+            st.session_state.video_info = get_video_info(st.session_state.input_path)
+        except Exception:
+            st.session_state.video_info = None
 
-            if not _trim_video(input_path, trimmed_path, clip.start_sec, clip.end_sec):
-                results.append({"clip": clip, "output_path": None,
-                                 "error": "trim failed"})
-                continue
+    if uploaded_file is not None and st.session_state.input_path:
+        info = st.session_state.video_info
+        if info and not info["is_landscape"]:
+            st.markdown(
+                '<div class="rf-warn">⚠ Video is already vertical. Upload a landscape video.</div>',
+                unsafe_allow_html=True)
+        mb_str = f"{len(uploaded_file.getvalue()) / (1024**2):.1f} MB"
+        st.markdown(
+            f'<div class="rf-chip"><span>🎬</span>'
+            f'<strong>{uploaded_file.name}</strong>'
+            f'<span style="color:var(--bdr2)">·</span>'
+            f'<span>{mb_str}</span></div>',
+            unsafe_allow_html=True)
+        st.video(uploaded_file)
 
-            safe_name = f"clip_{i+1:02d}_{int(clip.start_sec)}s_{int(clip.end_sec)}s"
-            out_path  = os.path.join(output_dir, f"{safe_name}_vertical.mp4")
+        if info:
+            dur = info["duration_seconds"]
+            mins, secs = int(dur // 60), int(dur % 60)
+            dur_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
+            eff_w, eff_h = resolve_target_size(
+                resolution_label, info["width"], info["height"])
+            st.markdown(f"""
+            <div class='rf-metrics' style='margin-top:10px;'>
+              <div class='rf-m'><div class='rf-ml'>Duration</div>
+                <div class='rf-mv'>{dur_str}</div></div>
+              <div class='rf-m'><div class='rf-ml'>Source</div>
+                <div class='rf-mv'>{info['width']}×{info['height']}</div></div>
+              <div class='rf-m'><div class='rf-ml'>Output</div>
+                <div class='rf-mv a'>{eff_w}×{eff_h}</div></div>
+              <div class='rf-m'><div class='rf-ml'>FPS</div>
+                <div class='rf-mv'>{info['fps']:.0f}</div></div>
+            </div>""", unsafe_allow_html=True)
 
-            def clip_cb(v: float, msg: str = "") -> None:
-                _p(base_pct + v * (next_pct - base_pct), msg)
+            if app_mode == "autoClip" and dur < 60:
+                st.markdown(
+                    '<div class="rf-warn" style="margin-top:8px;">⚠ Auto-Clip works best on videos ≥ 2 minutes.</div>',
+                    unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-            meta = process_video(
-                trimmed_path, out_path,
-                target_preset_label=target_preset_label,
-                tracking_mode=tracking_mode,
-                talking_head_bias=talking_head_bias,
-                confidence=confidence,
-                smooth_window=smooth_window,
-                adaptive_smoothing=adaptive_smoothing,
-                rule_of_thirds=rule_of_thirds,
-                crf=crf,
-                encoder_preset=encoder_preset,
-                audio_bitrate=audio_bitrate,
-                yolo_weights=yolo_weights,
-                burn_subtitles=burn_subtitles,
-                whisper_model=whisper_model,
-                subtitle_style_name=subtitle_style_name,
-                subtitle_max_chars=subtitle_max_chars,
-                progress_callback=clip_cb,
-            )
-            meta["clip"] = clip
-            results.append(meta)
 
-        except Exception as exc:
-            results.append({
-                "clip": clip,
-                "output_path": out_path,
-                "error": str(exc),
-            })
-        finally:
-            if trimmed_path and os.path.exists(trimmed_path):
-                try: os.unlink(trimmed_path)
-                except OSError: pass
+# ── Output column ─────────────────────────────────────────────────────────────
+with col_out:
+    st.markdown("<div class='rf-panelr'>", unsafe_allow_html=True)
 
-    n_ok = sum(1 for r in results if not r.get("error"))
-    _p(1.0, f"✅ Batch complete — {n_ok}/{len(results)} clips done")
-    return results
+    # ─── SINGLE CLIP OUTPUT ───────────────────────────────────────────────
+    if app_mode == "single":
+        st.markdown('<div class="rf-sec">Output · 9:16</div>', unsafe_allow_html=True)
+
+        if st.session_state.processing_done and st.session_state.output_bytes:
+            out_mb = len(st.session_state.output_bytes) / (1024 ** 2)
+            st.markdown(f'<div class="rf-ok">✓ Done — {out_mb:.1f} MB</div>',
+                        unsafe_allow_html=True)
+            st.video(st.session_state.output_bytes, format="video/mp4")
+            st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+            stem = os.path.splitext(st.session_state.uploaded_file_name or "video")[0]
+            st.download_button(
+                "↓  Download vertical video",
+                data=st.session_state.output_bytes,
+                file_name=f"{stem}_vertical.mp4",
+                mime="video/mp4",
+                use_container_width=True)
+            if st.session_state.srt_bytes:
+                st.download_button(
+                    "↓  Download subtitles (.srt)",
+                    data=st.session_state.srt_bytes,
+                    file_name=f"{stem}.srt",
+                    mime="text/plain",
+                    use_container_width=True)
+        else:
+            st.markdown("""
+            <div class="rf-empty">
+              <div class="rf-empty-icon">📱</div>
+              <div class="rf-empty-h">Vertical output</div>
+              <div class="rf-empty-s">appears here after conversion</div>
+            </div>""", unsafe_allow_html=True)
+
+    # ─── AUTO-CLIP PANEL ──────────────────────────────────────────────────
+    else:
+        st.markdown('<div class="rf-sec">Detected Clips</div>', unsafe_allow_html=True)
+
+        if not st.session_state.scan_done:
+            st.markdown("""
+            <div class="rf-empty">
+              <div class="rf-empty-icon">🔍</div>
+              <div class="rf-empty-h">Scan first</div>
+              <div class="rf-empty-s">AI will detect high-engagement segments</div>
+            </div>""", unsafe_allow_html=True)
+
+        elif st.session_state.detected_clips:
+            clips = st.session_state.detected_clips
+            if st.session_state.selected_clip_indices is None:
+                st.session_state.selected_clip_indices = set(range(len(clips)))
+            sel = st.session_state.selected_clip_indices
+
+            st.markdown(
+                f"<div style='font-size:11px;color:var(--ink3);margin-bottom:8px;'>"
+                f"{len(clips)} clips found · {len(sel)} selected</div>",
+                unsafe_allow_html=True)
+
+            clip_results_map: dict = {}
+            if st.session_state.clip_results:
+                for r in st.session_state.clip_results:
+                    clip_obj = r.get("clip")
+                    if clip_obj is not None:
+                        clip_results_map[id(clip_obj)] = r
+
+            for ci, clip in enumerate(clips):
+                score_pct = int(clip.score * 100)
+                score_cls = "h" if clip.score > 0.7 else ("m" if clip.score > 0.4 else "")
+                is_sel    = ci in sel
+
+                # Check if this clip has a finished result
+                result_for_clip = clip_results_map.get(id(clip))
+                is_done = (
+                    result_for_clip is not None
+                    and not result_for_clip.get("error")
+                    and result_for_clip.get("output_path")
+                    and os.path.exists(result_for_clip["output_path"])
+                )
+
+                mins_s = int(clip.start_sec // 60)
+                secs_s = int(clip.start_sec % 60)
+                mins_e = int(clip.end_sec // 60)
+                secs_e = int(clip.end_sec % 60)
+                time_str = f"{mins_s}:{secs_s:02d} → {mins_e}:{secs_e:02d}"
+
+                card_cls = "rf-ccard" + (" done" if is_done else (" sel" if is_sel else ""))
+                done_tag = ("<div style='margin-top:5px;font-size:10px;"
+                            "color:var(--grn);font-weight:700;'>✓ Converted</div>"
+                            if is_done else "")
+
+                st.markdown(f"""
+                <div class="{card_cls}">
+                  <span class="rf-cscore {score_cls}">{score_pct}%</span>
+                  <div class="rf-ctitle">Clip {ci+1}</div>
+                  <div class="rf-cmeta">{time_str}</div>
+                  <span class="rf-cdur">{clip.duration:.0f}s</span>
+                  <span class="rf-csoi">SOI: {clip.soi_region}</span>
+                  {done_tag}
+                </div>""", unsafe_allow_html=True)
+
+                cb_col, dl_col = st.columns([2, 1])
+                with cb_col:
+                    if not is_done:
+                        toggled = st.checkbox(
+                            "✓ Selected" if is_sel else "Include",
+                            value=is_sel, key=f"csel_{ci}")
+                        if toggled != is_sel:
+                            if toggled:
+                                st.session_state.selected_clip_indices.add(ci)
+                            else:
+                                st.session_state.selected_clip_indices.discard(ci)
+                            st.rerun()
+                with dl_col:
+                    if is_done:
+                        try:
+                            with open(result_for_clip["output_path"], "rb") as f:
+                                clip_bytes = f.read()
+                            st.download_button(
+                                "↓ Download",
+                                data=clip_bytes,
+                                file_name=f"clip_{ci+1}_vertical.mp4",
+                                mime="video/mp4",
+                                key=f"dl_{ci}",
+                                use_container_width=True)
+                        except Exception:
+                            pass
+        else:
+            st.markdown("""
+            <div class="rf-empty">
+              <div class="rf-empty-icon">🔍</div>
+              <div class="rf-empty-h">No clips found</div>
+              <div class="rf-empty-s">try adjusting clip duration in the Clips tab</div>
+            </div>""", unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Action bar (only shown when a file is uploaded)
+# ─────────────────────────────────────────────────────────────────────────────
+if uploaded_file is not None and st.session_state.input_path:
+    info = st.session_state.video_info
+    can_go = bool(info and info.get("is_landscape", True))
+
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:1px;background:var(--bdr);margin:0 20px'></div>",
+                unsafe_allow_html=True)
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+    # ─── SINGLE CLIP ACTIONS ──────────────────────────────────────────────
+    if app_mode == "single":
+        if not st.session_state.processing_done:
+            a1, a2, a3 = st.columns([4, 5, 2])
+            with a1:
+                go = st.button("▶  Convert to Vertical",
+                               type="primary", use_container_width=True,
+                               disabled=not can_go)
+            with a2:
+                if info:
+                    eff_w, eff_h = resolve_target_size(
+                        resolution_label, info["width"], info["height"])
+                    mode_t = "Talking Head" if tracking_mode == "talking_head" else "Subject"
+                    st.markdown(
+                        f"<p style='color:var(--ink3);font-size:11px;margin-top:12px;'>"
+                        f"{mode_t} · {eff_w}×{eff_h} · CRF {crf}</p>",
+                        unsafe_allow_html=True)
+            with a3:
+                if st.button("Clear", type="secondary", use_container_width=True):
+                    _cleanup()
+                    st.session_state.uploaded_file_name = None
+                    st.rerun()
+
+            if go:
+                st.session_state.last_settings = current_settings
+                prog   = st.progress(0.0)
+                status = st.empty()
+                status.info("⚡ Starting…")
+                try:
+                    def _cb(v: float, msg: str = "") -> None:
+                        prog.progress(min(v, 1.0))
+                        if msg: status.info(msg)
+
+                    meta = process_video(
+                        st.session_state.input_path,
+                        st.session_state.output_path,
+                        target_preset_label=resolution_label,
+                        tracking_mode=tracking_mode,
+                        talking_head_bias=talking_head_bias,
+                        confidence=confidence,
+                        smooth_window=smooth_window,
+                        adaptive_smoothing=adaptive_smoothing,
+                        use_optical_flow=use_optical_flow,
+                        rule_of_thirds=rule_of_thirds,
+                        scene_cut_threshold=scene_cut_threshold,
+                        output_fps=output_fps,
+                        crf=crf,
+                        encoder_preset=encoder_preset_label,
+                        audio_bitrate=audio_bitrate_label,
+                        yolo_weights=yolo_weights,
+                        burn_subtitles=burn_subtitles,
+                        whisper_model=whisper_model,
+                        whisper_language=whisper_language,
+                        subtitle_style_name=subtitle_style_name,
+                        subtitle_max_chars=subtitle_max_chars,
+                        subtitle_translate_to=subtitle_translate_to,
+                        progress_callback=_cb,
+                    )
+                    prog.progress(1.0)
+                    out_p = st.session_state.output_path
+                    if os.path.exists(out_p) and os.path.getsize(out_p) > 0:
+                        with open(out_p, "rb") as f:
+                            st.session_state.output_bytes = f.read()
+                        srt_p = meta.get("subtitle_path")
+                        if srt_p and os.path.exists(srt_p):
+                            with open(srt_p, "rb") as f:
+                                st.session_state.srt_bytes = f.read()
+                            try: os.unlink(srt_p)
+                            except OSError: pass
+                        st.session_state.processing_done = True
+                        status.success("✅ Done!")
+                        st.rerun()
+                    else:
+                        status.error("Output is empty — check your FFmpeg installation.")
+                except Exception as exc:
+                    status.error(f"Error: {exc}")
+        else:
+            r1, _, r2 = st.columns([2, 5, 2])
+            with r1:
+                if st.button("← Start over", type="secondary", use_container_width=True):
+                    _cleanup()
+                    st.session_state.uploaded_file_name = None
+                    st.session_state.processing_done = False
+                    st.rerun()
+            with r2:
+                if info and st.session_state.output_bytes:
+                    in_mb  = len(uploaded_file.getvalue()) / (1024 ** 2)
+                    out_mb = len(st.session_state.output_bytes) / (1024 ** 2)
+                    delta  = out_mb - in_mb
+                    dcol   = "var(--grn)" if delta < 0 else "var(--acc)"
+                    st.markdown(
+                        f"<p style='color:var(--ink3);font-size:11px;"
+                        f"text-align:right;margin-top:12px;'>"
+                        f"{out_mb:.1f} MB "
+                        f"<span style='color:{dcol}'>({delta:+.1f} MB)</span></p>",
+                        unsafe_allow_html=True)
+
+    # ─── AUTO-CLIP ACTIONS ────────────────────────────────────────────────
+    else:
+        if not st.session_state.scan_done:
+            b1, b2, b3 = st.columns([4, 4, 2])
+            with b1:
+                scan_btn = st.button("🔍  Scan for Clips",
+                                     type="primary", use_container_width=True,
+                                     disabled=not can_go)
+            with b2:
+                if info:
+                    dur = info["duration_seconds"]
+                    est = max(10, dur * 0.05)
+                    est_s = (f"~{int(est//60)}m {int(est%60):02d}s"
+                             if est >= 60 else f"~{int(est)}s")
+                    st.markdown(
+                        f"<p style='color:var(--ink3);font-size:11px;margin-top:12px;'>"
+                        f"Scan est. {est_s}</p>", unsafe_allow_html=True)
+            with b3:
+                if st.button("Clear", type="secondary", use_container_width=True):
+                    _cleanup()
+                    st.session_state.uploaded_file_name = None
+                    st.rerun()
+
+            if scan_btn:
+                prog   = st.progress(0.0)
+                status = st.empty()
+                status.info("🔍 Scanning for high-engagement segments…")
+                try:
+                    def _scan_cb(v: float, msg: str = "") -> None:
+                        prog.progress(min(v, 1.0))
+                        if msg: status.info(msg)
+
+                    clips = detect_clips(
+                        st.session_state.input_path,
+                        min_duration_sec=float(clip_min_dur),
+                        max_duration_sec=float(clip_max_dur),
+                        target_n_clips=int(clip_target_n),
+                        model=None,
+                        confidence=confidence,
+                        progress_callback=_scan_cb,
+                    )
+                    prog.progress(1.0)
+                    st.session_state.detected_clips          = clips
+                    st.session_state.selected_clip_indices   = set(range(len(clips)))
+                    st.session_state.scan_done               = True
+                    status.success(f"✅ Found {len(clips)} clips!")
+                    st.rerun()
+                except Exception as exc:
+                    status.error(f"Scan error: {exc}")
+
+        else:
+            clips = st.session_state.detected_clips or []
+            sel   = st.session_state.selected_clip_indices or set()
+
+            if not st.session_state.clip_results:
+                p1, p2, p3 = st.columns([4, 3, 2])
+                with p1:
+                    n_sel = len(sel)
+                    process_btn = st.button(
+                        f"▶  Verticalize {n_sel} Clip{'s' if n_sel != 1 else ''}",
+                        type="primary", use_container_width=True,
+                        disabled=n_sel == 0)
+                with p2:
+                    if st.button("🔄 Re-scan", type="secondary", use_container_width=True):
+                        st.session_state.scan_done       = False
+                        st.session_state.detected_clips  = None
+                        st.session_state.clip_results    = None
+                        st.rerun()
+                with p3:
+                    if st.button("Clear", type="secondary", use_container_width=True):
+                        _cleanup()
+                        st.session_state.uploaded_file_name = None
+                        st.rerun()
+
+                if process_btn and sel:
+                    selected_clips = [clips[i] for i in sorted(sel)]
+                    out_dir = tempfile.mkdtemp()
+                    st.session_state.clip_out_dir = out_dir
+
+                    prog   = st.progress(0.0)
+                    status = st.empty()
+                    status.info(f"⚡ Processing {len(selected_clips)} clips…")
+
+                    def _batch_cb(v: float, msg: str = "") -> None:
+                        prog.progress(min(v, 1.0))
+                        if msg: status.info(msg)
+
+                    try:
+                        results = process_clips_batch(
+                            input_path=st.session_state.input_path,
+                            output_dir=out_dir,
+                            clips=selected_clips,
+                            target_preset_label=resolution_label,
+                            tracking_mode=tracking_mode,
+                            talking_head_bias=talking_head_bias,
+                            confidence=confidence,
+                            smooth_window=smooth_window,
+                            adaptive_smoothing=adaptive_smoothing,
+                            rule_of_thirds=rule_of_thirds,
+                            crf=crf,
+                            encoder_preset=encoder_preset_label,
+                            audio_bitrate=audio_bitrate_label,
+                            yolo_weights=yolo_weights,
+                            burn_subtitles=burn_subtitles,
+                            whisper_model=whisper_model,
+                            subtitle_style_name=subtitle_style_name,
+                            subtitle_max_chars=subtitle_max_chars,
+                            progress_callback=_batch_cb,
+                        )
+                        prog.progress(1.0)
+                        st.session_state.clip_results = results
+                        n_ok = sum(1 for r in results if not r.get("error"))
+                        status.success(f"✅ {n_ok}/{len(results)} clips converted!")
+                        st.rerun()
+                    except Exception as exc:
+                        status.error(f"Error: {exc}")
+
+            else:
+                results = st.session_state.clip_results
+                n_ok = sum(1 for r in results if not r.get("error"))
+                st.markdown(
+                    f'<div class="rf-ok">✓ {n_ok} clip{"s" if n_ok!=1 else ""} '
+                    f'ready — download from the cards above</div>',
+                    unsafe_allow_html=True)
+
+                rc1, rc2 = st.columns(2)
+                with rc1:
+                    if st.button("← New scan", type="secondary", use_container_width=True):
+                        st.session_state.scan_done      = False
+                        st.session_state.detected_clips = None
+                        st.session_state.clip_results   = None
+                        st.rerun()
+                with rc2:
+                    if st.button("← New video", type="secondary", use_container_width=True):
+                        _cleanup()
+                        st.session_state.uploaded_file_name = None
+                        st.rerun()
+
+else:
+    # Welcome / empty state
+    st.markdown("""
+    <div style='padding:0 20px 44px;margin-top:16px;'>
+      <div style='background:var(--surf);border:2px dashed var(--bdr);
+          border-radius:var(--r);padding:48px 28px;text-align:center;'>
+        <div style='font-family:"DM Serif Display",serif;
+            font-size:clamp(1.5rem,3.5vw,2.2rem);font-weight:400;
+            color:var(--bdr2);letter-spacing:-0.03em;
+            margin-bottom:10px;line-height:1.1;'>
+          Drop a video to begin.
+        </div>
+        <p style='font-size:12px;color:var(--ink3);margin-bottom:16px;'>
+          Landscape MP4 · MOV · AVI · MKV
+        </p>
+        <div style='display:flex;gap:6px;justify-content:center;flex-wrap:wrap;'>
+          <span style='font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+            color:var(--ink3);padding:4px 9px;border:1px solid var(--bdr);border-radius:4px;'>MP4</span>
+          <span style='font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+            color:var(--ink3);padding:4px 9px;border:1px solid var(--bdr);border-radius:4px;'>MOV</span>
+          <span style='font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+            color:var(--ink3);padding:4px 9px;border:1px solid var(--bdr);border-radius:4px;'>AVI</span>
+          <span style='font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+            color:var(--ink3);padding:4px 9px;border:1px solid var(--bdr);border-radius:4px;'>MKV</span>
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Footer
+st.markdown("""
+<div class="rf-foot">
+  <div class="rf-tech">
+    <span>YOLOv8</span><span>OpenCV</span>
+    <span>Whisper</span><span>FFmpeg</span>
+  </div>
+  <div style='font-size:10px;color:var(--bdr2);'>Reframe · AI Vertical Video</div>
+</div>
+""", unsafe_allow_html=True)
