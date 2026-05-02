@@ -216,16 +216,19 @@ video { border-radius: var(--r) !important; width: 100% !important; }
 [data-testid="stRadio"] [data-testid="stMarkdownContainer"] p { font-size:12px !important; }
 [data-testid="stRadio"] > div { gap:6px !important; }
 
-/* Vertical video player — 9:16 constrained preview */
-div[style*="max-width:220px"] video {
-  max-height:390px !important;
-  width:100% !important;
-  border-radius:8px !important;
-  display:block !important;
-}
-div[style*="max-width:220px"] [data-testid="stVideo"] {
-  border-radius:8px !important;
+/* Vertical 9:16 player — height matches landscape player (~360px) so width = 360*9/16 = 202px */
+.rf-vplayer { width:202px; flex-shrink:0; }
+.rf-vplayer [data-testid="stVideo"] {
+  border-radius:10px !important;
   overflow:hidden !important;
+  height:360px !important;
+}
+.rf-vplayer video {
+  width:202px !important;
+  height:360px !important;
+  object-fit:cover !important;
+  border-radius:10px !important;
+  display:block !important;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -707,10 +710,10 @@ with col_out:
                 </div>""", unsafe_allow_html=True)
 
                 if is_done:
-                    # Row: Play toggle | Download
+                    # Buttons row: Play toggle | Download
                     btn_col, dl_col = st.columns([1, 1])
                     with btn_col:
-                        play_label = "⏹ Close player" if is_playing else "▶ Play vertical"
+                        play_label = "⏹ Close" if is_playing else "▶ Play 9:16"
                         if st.button(play_label, key=f"play_{ci}",
                                      type="secondary", use_container_width=True):
                             st.session_state.playing_clip_idx = -1 if is_playing else ci
@@ -729,22 +732,19 @@ with col_out:
                         except Exception:
                             pass
 
-                    # Vertical player — only shown for the active clip
+                    # Vertical player — only for the active clip, same height as landscape player
                     if is_playing:
                         try:
                             with open(result_for_clip["output_path"], "rb") as f:
                                 clip_bytes_play = f.read()
-                            st.markdown(
-                                "<div style='"
-                                "background:#111;border-radius:10px;overflow:hidden;"
-                                "max-width:220px;margin:8px auto 4px;"
-                                "box-shadow:0 4px 20px rgba(0,0,0,0.25);'>"
-                                "<div style='text-align:center;padding:6px 0 2px;"
-                                "font-size:10px;font-weight:700;color:#666;"
-                                "letter-spacing:.08em;text-transform:uppercase;'>9:16 Preview</div>",
-                                unsafe_allow_html=True)
-                            st.video(clip_bytes_play, format="video/mp4")
-                            st.markdown("</div>", unsafe_allow_html=True)
+                            # Use columns: narrow (9:16 width) | spacer
+                            # 202px ≈ 360px * 9/16  so it matches horizontal player height
+                            vcol, _ = st.columns([202, 400])
+                            with vcol:
+                                st.markdown('<div class="rf-vplayer">',
+                                            unsafe_allow_html=True)
+                                st.video(clip_bytes_play, format="video/mp4")
+                                st.markdown('</div>', unsafe_allow_html=True)
                         except Exception:
                             pass
 
@@ -1006,17 +1006,24 @@ if uploaded_file is not None and st.session_state.input_path:
                     f'ready — download from the cards above</div>',
                     unsafe_allow_html=True)
 
-                rc1, rc2 = st.columns(2)
+                rc1, rc2, rc3 = st.columns(3)
                 with rc1:
                     if st.button("← New scan", type="secondary", use_container_width=True):
                         st.session_state.scan_done      = False
                         st.session_state.detected_clips = None
                         st.session_state.clip_results   = None
+                        st.session_state.playing_clip_idx = -1
                         st.rerun()
                 with rc2:
                     if st.button("← New video", type="secondary", use_container_width=True):
                         _cleanup()
                         st.session_state.uploaded_file_name = None
+                        st.rerun()
+                with rc3:
+                    if st.button("🗑 Clear cache", type="secondary", use_container_width=True):
+                        _cleanup()
+                        st.session_state.uploaded_file_name = None
+                        st.cache_data.clear()
                         st.rerun()
 
 else:
