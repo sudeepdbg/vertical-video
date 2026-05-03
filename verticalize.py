@@ -45,6 +45,19 @@ MAX_FRAMES_GUARD  = 1_080_000
 # Subjects must appear above this fraction of vertical crop height
 LOWER_THIRD_GUARD = 0.80   # bottom 20% is reserved for platform UI
 
+# ── Anti-shake constants ────────────────────────────────────────────────────
+# Only move the crop if the new center differs by more than this fraction
+# of the crop dimension.  Filters out sub-pixel YOLO bbox jitter.
+DEADBAND_FRAC   = 0.005    # 0.5% of crop width/height
+# Hard cap on how many pixels the crop center may move per frame.
+# Prevents single-frame detection outliers from snapping the view.
+MAX_PIXELS_PER_FRAME = 8
+# How many frames to cross-fade smoothing windows at scene boundaries.
+SCENE_BLEND_FRAMES = 6
+# Talking-head lock: ignore face-bbox shifts smaller than this fraction
+# of frame width (kills micro-jitter from AA/compression artifacts).
+FACE_LOCK_FRAC  = 0.01     # 1% of orig_w
+
 VELOCITY_SMOOTH_TABLE: List[Tuple[float, int]] = [
     (0.0,   31), (5.0,   25), (15.0,  17),
     (30.0,  11), (60.0,   7), (120.0,  3),
@@ -316,7 +329,7 @@ def resolve_target_size(label: str, orig_w: int, orig_h: int) -> Tuple[int, int]
 # ─────────────────────────────────────────────────────────────────────────────
 #  YOLO model cache
 # ─────────────────────────────────────────────────────────────────────────────
-_model_cache: Dict[str, Any] = {}   # str -> YOLO, no cv2 type at module level
+_model_cache: Dict[str, Any] = {}
 
 
 def _get_model(weights: str = "yolov8n.pt") -> Any:
@@ -330,11 +343,9 @@ def _get_model(weights: str = "yolov8n.pt") -> Any:
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Face detection  (DNN → Haar fallback)
-#  NOTE: module-level variables use plain 'None' — no cv2 type annotations
-#        here to avoid AttributeError when cv2 is not fully loaded yet.
 # ─────────────────────────────────────────────────────────────────────────────
-_face_net = None          # cv2.dnn.Net instance once loaded
-_haar_cascade = None      # cv2.CascadeClassifier instance once loaded
+_face_net      = None
+_haar_cascade  = None
 
 _FACE_PROTO = "deploy.prototxt"
 _FACE_MODEL = "res10_300x300_ssd_iter_140000.caffemodel"
@@ -409,14 +420,6 @@ def detect_faces(frame: np.ndarray,
 #  Lower-third guard
 # ─────────────────────────────────────────────────────────────────────────────
 def _apply_lower_third_guard(cy: int, crop_h: int, subject_cy_src: int) -> int:
-    """
-    Ensure the subject does not appear in the bottom (1-LOWER_THIRD_GUARD)
-    fraction of the crop frame.
-
-    Formula: subject_y_in_crop = subject_cy_src - (cy - crop_h//2)
-    We require: subject_y_in_crop <= LOWER_THIRD_GUARD * crop_h
-    => cy >= subject_cy_src - LOWER_THIRD_GUARD * crop_h + crop_h//2
-    """
     min_cy = subject_cy_src - int(LOWER_THIRD_GUARD * crop_h) + crop_h // 2
     return max(cy, min_cy)
 
@@ -444,7 +447,14 @@ def talking_head_center(
     crop_w: int,
     crop_h: int,
     upper_third_bias: float = 0.30,
+    prev_center: Optional[Tuple[int, int]] = None,
 ) -> Optional[Tuple[int, int]]:
+    """
+    Compute crop center for talking-head mode.
+
+    Anti-shake addition: if prev_center is supplied, only update when the
+    face has moved more than FACE_LOCK_FRAC * orig_w in either axis.
+    """
     if not faces:
         return None
 
@@ -456,7 +466,13 @@ def talking_head_center(
     face_cx = (ux1 + ux2) // 2
     face_cy = (uy1 + uy2) // 2
 
-    # Pull crop up so face lands at upper-third
+    # Lock: ignore tiny face bbox wobbles
+    if prev_center is not None:
+        lock_px = int(FACE_LOCK_FRAC * orig_w)
+        if (abs(face_cx - prev_center[0]) < lock_px and
+                abs(face_cy - prev_center[1]) < lock_px):
+            return prev_center
+
     target_cy = face_cy + crop_h // 6
     cy = int(face_cy * (1 - upper_third_bias) + target_cy * upper_third_bias)
     cx = face_cx
@@ -465,7 +481,6 @@ def talking_head_center(
     cx = max(hw, min(cx, orig_w - hw))
     cy = max(hh, min(cy, orig_h - hh))
 
-    # Lower-third guard
     cy = _apply_lower_third_guard(cy, crop_h, face_cy)
     cy = max(hh, min(cy, orig_h - hh))
 
@@ -667,7 +682,52 @@ def _vel_to_window(speed: float) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Smoothing
+#  Spline interpolation  (replaces linear — smoother between sparse detections)
+# ─────────────────────────────────────────────────────────────────────────────
+def _spline_interp(
+    values: List[float], indices: List[int], total: int
+) -> np.ndarray:
+    """
+    Monotone cubic (PCHIP) interpolation along a sparse set of (index, value)
+    pairs.  Falls back to linear when scipy is unavailable.
+    """
+    if total <= 0:
+        return np.zeros(total)
+    if len(indices) < 2:
+        return np.full(total, values[0] if values else 0.0)
+
+    xs = np.array(indices, dtype=float)
+    ys = np.array(values,  dtype=float)
+
+    try:
+        from scipy.interpolate import PchipInterpolator  # type: ignore
+        interp = PchipInterpolator(xs, ys, extrapolate=False)
+        out = interp(np.arange(total, dtype=float))
+        # Fill NaN at extrapolated edges
+        out = np.where(np.isnan(out), np.interp(np.arange(total), xs, ys), out)
+    except ImportError:
+        out = np.interp(np.arange(total, dtype=float), xs, ys)
+
+    return out
+
+
+def interpolate_centers(
+    centers: List[Tuple[int, int]],
+    indices: List[int],
+    total: int,
+) -> List[Tuple[int, int]]:
+    """Spline-interpolate crop centers across all frames."""
+    if total <= 0: return []
+    if not centers: return [(0, 0)] * total
+
+    xs_interp = _spline_interp([c[0] for c in centers], indices, total)
+    ys_interp = _spline_interp([c[1] for c in centers], indices, total)
+
+    return [(int(round(x)), int(round(y))) for x, y in zip(xs_interp, ys_interp)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Smoothing  (with cross-fade at scene boundaries)
 # ─────────────────────────────────────────────────────────────────────────────
 def _gauss_seg(xs: np.ndarray, ys: np.ndarray,
                window: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -694,6 +754,14 @@ def smooth_centers(
     adaptive: bool = True,
     scene_cuts: Optional[List[int]] = None,
 ) -> List[Tuple[int, int]]:
+    """
+    Gaussian-smooth crop centers, respecting scene boundaries.
+
+    Anti-shake improvement: instead of hard-resetting at each scene cut, we
+    cross-fade between the tail of the previous segment and the head of the
+    next over SCENE_BLEND_FRAMES frames. This removes the position snap that
+    previously occurred at every cut boundary.
+    """
     if not centers or len(centers) < 3:
         return list(centers) if centers else []
     n   = len(centers)
@@ -702,48 +770,90 @@ def smooth_centers(
     spd = np.array(speeds[:n], dtype=float)
     if len(spd) < n:
         spd = np.pad(spd, (0, n - len(spd)), mode="edge")
+
     cuts   = set(scene_cuts or [])
     bounds = [0] + sorted(cuts) + [n]
     rx, ry = xs.copy(), ys.copy()
+
+    # First pass: smooth each segment independently
+    seg_results: List[Tuple[int, int, np.ndarray, np.ndarray]] = []
     for i in range(len(bounds) - 1):
         s, e = bounds[i], bounds[i + 1]
         if e - s < 3:
+            seg_results.append((s, e, xs[s:e].copy(), ys[s:e].copy()))
             continue
         w = _vel_to_window(float(np.median(spd[s:e]))) if adaptive else base_window
         xs_s, ys_s = _gauss_seg(xs[s:e], ys[s:e], w)
+        seg_results.append((s, e, xs_s, ys_s))
         rx[s:e] = xs_s
         ry[s:e] = ys_s
+
+    # Second pass: cross-fade at each scene cut to eliminate position snaps
+    blend = SCENE_BLEND_FRAMES
+    for cut in sorted(cuts):
+        if cut < blend or cut + blend >= n:
+            continue
+        pre_start  = cut - blend
+        post_end   = cut + blend
+        # Values just before and just after the cut (already smoothed)
+        pre_x, pre_y   = rx[cut - 1], ry[cut - 1]
+        post_x, post_y = rx[cut],     ry[cut]
+        for fi in range(pre_start, post_end):
+            t = (fi - pre_start) / (2 * blend)          # 0 → 1 across blend window
+            t = t * t * (3 - 2 * t)                     # smoothstep
+            rx[fi] = pre_x * (1 - t) + post_x * t
+            ry[fi] = pre_y * (1 - t) + post_y * t
+
     return [(int(x), int(y)) for x, y in zip(rx, ry)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Interpolation
+#  Anti-shake: deadband + velocity cap applied to the final center path
 # ─────────────────────────────────────────────────────────────────────────────
-def interpolate_centers(
+def _apply_antishake(
     centers: List[Tuple[int, int]],
-    indices: List[int],
-    total: int,
+    crop_w: int,
+    crop_h: int,
 ) -> List[Tuple[int, int]]:
-    if total <= 0: return []
-    if not centers: return [(0, 0)] * total
-    n      = len(indices)
-    result: List[Tuple[int, int]] = []
-    for fi in range(total):
-        if fi <= indices[0]:
-            result.append(centers[0]); continue
-        if fi >= indices[-1]:
-            result.append(centers[-1]); continue
-        r = bisect.bisect_right(indices, fi)
-        l = r - 1
-        if r >= n:
-            result.append(centers[-1]); continue
-        span = max(indices[r] - indices[l], 1)
-        t    = (fi - indices[l]) / span
-        result.append((int(centers[l][0] + t * (centers[r][0] - centers[l][0])),
-                       int(centers[l][1] + t * (centers[r][1] - centers[l][1]))))
-    while len(result) < total:
-        result.append(result[-1] if result else (0, 0))
-    return result[:total]
+    """
+    Two-pass stabilisation applied after smoothing:
+
+    1. Deadband  — if consecutive frames differ by less than DEADBAND_FRAC of
+                   the crop dimension, hold the previous position.  This kills
+                   the residual sub-pixel YOLO jitter that survives Gaussian
+                   smoothing.
+
+    2. Velocity cap — clamp per-frame displacement to MAX_PIXELS_PER_FRAME.
+                      Prevents single-frame outlier detections from causing a
+                      visible jump even after smoothing.
+    """
+    if not centers:
+        return centers
+
+    db_x = max(1, int(DEADBAND_FRAC * crop_w))
+    db_y = max(1, int(DEADBAND_FRAC * crop_h))
+    cap  = MAX_PIXELS_PER_FRAME
+
+    out: List[Tuple[int, int]] = [centers[0]]
+    for cx, cy in centers[1:]:
+        px, py = out[-1]
+        dx, dy = cx - px, cy - py
+
+        # Deadband: hold still if movement is tiny
+        if abs(dx) < db_x and abs(dy) < db_y:
+            out.append((px, py))
+            continue
+
+        # Velocity cap: limit how fast the crop can pan
+        dist = np.sqrt(dx * dx + dy * dy)
+        if dist > cap:
+            scale = cap / dist
+            dx = int(dx * scale)
+            dy = int(dy * scale)
+
+        out.append((px + dx, py + dy))
+
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -864,7 +974,7 @@ def translate_srt(
             except Exception: pass
 
     if not translation_available() or not target_language:
-        return bool(not target_language)  # True if no translation needed
+        return bool(not target_language)
 
     try:
         from deep_translator import GoogleTranslator  # type: ignore
@@ -983,16 +1093,6 @@ def detect_clips(
     confidence: float = 0.45,
     progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> List[ClipSegment]:
-    """
-    Scan a long video, detect high-engagement segments with narrative arcs.
-
-    Pipeline:
-      1. Sample frames, compute per-frame saliency score
-      2. Smooth, find peaks
-      3. Expand peaks into arcs snapping to scene-cut boundaries
-      4. Merge overlaps, rank by score
-      5. Detect SOI region per clip
-    """
     def _p(v: float, msg: str = "") -> None:
         if progress_callback:
             try: progress_callback(v, msg)
@@ -1004,7 +1104,7 @@ def detect_clips(
     duration     = info["duration_seconds"]
     orig_w, orig_h = info["width"], info["height"]
 
-    sample_every = max(1, int(fps))   # 1 sample per second
+    sample_every = max(1, int(fps))
 
     _p(0.0, "🔍 Scanning for engagement peaks…")
     scores, scene_cuts_frames = _compute_frame_scores(
@@ -1018,7 +1118,6 @@ def detect_clips(
 
     _p(0.45, "📊 Computing narrative arcs…")
 
-    # Smooth
     window = max(5, int(30 / (sample_every / fps)))
     if len(scores) >= window:
         smooth_scores = np.convolve(scores, np.ones(window) / window, mode="same")
@@ -1030,7 +1129,6 @@ def detect_clips(
 
     min_gap_samples = max(1, int(min_duration_sec * fps / sample_every))
 
-    # Local peak detection
     peaks: List[int] = []
     for i in range(1, len(smooth_scores) - 1):
         wh  = min_gap_samples // 2
@@ -1048,14 +1146,12 @@ def detect_clips(
         raw_start = max(0.0, peak_sec - max_duration_sec * 0.4)
         raw_end   = min(duration, raw_start + max_duration_sec)
 
-        # Snap start to nearest preceding scene cut within 15 s
         for sc in reversed(scene_cuts_frames):
             sc_sec = sc / fps
             if 0 < peak_sec - sc_sec < 15.0:
                 raw_start = max(0.0, sc_sec - 1.0)
                 break
 
-        # Snap end to nearest following scene cut within 15 s
         for sc in scene_cuts_frames:
             sc_sec = sc / fps
             if 0 < sc_sec - peak_sec < 15.0:
@@ -1216,8 +1312,10 @@ def process_video(
 
     _p(0.01, f"📐 Output {target_w}×{target_h}")
 
+    # Sample one frame per second — denser sampling than original fps/2
+    # reduces interpolation gap length which lessens inter-anchor jitter.
     if not sample_interval:
-        sample_interval = max(1, int(fps / 2))
+        sample_interval = max(1, int(fps))
 
     render_fps = float(output_fps) if output_fps and output_fps > 0 else fps
     crop_w, crop_h = calculate_crop_dims(orig_w, orig_h, target_w, target_h)
@@ -1269,11 +1367,12 @@ def process_video(
     sal_indices: List[int]             = []
     scene_cuts:  List[int]             = []
 
-    prev_gray: Optional[np.ndarray] = None
-    prev_flow: Optional[np.ndarray] = None
-    frame_idx  = 0
-    report_n   = max(1, total_frames // 25)
-    det_end    = 0.42
+    prev_gray:    Optional[np.ndarray]  = None
+    prev_flow:    Optional[np.ndarray]  = None
+    prev_th_center: Optional[Tuple[int, int]] = None   # talking-head lock state
+    frame_idx   = 0
+    report_n    = max(1, total_frames // 25)
+    det_end     = 0.42
 
     cap = cv2.VideoCapture(input_path)
     while frame_idx < total_frames:
@@ -1283,7 +1382,8 @@ def process_video(
         curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if is_scene_change(prev_gray, curr_gray, scene_cut_threshold):
             scene_cuts.append(frame_idx)
-            prev_flow = None
+            prev_flow      = None
+            prev_th_center = None   # reset face lock on scene cut
         prev_gray = curr_gray
 
         if frame_idx % sample_interval == 0:
@@ -1293,7 +1393,11 @@ def process_video(
                 faces = detect_faces(frame, confidence_thresh=0.5)
                 if faces:
                     center = talking_head_center(
-                        faces, orig_w, orig_h, crop_w, crop_h, talking_head_bias)
+                        faces, orig_w, orig_h, crop_w, crop_h,
+                        talking_head_bias,
+                        prev_center=prev_th_center,   # pass lock state
+                    )
+                    prev_th_center = center
                 elif use_optical_flow:
                     small = cv2.resize(curr_gray, (orig_w // 2, orig_h // 2))
                     if prev_flow is not None:
@@ -1345,6 +1449,8 @@ def process_video(
 
     # ── Crop path ────────────────────────────────────────────────────────
     _p(0.43, "📈 Computing crop path…")
+
+    # Spline interpolation instead of linear → smoother arcs between anchors
     all_centers = interpolate_centers(det_centers, det_indices, total_frames)
     speeds      = _compute_speeds(all_centers)
     all_centers = smooth_centers(
@@ -1378,6 +1484,11 @@ def process_video(
         (max(hw, min(cx, orig_w - hw)), max(hh, min(cy, orig_h - hh)))
         for cx, cy in all_centers
     ]
+
+    # ── Anti-shake: deadband + velocity cap ──────────────────────────────
+    _p(0.44, "🎯 Stabilising crop path…")
+    all_centers = _apply_antishake(all_centers, crop_w, crop_h)
+
     all_centers += [all_centers[-1]] * max(0, total_frames - len(all_centers))
     all_centers  = all_centers[:total_frames]
 
@@ -1450,7 +1561,6 @@ def process_video(
             if p and os.path.exists(p):
                 try: os.unlink(p)
                 except OSError: pass
-        # srt_path is kept alive — caller reads and then deletes it
 
 
 # ─────────────────────────────────────────────────────────────────────────────
