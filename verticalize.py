@@ -338,24 +338,55 @@ def extract_thumbnail(path: str, t: float = 1.0) -> Optional[bytes]:
 #  Resolution resolver (upscale guard)
 # ─────────────────────────────────────────────────────────────────────────────
 def resolve_target_size(label: str, orig_w: int, orig_h: int) -> Tuple[int, int]:
+    """
+    Compute 9:16 output dimensions that:
+      - Never exceed the source dimensions (no upscale)
+      - Are always even (H.264 requirement)
+      - Are at least 128×128 (encoder minimum)
+      - Fit entirely within orig_w × orig_h as a 9:16 crop window
+    """
+    TARGET_RATIO = 9 / 16   # width / height for vertical video
+    MIN_DIM = 128
+
     tw, th = RESOLUTION_PRESETS.get(label, (0, 0))
+
     if tw == 0 and th == 0:
-        cw = int(orig_h * 9 / 16)
-        if cw > orig_w:
-            cw = orig_w
-            ch = int(cw * 16 / 9)
+        # "Match source" — derive the largest 9:16 rectangle that fits in orig
+        # Option A: constrain by height → cw = orig_h * 9/16
+        cw_a = int(orig_h * TARGET_RATIO)
+        ch_a = orig_h
+        # Option B: constrain by width → ch = orig_w / (9/16)
+        ch_b = int(orig_w / TARGET_RATIO)
+        cw_b = orig_w
+        # Pick whichever fits inside source dimensions
+        if cw_a <= orig_w:
+            cw, ch = cw_a, ch_a
         else:
-            ch = orig_h
-        return cw - (cw % 2), ch - (ch % 2)
-    if th > orig_h:
-        scale = orig_h / th
-        tw = int(tw * scale)
-        th = int(orig_h)
-    if tw > orig_w:
-        scale = orig_w / tw
-        tw = int(orig_w)
-        th = int(th * scale)
-    return max(tw - (tw % 2), 2), max(th - (th % 2), 2)
+            cw, ch = cw_b, min(ch_b, orig_h)
+    else:
+        # Preset requested — scale down proportionally if source is smaller
+        if th > orig_h:
+            scale = orig_h / th
+            tw = int(tw * scale)
+            th = orig_h
+        if tw > orig_w:
+            scale = orig_w / tw
+            tw = orig_w
+            th = int(th * scale)
+        cw, ch = tw, th
+
+    # Enforce even dimensions
+    cw = max(cw - (cw % 2), MIN_DIM)
+    ch = max(ch - (ch % 2), MIN_DIM)
+
+    # Final sanity: the crop window must actually fit inside source
+    # If cw > orig_w or ch > orig_h, scale down preserving 9:16
+    if cw > orig_w or ch > orig_h:
+        scale = min(orig_w / cw, orig_h / ch)
+        cw = max(int(cw * scale) & ~1, MIN_DIM)
+        ch = max(int(ch * scale) & ~1, MIN_DIM)
+
+    return cw, ch
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1709,16 +1740,29 @@ def process_clips_batch(
             results.append(meta)
 
         except Exception as exc:
+            err_msg = str(exc)
+            print(f"❌ Clip {i+1} failed: {err_msg}", file=sys.stderr)
             results.append({
                 "clip": clip,
                 "output_path": out_path,
-                "error": str(exc),
+                "error": err_msg,
             })
         finally:
             if trimmed_path and os.path.exists(trimmed_path):
                 try: os.unlink(trimmed_path)
                 except OSError: pass
 
-    n_ok = sum(1 for r in results if not r.get("error"))
-    _p(1.0, f"✅ Batch complete — {n_ok}/{len(results)} clips done")
+    n_ok  = sum(1 for r in results if not r.get("error"))
+    n_err = len(results) - n_ok
+
+    if n_ok == 0 and results:
+        first_err = next((r["error"] for r in results if r.get("error")), "unknown error")
+        raise ProcessingError(
+            f"All {n_err} clip(s) failed. First error: {first_err}"
+        )
+
+    if n_err:
+        _p(1.0, f"⚠️ Batch done — {n_ok} ok, {n_err} failed")
+    else:
+        _p(1.0, f"✅ Batch complete — {n_ok}/{len(results)} clips done")
     return results
