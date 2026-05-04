@@ -42,10 +42,8 @@ MAX_FILE_SIZE_MB  = 2000
 MIN_FRAME_DIM     = 240
 MAX_FRAMES_GUARD  = 1_080_000
 
-# Subjects must appear above this fraction of vertical crop height
-LOWER_THIRD_GUARD = 0.80   # bottom 20% is reserved for platform UI
+LOWER_THIRD_GUARD = 0.80
 
-# FIX: More conservative velocity table — wider smoothing windows to prevent jumps
 VELOCITY_SMOOTH_TABLE: List[Tuple[float, int]] = [
     (0.0,   51), (3.0,   45), (8.0,   37),
     (15.0,  27), (30.0,  19), (60.0,  13), (120.0,  7),
@@ -171,7 +169,6 @@ def _has_audio(path: str) -> bool:
 
 
 def _get_video_duration_ffprobe(path: str) -> Optional[float]:
-    """Get precise duration via ffprobe."""
     cmd = [
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1", path
@@ -192,7 +189,6 @@ def _extract_audio_wav(video_path: str, wav_path: str) -> bool:
 
 def _trim_video(input_path: str, output_path: str,
                 start_sec: float, end_sec: float) -> bool:
-    """Fast stream-copy trim with re-encode to fix keyframe alignment."""
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(start_sec),
@@ -209,7 +205,7 @@ def _trim_video(input_path: str, output_path: str,
 
 
 def _ffmpeg_encode_pipe(
-    frame_iter,            # callable: yields np.ndarray BGR frames
+    frame_iter,
     frame_w: int,
     frame_h: int,
     n_frames: int,
@@ -246,7 +242,6 @@ def _ffmpeg_encode_pipe(
         )
         vf_chain.append(f"subtitles='{srt_esc}':force_style='{force_style}'")
 
-    # Input 0 = rawvideo pipe  |  Input 1 (optional) = audio from source
     cmd = [
         "ffmpeg", "-y",
         "-f", "rawvideo",
@@ -254,7 +249,7 @@ def _ffmpeg_encode_pipe(
         "-s", f"{frame_w}x{frame_h}",
         "-pix_fmt", "bgr24",
         "-r", str(fps),
-        "-i", "pipe:0",           # video from stdin
+        "-i", "pipe:0",
     ]
     if audio_source:
         cmd += ["-i", audio_source]
@@ -290,7 +285,7 @@ def _ffmpeg_encode_pipe(
             proc.stdin.write(frame.tobytes())
         proc.stdin.close()
     except BrokenPipeError:
-        pass  # FFmpeg closed stdin early — catch stderr for real error
+        pass
 
     stdout, stderr = proc.communicate()
     if proc.returncode != 0:
@@ -312,10 +307,8 @@ def get_video_info(path: str) -> Dict[str, Any]:
     h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
 
-    # FIX: Use ffprobe for precise duration (OpenCV frame count is often wrong)
     ffprobe_dur = _get_video_duration_ffprobe(path)
     duration = ffprobe_dur if ffprobe_dur and ffprobe_dur > 0 else (nf / fps if fps > 0 else 0.0)
-    # Recompute total_frames from precise duration
     total_frames = min(int(duration * fps), MAX_FRAMES_GUARD)
 
     return {
@@ -460,14 +453,8 @@ def detect_faces(frame: np.ndarray,
 # ─────────────────────────────────────────────────────────────────────────────
 def _apply_lower_third_guard(cy: int, crop_h: int, subject_cy_src: int,
                               orig_h: int) -> int:
-    """
-    Ensure the subject does not appear in the bottom (1-LOWER_THIRD_GUARD)
-    fraction of the crop frame.
-    """
     hh = crop_h // 2
-    # Maximum allowed cy so subject stays above the guard line
     max_cy = subject_cy_src - int((1.0 - LOWER_THIRD_GUARD) * crop_h) + hh
-    # Clamp within valid range
     max_cy = min(max_cy, orig_h - hh)
     return min(cy, max_cy)
 
@@ -507,7 +494,6 @@ def talking_head_center(
     face_cx = (ux1 + ux2) // 2
     face_cy = (uy1 + uy2) // 2
 
-    # Pull crop up so face lands at upper-third
     target_cy = face_cy + crop_h // 6
     cy = int(face_cy * (1 - upper_third_bias) + target_cy * upper_third_bias)
     cx = face_cx
@@ -516,7 +502,6 @@ def talking_head_center(
     cx = max(hw, min(cx, orig_w - hw))
     cy = max(hh, min(cy, orig_h - hh))
 
-    # Lower-third guard (FIX: pass orig_h, apply once only)
     cy = _apply_lower_third_guard(cy, crop_h, face_cy, orig_h)
     cy = max(hh, min(cy, orig_h - hh))
 
@@ -585,7 +570,6 @@ def frame_for_union(
     hw, hh = crop_w // 2, crop_h // 2
     cx = max(hw, min(ucx, orig_w - hw))
     cy = max(hh, min(ucy, orig_h - hh))
-    # FIX: apply guard ONCE here, not again in the main loop
     cy = _apply_lower_third_guard(cy, crop_h, ucy, orig_h)
     cy = max(hh, min(cy, orig_h - hh))
     return cx, cy
@@ -652,18 +636,18 @@ def is_scene_change(
 def apply_framing_bias(
     cx: int, cy: int, vx: float, vy: float, speed: float,
     orig_w: int, orig_h: int, crop_w: int, crop_h: int,
-    look_room_frac: float = 0.12,  # FIX: reduced from 0.18 to avoid over-panning
-    rot_bias: float = 0.15,        # FIX: reduced from 0.25 to avoid jitter
+    look_room_frac: float = 0.12,
+    rot_bias: float = 0.15,
 ) -> Tuple[int, int]:
     hw, hh = crop_w // 2, crop_h // 2
-    look = min(speed / 60.0, 1.0)  # FIX: raised denominator so look activates only on fast motion
+    look = min(speed / 60.0, 1.0)
     if look > 0.05:
         n  = speed + 1e-9
         lx = int(cx + (vx / n) * look_room_frac * crop_w * look)
         ly = int(cy + (vy / n) * look_room_frac * crop_h * look)
     else:
         lx, ly = cx, cy
-    still = max(0.0, 1.0 - look * 3)  # FIX: faster transition out of "still" state
+    still = max(0.0, 1.0 - look * 3)
     if still > 0.01:
         tx = min([orig_w // 3, 2 * orig_w // 3], key=lambda x: abs(x - cx))
         ty = min([orig_h // 3, 2 * orig_h // 3], key=lambda y: abs(y - cy))
@@ -720,7 +704,7 @@ def _vel_to_window(speed: float) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Smoothing — FIX: replaced reflect padding with edge padding to kill edge artifacts
+#  Smoothing
 # ─────────────────────────────────────────────────────────────────────────────
 def _gauss_seg(xs: np.ndarray, ys: np.ndarray,
                window: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -732,10 +716,9 @@ def _gauss_seg(xs: np.ndarray, ys: np.ndarray,
     if w < 3:
         return xs.copy(), ys.copy()
     h2    = w // 2
-    sigma = h2 / 2.5 + 1e-9  # FIX: tighter Gaussian — less ringing
+    sigma = h2 / 2.5 + 1e-9
     k     = np.exp(-0.5 * (np.arange(-h2, h2 + 1) / sigma) ** 2)
     k    /= k.sum()
-    # FIX: use "edge" padding instead of "reflect" — no artificial bounce at cuts
     sx = np.convolve(np.pad(xs, h2, "edge"), k, "valid")[:n]
     sy = np.convolve(np.pad(ys, h2, "edge"), k, "valid")[:n]
     return sx, sy
@@ -744,7 +727,7 @@ def _gauss_seg(xs: np.ndarray, ys: np.ndarray,
 def smooth_centers(
     centers: List[Tuple[int, int]],
     speeds: List[float],
-    base_window: int = 27,  # FIX: higher default
+    base_window: int = 27,
     adaptive: bool = True,
     scene_cuts: Optional[List[int]] = None,
 ) -> List[Tuple[int, int]]:
@@ -765,7 +748,6 @@ def smooth_centers(
         if e - s < 3:
             continue
         w = _vel_to_window(float(np.median(spd[s:e]))) if adaptive else base_window
-        # FIX: enforce a minimum window to prevent micro-jitter
         w = max(w, 13)
         xs_s, ys_s = _gauss_seg(xs[s:e], ys[s:e], w)
         rx[s:e] = xs_s
@@ -774,8 +756,7 @@ def smooth_centers(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  FIX: Improved interpolation — cubic Hermite spline instead of linear
-#       to eliminate the sharp-angle artifacts at keyframes
+#  Cubic Hermite interpolation
 # ─────────────────────────────────────────────────────────────────────────────
 def _cubic_hermite(p0: float, p1: float, m0: float, m1: float, t: float) -> float:
     t2 = t * t; t3 = t2 * t
@@ -797,7 +778,6 @@ def interpolate_centers(
     xs = [float(c[0]) for c in centers]
     ys = [float(c[1]) for c in centers]
 
-    # Compute tangents using finite differences (Catmull-Rom style)
     def _tangents(vals: List[float]) -> List[float]:
         m = [0.0] * len(vals)
         for i in range(len(vals)):
@@ -827,7 +807,6 @@ def interpolate_centers(
         span = max(indices[r] - indices[l], 1)
         t    = (fi - indices[l]) / span
 
-        # Scale tangents by span so they're in pixel-space
         nx = int(_cubic_hermite(xs[l], xs[r], mx[l]*span, mx[r]*span, t))
         ny = int(_cubic_hermite(ys[l], ys[r], my[l]*span, my[r]*span, t))
         result.append((nx, ny))
@@ -1074,9 +1053,6 @@ def detect_clips(
     confidence: float = 0.45,
     progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> List[ClipSegment]:
-    """
-    Scan a long video, detect high-engagement segments with narrative arcs.
-    """
     def _p(v: float, msg: str = "") -> None:
         if progress_callback:
             try: progress_callback(v, msg)
@@ -1224,9 +1200,7 @@ def detect_clips(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  FIX: Exponential moving average final polish pass
-#       Applied AFTER Gaussian smoothing to remove any residual micro-jitter
-#       without affecting the overall motion path.
+#  EMA polish pass
 # ─────────────────────────────────────────────────────────────────────────────
 def _ema_polish(centers: List[Tuple[int, int]], alpha: float = 0.12) -> List[Tuple[int, int]]:
     """Exponential moving average forward+backward pass (zero-phase)."""
@@ -1234,14 +1208,12 @@ def _ema_polish(centers: List[Tuple[int, int]], alpha: float = 0.12) -> List[Tup
         return centers
     n = len(centers)
 
-    # Forward pass
     fx = [float(centers[0][0])]
     fy = [float(centers[0][1])]
     for i in range(1, n):
         fx.append(alpha * centers[i][0] + (1 - alpha) * fx[-1])
         fy.append(alpha * centers[i][1] + (1 - alpha) * fy[-1])
 
-    # Backward pass over forward result
     rx = [fx[-1]]
     ry = [fy[-1]]
     for i in range(n - 2, -1, -1):
@@ -1264,7 +1236,7 @@ def process_video(
     sample_interval: Optional[int] = None,
     confidence: float = 0.45,
     use_optical_flow: bool = True,
-    smooth_window: int = 27,  # FIX: higher default
+    smooth_window: int = 27,
     adaptive_smoothing: bool = True,
     rule_of_thirds: bool = True,
     scene_cut_threshold: float = 0.35,
@@ -1325,7 +1297,6 @@ def process_video(
 
     _p(0.01, f"📐 Output {target_w}×{target_h}")
 
-    # FIX: Sample every 3rd frame for denser anchors → smoother interpolation
     if not sample_interval:
         sample_interval = max(1, int(fps / 3))
 
@@ -1385,10 +1356,9 @@ def process_video(
     report_n   = max(1, total_frames // 25)
     det_end    = 0.42
 
-    # FIX: Track last valid detection for temporal continuity
     last_det_center: Optional[Tuple[int, int]] = None
     det_dropout_count = 0
-    MAX_DROPOUT = int(fps * 1.5)   # Max 1.5s of no detection before saliency fallback
+    MAX_DROPOUT = int(fps * 1.5)
 
     cap = cv2.VideoCapture(input_path)
     while frame_idx < total_frames:
@@ -1399,7 +1369,7 @@ def process_video(
         if is_scene_change(prev_gray, curr_gray, scene_cut_threshold):
             scene_cuts.append(frame_idx)
             prev_flow = None
-            det_dropout_count = 0  # Reset dropout counter at scene cuts
+            det_dropout_count = 0
         prev_gray = curr_gray
 
         if frame_idx % sample_interval == 0:
@@ -1440,7 +1410,6 @@ def process_video(
                 det_centers.append(center)
                 det_indices.append(frame_idx)
             else:
-                # FIX: prefer last detection over saliency when dropout is short
                 if last_det_center is not None and det_dropout_count < MAX_DROPOUT:
                     det_centers.append(last_det_center)
                     det_indices.append(frame_idx)
@@ -1456,12 +1425,11 @@ def process_video(
     cap.release()
     _p(det_end, f"📍 {len(det_centers)} anchors · {len(scene_cuts)} cuts")
 
-    # Merge saliency into detection gaps (only for real gaps, not short dropouts)
     if not det_centers:
         det_centers = sal_centers or [(orig_w // 2, orig_h // 2)]
         det_indices = sal_indices  or [0]
     else:
-        gap = sample_interval * 6  # FIX: wider gap threshold
+        gap = sample_interval * 6
         for si, sc_center in zip(sal_indices, sal_centers):
             if not det_indices or min(abs(si - di) for di in det_indices) > gap:
                 det_indices.append(si)
@@ -1473,11 +1441,9 @@ def process_video(
     # ── Crop path ────────────────────────────────────────────────────────
     _p(0.43, "📈 Computing crop path…")
 
-    # FIX: Cubic Hermite interpolation for smooth camera path
     all_centers = interpolate_centers(det_centers, det_indices, total_frames)
     speeds      = _compute_speeds(all_centers, smooth=11)
 
-    # FIX: Apply framing bias BEFORE Gaussian smoothing so the bias itself gets smoothed
     if rule_of_thirds and tracking_mode != "talking_head":
         vel_vecs = _compute_vel_vecs(all_centers, look=6)
         biased   = [
@@ -1491,12 +1457,11 @@ def process_video(
         framed = []
         for cx, cy in all_centers:
             tx = min([orig_w // 3, 2 * orig_w // 3], key=lambda x: abs(x - cx))
-            nx = int(cx + 0.10 * (tx - cx))  # FIX: reduced from 0.15
+            nx = int(cx + 0.10 * (tx - cx))
             nx = max(hw2, min(nx, orig_w - hw2))
             framed.append((nx, cy))
         all_centers = framed
 
-    # Gaussian smoothing pass
     speeds      = _compute_speeds(all_centers, smooth=11)
     all_centers = smooth_centers(
         all_centers, speeds,
@@ -1505,10 +1470,8 @@ def process_video(
         scene_cuts=scene_cuts,
     )
 
-    # FIX: EMA polish pass for final micro-jitter removal
     all_centers = _ema_polish(all_centers, alpha=0.08)
 
-    # Final boundary clamp
     hw, hh = crop_w // 2, crop_h // 2
     all_centers = [
         (max(hw, min(cx, orig_w - hw)), max(hh, min(cy, orig_h - hh)))
@@ -1517,26 +1480,27 @@ def process_video(
     all_centers += [all_centers[-1]] * max(0, total_frames - len(all_centers))
     all_centers  = all_centers[:total_frames]
 
-    # ── Render → temp AVI → FFmpeg → output MP4 ─────────────────────────
-    _p(0.46, "✂️ Rendering frames…")
-    temp_avi: Optional[str] = None
-    temp_mp4: Optional[str] = None
+    # ── Render pass — pipe frames directly to FFmpeg (no temp AVI) ───────
+    _p(0.46, "✂️ Rendering & encoding…")
 
-    try:
-        fd, temp_avi = tempfile.mkstemp(suffix=".avi")
-        os.close(fd)
+    style = SUBTITLE_STYLES.get(subtitle_style_name,
+                                SUBTITLE_STYLES["Bold White (TikTok)"])
 
-        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        writer = cv2.VideoWriter(temp_avi, fourcc, render_fps, (target_w, target_h))
-        if not writer.isOpened():
-            raise ProcessingError("cv2.VideoWriter failed to open.")
+    # We need to do two passes over the video: one to collect frames for the
+    # pipe. We use a generator that reads and crops on-the-fly.
+    cap_render = cv2.VideoCapture(input_path)
+    frames_written = 0
+    rpt_n = max(1, total_frames // 40)
 
-        cap   = cv2.VideoCapture(input_path)
-        rpt_n = max(1, total_frames // 40)
-        frames_written = 0
-        for fn in range(total_frames):
-            ret, frame = cap.read()
-            if not ret: break
+    # Count frames first (needed for n_frames param), then render via generator
+    def _frame_generator():
+        nonlocal frames_written
+        _cap = cv2.VideoCapture(input_path)
+        fn = 0
+        while fn < total_frames:
+            ret, frame = _cap.read()
+            if not ret:
+                break
             cx, cy = all_centers[fn]
             left   = max(0, min(cx - crop_w // 2, orig_w - crop_w))
             top    = max(0, min(cy - crop_h // 2, orig_h - crop_h))
@@ -1544,32 +1508,30 @@ def process_video(
             if crop.shape[1] != target_w or crop.shape[0] != target_h:
                 crop = cv2.resize(crop, (target_w, target_h),
                                   interpolation=cv2.INTER_LANCZOS4)
-            writer.write(crop)
+            yield crop
             frames_written += 1
-            if (fn + 1) % rpt_n == 0:
-                _p(0.46 + 0.40 * ((fn + 1) / total_frames), f"✂️ {fn+1}/{total_frames}…")
+            fn += 1
+            if fn % rpt_n == 0:
+                _p(0.46 + 0.40 * (fn / total_frames), f"✂️ {fn}/{total_frames}…")
+        _cap.release()
 
-        cap.release()
-        writer.release()
+    cap_render.release()  # not used — generator opens its own cap
 
-        if not os.path.exists(temp_avi) or os.path.getsize(temp_avi) < 1000:
-            raise ProcessingError("Rendered AVI is empty.")
-
-        # FIX: use actual rendered duration, not source duration
-        actual_duration = frames_written / render_fps
-
-        _p(0.87, "🎵 Encoding…" + (" Burning subtitles…" if srt_path else ""))
+    temp_mp4: Optional[str] = None
+    try:
         fd, temp_mp4 = tempfile.mkstemp(suffix=".mp4")
         os.close(fd)
 
-        style = SUBTITLE_STYLES.get(subtitle_style_name,
-                                    SUBTITLE_STYLES["Bold White (TikTok)"])
-        _ffmpeg_encode(
-            temp_avi,
-            input_path if _has_audio(input_path) else None,
-            temp_mp4,
-            fps=render_fps, duration=actual_duration,
-            crf=crf, preset=encoder_preset,
+        _ffmpeg_encode_pipe(
+            frame_iter=_frame_generator,
+            frame_w=target_w,
+            frame_h=target_h,
+            n_frames=total_frames,
+            audio_source=input_path if _has_audio(input_path) else None,
+            output_path=temp_mp4,
+            fps=render_fps,
+            crf=crf,
+            preset=encoder_preset,
             audio_bitrate=audio_bitrate,
             subtitle_path=srt_path,
             subtitle_style=style,
@@ -1587,9 +1549,13 @@ def process_video(
         return result_meta
 
     finally:
-        for p in (temp_avi, temp_mp4):
-            if p and os.path.exists(p):
-                try: os.unlink(p)
+        if temp_mp4 and os.path.exists(temp_mp4):
+            try: os.unlink(temp_mp4)
+            except OSError: pass
+        # Clean up SRT if it was temporary
+        if srt_path and not result_meta.get("subtitle_path"):
+            if os.path.exists(srt_path):
+                try: os.unlink(srt_path)
                 except OSError: pass
 
 
@@ -1604,9 +1570,9 @@ def process_clips_batch(
     tracking_mode: str = "subject",
     talking_head_bias: float = 0.30,
     confidence: float = 0.45,
-    smooth_window: int = 27,  # FIX: higher default
+    smooth_window: int = 27,
     adaptive_smoothing: bool = True,
-    use_optical_flow: bool = True,  # FIX: was missing — always defaulted silently
+    use_optical_flow: bool = True,
     rule_of_thirds: bool = True,
     crf: int = 23,
     encoder_preset: str = "fast",
@@ -1662,7 +1628,7 @@ def process_clips_batch(
                 confidence=confidence,
                 smooth_window=smooth_window,
                 adaptive_smoothing=adaptive_smoothing,
-                use_optical_flow=use_optical_flow,  # FIX: now passed through
+                use_optical_flow=use_optical_flow,
                 rule_of_thirds=rule_of_thirds,
                 crf=crf,
                 encoder_preset=encoder_preset,
