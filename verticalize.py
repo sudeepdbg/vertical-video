@@ -1225,6 +1225,68 @@ def _ema_polish(centers: List[Tuple[int, int]], alpha: float = 0.12) -> List[Tup
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Codec compatibility guard — auto-transcode AV1/HEVC/etc. to H.264
+# ─────────────────────────────────────────────────────────────────────────────
+def _get_video_codec(path: str) -> str:
+    """Return the video codec name via ffprobe (lowercase)."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        return r.stdout.strip().lower()
+    except Exception:
+        return ""
+
+
+_OPENCV_UNSUPPORTED = {"av1", "libaom-av1", "hevc", "vp9", "vp8"}
+_transcode_tmp_registry: List[str] = []
+
+
+def _ensure_opencv_compat(
+    input_path: str,
+    result_meta: Dict[str, Any],
+    _p: Callable,
+) -> str:
+    """
+    If the source codec is not reliably decodable by OpenCV on this platform,
+    transcode to H.264 in a temp file and return the new path.
+    The original input_path is returned unchanged if no transcode is needed.
+    """
+    codec = _get_video_codec(input_path)
+    if codec not in _OPENCV_UNSUPPORTED:
+        return input_path
+
+    _p(0.005, f"\u2699\ufe0f Transcoding {codec.upper()} \u2192 H.264 for OpenCV compatibility\u2026")
+    fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+    _transcode_tmp_registry.append(tmp_path)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+        "-c:a", "aac", "-b:a", "128k",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        tmp_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 1000:
+        raise ProcessingError(
+            f"Failed to transcode {codec.upper()} input to H.264:\n"
+            f"{r.stderr[-1500:]}"
+        )
+
+    _p(0.01, "\u2705 Transcode done \u2014 processing H.264 copy")
+    return tmp_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Single-video verticalization
 # ─────────────────────────────────────────────────────────────────────────────
 def process_video(
@@ -1273,6 +1335,9 @@ def process_video(
         raise ProcessingError(f"Input not found: {input_path}")
     if os.path.getsize(input_path) / 1024 ** 2 > MAX_FILE_SIZE_MB:
         raise ProcessingError(f"File exceeds {MAX_FILE_SIZE_MB} MB limit.")
+
+    # ── Auto-transcode if OpenCV cannot decode the source codec (e.g. AV1) ──
+    input_path = _ensure_opencv_compat(input_path, result_meta, _p)
 
     info = get_video_info(input_path)
     fps          = info["fps"]
