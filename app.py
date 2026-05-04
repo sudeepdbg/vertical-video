@@ -47,6 +47,10 @@ st.markdown("""
   --amb-l:    #fdf6e7;
   --r:        12px;
   --rs:       8px;
+
+  /* Player dimensions — single source of truth */
+  --player-h:   360px;
+  --player-v-w: 203px;   /* 360 * 9/16 = 202.5 → 203 */
 }
 *, *::before, *::after { box-sizing: border-box; }
 html, body, [class*="css"] {
@@ -101,8 +105,53 @@ section[data-testid="stSidebar"] { display: none !important; }
   font-family: 'DM Sans', sans-serif !important;
   font-size: 12px !important;
 }
-[data-testid="stVideo"] { border-radius: var(--r) !important; overflow: hidden !important; }
-video { border-radius: var(--r) !important; width: 100% !important; }
+
+/* ── Horizontal player — fixed height ── */
+.rf-hplayer [data-testid="stVideo"],
+.rf-hplayer video {
+  border-radius: var(--r) !important;
+  overflow: hidden !important;
+  max-height: var(--player-h) !important;
+  width: 100% !important;
+  object-fit: contain !important;
+  background: #000 !important;
+  display: block !important;
+}
+
+/* ── Vertical 9:16 player — same height as horizontal ── */
+.rf-vplayer {
+  display: flex !important;
+  justify-content: flex-start !important;
+  align-items: flex-start !important;
+  height: var(--player-h) !important;
+  margin: 6px 0 !important;
+}
+.rf-vplayer [data-testid="stVideo"],
+.rf-vplayer video {
+  width:  var(--player-v-w) !important;
+  height: var(--player-h)   !important;
+  max-width:  var(--player-v-w) !important;
+  max-height: var(--player-h)   !important;
+  min-width:  var(--player-v-w) !important;
+  min-height: var(--player-h)   !important;
+  object-fit: cover !important;
+  border-radius: 10px !important;
+  overflow: hidden !important;
+  display: block !important;
+  background: #000 !important;
+}
+
+/* Single-clip vertical output */
+.rf-output-player [data-testid="stVideo"],
+.rf-output-player video {
+  max-height: var(--player-h) !important;
+  width: auto !important;
+  max-width: var(--player-v-w) !important;
+  object-fit: cover !important;
+  border-radius: var(--r) !important;
+  overflow: hidden !important;
+  display: block !important;
+}
 
 /* Metrics */
 .rf-metrics { display:grid; grid-template-columns:repeat(4,1fr);
@@ -216,20 +265,16 @@ video { border-radius: var(--r) !important; width: 100% !important; }
 [data-testid="stRadio"] [data-testid="stMarkdownContainer"] p { font-size:12px !important; }
 [data-testid="stRadio"] > div { gap:6px !important; }
 
-/* Vertical 9:16 player — height matches landscape player (~360px) so width = 360*9/16 = 202px */
-.rf-vplayer { width:202px; flex-shrink:0; }
-.rf-vplayer [data-testid="stVideo"] {
-  border-radius:10px !important;
-  overflow:hidden !important;
-  height:360px !important;
+/* Player size badge */
+.rf-badge-row {
+  display: flex; gap: 6px; align-items: center; margin-bottom: 8px;
 }
-.rf-vplayer video {
-  width:202px !important;
-  height:360px !important;
-  object-fit:cover !important;
-  border-radius:10px !important;
-  display:block !important;
+.rf-badge {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.08em;
+  text-transform: uppercase; padding: 3px 8px; border-radius: 4px;
+  border: 1px solid var(--bdr); color: var(--ink3); background: var(--surf2);
 }
+.rf-badge.v { color: var(--pur); border-color: #c8b8f0; background: var(--pur-l); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -247,7 +292,7 @@ _DEFAULTS = dict(
     detected_clips=None, selected_clip_indices=None,
     clip_results=None, scan_done=False,
     clip_out_dir=None,
-    # vertical player: index of the clip currently being previewed (-1 = none)
+    # vertical player
     playing_clip_idx=-1,
 )
 for _k, _v in _DEFAULTS.items():
@@ -376,7 +421,7 @@ if app_mode == "autoClip":
     tab_out, tab_trk, tab_sub, tab_adv, tab_clip = st.tabs(tab_list)
 else:
     tab_out, tab_trk, tab_sub, tab_adv = st.tabs(tab_list)
-    tab_clip = None  # not used in single mode
+    tab_clip = None
 
 with tab_out:
     st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
@@ -401,7 +446,7 @@ with tab_trk:
         with th1:
             talking_head_bias = st.slider("Upper-third pull", 0.0, 1.0, 0.30, 0.05)
             st.caption("0 = centered face  ·  1 = upper third")
-            smooth_window = st.slider("Smoothness", 3, 31, 21, 2)
+            smooth_window = st.slider("Smoothness", 3, 61, 35, 2)
         with th2:
             adaptive_smoothing  = st.toggle("Adaptive smoothing", value=False)
             use_optical_flow    = st.toggle("Optical flow bridge", value=True)
@@ -412,7 +457,7 @@ with tab_trk:
         t1, t2 = st.columns(2, gap="medium")
         with t1:
             adaptive_smoothing  = st.toggle("Adaptive smoothing", value=True)
-            smooth_window       = st.slider("Smoothness", 3, 31, 15, 2)
+            smooth_window       = st.slider("Smoothness", 3, 61, 27, 2)
             confidence          = st.slider("Detection confidence", 0.10, 0.95, 0.45, 0.05)
         with t2:
             use_optical_flow    = st.toggle("Optical flow fallback", value=True)
@@ -504,9 +549,9 @@ if app_mode == "autoClip" and tab_clip is not None:
             (beginning · middle · end) in your video.
             </div>""", unsafe_allow_html=True)
 
-st.markdown("</div>", unsafe_allow_html=True)  # close settings div
+st.markdown("</div>", unsafe_allow_html=True)
 
-# Settings fingerprint for change detection
+# Settings fingerprint
 current_settings = dict(
     app_mode=app_mode, tracking_mode=tracking_mode,
     resolution_label=resolution_label, fps_label=fps_label, crf=crf,
@@ -572,7 +617,11 @@ with col_src:
             f'<span style="color:var(--bdr2)">·</span>'
             f'<span>{mb_str}</span></div>',
             unsafe_allow_html=True)
+
+        # Horizontal player — wrapped in rf-hplayer for height constraint
+        st.markdown('<div class="rf-hplayer">', unsafe_allow_html=True)
         st.video(uploaded_file)
+        st.markdown('</div>', unsafe_allow_html=True)
 
         if info:
             dur = info["duration_seconds"]
@@ -611,7 +660,12 @@ with col_out:
             out_mb = len(st.session_state.output_bytes) / (1024 ** 2)
             st.markdown(f'<div class="rf-ok">✓ Done — {out_mb:.1f} MB</div>',
                         unsafe_allow_html=True)
+
+            # Vertical player — same height as source player, correct 9:16 width
+            st.markdown('<div class="rf-vplayer">', unsafe_allow_html=True)
             st.video(st.session_state.output_bytes, format="video/mp4")
+            st.markdown('</div>', unsafe_allow_html=True)
+
             st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
             stem = os.path.splitext(st.session_state.uploaded_file_name or "video")[0]
             st.download_button(
@@ -658,15 +712,11 @@ with col_out:
                 f"{len(clips)} clips found · {len(sel)} selected</div>",
                 unsafe_allow_html=True)
 
-            # Build index-based results map: clip_index -> result dict
-            # (reliable across reruns unlike id())
             clip_results_map: dict = {}
             if st.session_state.clip_results:
-                # clip_results are stored in selection order; map by start_sec key
                 for r in st.session_state.clip_results:
                     clip_obj = r.get("clip")
                     if clip_obj is not None:
-                        # Key = (start_sec, end_sec) tuple — stable across reruns
                         clip_results_map[(round(clip_obj.start_sec, 1),
                                           round(clip_obj.end_sec, 1))] = r
 
@@ -678,7 +728,6 @@ with col_out:
                 is_sel    = ci in sel
                 is_playing = (playing_idx == ci)
 
-                # Stable key lookup
                 clip_key = (round(clip.start_sec, 1), round(clip.end_sec, 1))
                 result_for_clip = clip_results_map.get(clip_key)
                 is_done = (
@@ -710,7 +759,6 @@ with col_out:
                 </div>""", unsafe_allow_html=True)
 
                 if is_done:
-                    # Buttons row: Play toggle | Download
                     btn_col, dl_col = st.columns([1, 1])
                     with btn_col:
                         play_label = "⏹ Close" if is_playing else "▶ Play 9:16"
@@ -732,24 +780,18 @@ with col_out:
                         except Exception:
                             pass
 
-                    # Vertical player — only for the active clip, same height as landscape player
+                    # Vertical player — correct 9:16 dimensions, same height as horizontal
                     if is_playing:
                         try:
                             with open(result_for_clip["output_path"], "rb") as f:
                                 clip_bytes_play = f.read()
-                            # Use columns: narrow (9:16 width) | spacer
-                            # 202px ≈ 360px * 9/16  so it matches horizontal player height
-                            vcol, _ = st.columns([202, 400])
-                            with vcol:
-                                st.markdown('<div class="rf-vplayer">',
-                                            unsafe_allow_html=True)
-                                st.video(clip_bytes_play, format="video/mp4")
-                                st.markdown('</div>', unsafe_allow_html=True)
+                            st.markdown('<div class="rf-vplayer">', unsafe_allow_html=True)
+                            st.video(clip_bytes_play, format="video/mp4")
+                            st.markdown('</div>', unsafe_allow_html=True)
                         except Exception:
                             pass
 
                 else:
-                    # Not yet converted — show include checkbox
                     cb_col, _ = st.columns([2, 1])
                     with cb_col:
                         toggled = st.checkbox(
@@ -773,7 +815,7 @@ with col_out:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Action bar (only shown when a file is uploaded)
+#  Action bar
 # ─────────────────────────────────────────────────────────────────────────────
 if uploaded_file is not None and st.session_state.input_path:
     info = st.session_state.video_info
@@ -979,6 +1021,7 @@ if uploaded_file is not None and st.session_state.input_path:
                             confidence=confidence,
                             smooth_window=smooth_window,
                             adaptive_smoothing=adaptive_smoothing,
+                            use_optical_flow=use_optical_flow,
                             rule_of_thirds=rule_of_thirds,
                             crf=crf,
                             encoder_preset=encoder_preset_label,
@@ -1027,7 +1070,6 @@ if uploaded_file is not None and st.session_state.input_path:
                         st.rerun()
 
 else:
-    # Welcome / empty state
     st.markdown("""
     <div style='padding:0 20px 44px;margin-top:16px;'>
       <div style='background:var(--surf);border:2px dashed var(--bdr);
@@ -1055,7 +1097,6 @@ else:
     </div>
     """, unsafe_allow_html=True)
 
-# Footer
 st.markdown("""
 <div class="rf-foot">
   <div class="rf-tech">
