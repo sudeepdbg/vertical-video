@@ -208,22 +208,24 @@ def _trim_video(input_path: str, output_path: str,
     return r.returncode == 0 and os.path.exists(output_path)
 
 
-def _ffmpeg_encode(
-    video_path: str,
+def _ffmpeg_encode_pipe(
+    frame_iter,            # callable: yields np.ndarray BGR frames
+    frame_w: int,
+    frame_h: int,
+    n_frames: int,
     audio_source: Optional[str],
     output_path: str,
     fps: float,
-    duration: float,
     crf: int = 23,
     preset: str = "fast",
     audio_bitrate: str = "128k",
     subtitle_path: Optional[str] = None,
     subtitle_style: Optional[Dict[str, Any]] = None,
 ) -> None:
-    cmd = ["ffmpeg", "-y", "-i", video_path]
-    if audio_source:
-        cmd += ["-i", audio_source]
-
+    """
+    Encode by piping raw BGR frames directly to FFmpeg stdin.
+    No intermediate AVI — eliminates the MJPG/pixel-format bug entirely.
+    """
     vf_chain: List[str] = []
 
     if subtitle_path and os.path.exists(subtitle_path):
@@ -244,9 +246,23 @@ def _ffmpeg_encode(
         )
         vf_chain.append(f"subtitles='{srt_esc}':force_style='{force_style}'")
 
+    # Input 0 = rawvideo pipe  |  Input 1 (optional) = audio from source
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-s", f"{frame_w}x{frame_h}",
+        "-pix_fmt", "bgr24",
+        "-r", str(fps),
+        "-i", "pipe:0",           # video from stdin
+    ]
+    if audio_source:
+        cmd += ["-i", audio_source]
+
     cmd += ["-map", "0:v:0"]
     if audio_source:
-        cmd += ["-map", "1:a:0?", "-c:a", "aac", "-b:a", audio_bitrate, "-ac", "2"]
+        cmd += ["-map", "1:a:0?", "-c:a", "aac", "-b:a", audio_bitrate, "-ac", "2",
+                "-shortest"]
     else:
         cmd += ["-an"]
 
@@ -260,15 +276,27 @@ def _ffmpeg_encode(
         "-profile:v", "baseline",
         "-level", "3.1",
         "-pix_fmt", "yuv420p",
-        "-r", str(fps),
-        # FIX: Use shortest instead of hard duration to avoid cutoff on trimmed clips
-        "-shortest",
         "-movflags", "+faststart",
         output_path,
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise ProcessingError(f"FFmpeg failed (rc={r.returncode}):\n{r.stderr[-2000:]}")
+
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        for frame in frame_iter():
+            if frame.shape[0] != frame_h or frame.shape[1] != frame_w:
+                frame = cv2.resize(frame, (frame_w, frame_h),
+                                   interpolation=cv2.INTER_LANCZOS4)
+            proc.stdin.write(frame.tobytes())
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass  # FFmpeg closed stdin early — catch stderr for real error
+
+    stdout, stderr = proc.communicate()
+    if proc.returncode != 0:
+        raise ProcessingError(
+            f"FFmpeg pipe failed (rc={proc.returncode}):\n{stderr.decode()[-2000:]}"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
