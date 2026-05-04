@@ -2,19 +2,15 @@
 verticalize.py
 ──────────────
 Convert landscape video to 9:16 vertical with AI subject tracking.
-
 Modes:
-  • Subject tracking  — YOLOv8 + optical flow
-  • Talking Head Mode — DNN/Haar face detector, upper-third framing
-  • Auto-clip detect  — scan long video, find high-engagement segments
-  • Lower-third guard — subjects kept above bottom 20% of vertical frame
-
+• Subject tracking  — YOLOv8 + optical flow
+• Talking Head Mode — DNN/Haar face detector, upper-third framing
+• Auto-clip detect  — scan long video, find high-engagement segments
+• Lower-third guard — subjects kept above bottom 20% of vertical frame
 Dependencies: opencv-python, ultralytics, numpy, ffmpeg (system)
 Optional:     openai-whisper, deep-translator
 """
-
 from __future__ import annotations
-
 import bisect
 import cv2
 import numpy as np
@@ -27,15 +23,13 @@ import shutil
 from collections import namedtuple
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
 class ProcessingError(Exception):
     pass
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Constants
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Constants
+─────────────────────────────────────────────────────────────────────────────
 PERSON_CLASS_ID   = 0
 HIGH_PRIO_CLASSES = {0, 2, 3, 5, 7, 15, 16}
 MAX_FILE_SIZE_MB  = 2000
@@ -60,58 +54,57 @@ RESOLUTION_PRESETS: Dict[str, Tuple[int, int]] = {
 
 SUBTITLE_STYLES: Dict[str, Dict[str, Any]] = {
     "Bold White (TikTok)": {
-        "fontsize": 18, "primary_color": "&H00FFFFFF",
-        "outline_color": "&H00000000", "outline": 2,
-        "bold": 1, "shadow": 0, "back_color": "&H00000000",
+        "fontsize": 18,  "primary_color":  "&H00FFFFFF",
+        "outline_color":  "&H00000000",  "outline": 2,
+        "bold": 1,  "shadow": 0,  "back_color":  "&H00000000",
         "margin_v": 80,
     },
     "Yellow (Classic)": {
-        "fontsize": 16, "primary_color": "&H0000FFFF",
-        "outline_color": "&H00000000", "outline": 2,
-        "bold": 1, "shadow": 1, "back_color": "&H00000000",
+        "fontsize": 16,  "primary_color":  "&H0000FFFF",
+        "outline_color":  "&H00000000",  "outline": 2,
+        "bold": 1,  "shadow": 1,  "back_color":  "&H00000000",
         "margin_v": 80,
     },
     "Box (Accessible)": {
-        "fontsize": 15, "primary_color": "&H00FFFFFF",
-        "outline_color": "&H00000000", "outline": 0,
-        "bold": 0, "shadow": 0, "back_color": "&H80000000",
+        "fontsize": 15,  "primary_color":  "&H00FFFFFF",
+        "outline_color":  "&H00000000",  "outline": 0,
+        "bold": 0,  "shadow": 0,  "back_color":  "&H80000000",
         "margin_v": 80,
     },
 }
 
 TRANSLATION_LANGUAGES: Dict[str, str] = {
-    "None (keep original)": "",
-    "French 🇫🇷":           "fr",
-    "German 🇩🇪":           "de",
-    "Spanish 🇪🇸":          "es",
-    "Italian 🇮🇹":          "it",
-    "Portuguese 🇵🇹":       "pt",
-    "Dutch 🇳🇱":            "nl",
-    "Polish 🇵🇱":           "pl",
-    "Russian 🇷🇺":          "ru",
-    "Japanese 🇯🇵":         "ja",
-    "Korean 🇰🇷":           "ko",
-    "Chinese (Simplified) 🇨🇳": "zh-CN",
-    "Arabic 🇸🇦":           "ar",
-    "Hindi 🇮🇳":            "hi",
-    "Turkish 🇹🇷":          "tr",
-    "Indonesian 🇮🇩":       "id",
-    "Swedish 🇸🇪":          "sv",
-    "Norwegian 🇳🇴":        "no",
-    "Danish 🇩🇰":           "da",
-    "Finnish 🇫🇮":          "fi",
-    "Greek 🇬🇷":            "el",
-    "Hebrew 🇮🇱":           "iw",
-    "Thai 🇹🇭":             "th",
-    "Vietnamese 🇻🇳":       "vi",
-    "Malay 🇲🇾":            "ms",
-    "Ukrainian 🇺🇦":        "uk",
+    "None (keep original)":  "",
+    "French 🇫🇷":            "fr",
+    "German 🇩🇪":            "de",
+    "Spanish 🇪🇸":           "es",
+    "Italian 🇮🇹":           "it",
+    "Portuguese 🇵🇹":        "pt",
+    "Dutch 🇳🇱":             "nl",
+    "Polish 🇵🇱":            "pl",
+    "Russian 🇷🇺":           "ru",
+    "Japanese 🇯🇵":          "ja",
+    "Korean 🇰🇷":            "ko",
+    "Chinese (Simplified) 🇨🇳":  "zh-CN",
+    "Arabic 🇸🇦":            "ar",
+    "Hindi 🇮🇳":             "hi",
+    "Turkish 🇹🇷":           "tr",
+    "Indonesian 🇮":        "id",
+    "Swedish 🇸🇪":           "sv",
+    "Norwegian 🇳🇴":         "no",
+    "Danish 🇩🇰":            "da",
+    "Finnish 🇫":           "fi",
+    "Greek 🇬":             "el",
+    "Hebrew 🇮🇱":            "iw",
+    "Thai 🇹🇭":              "th",
+    "Vietnamese 🇻🇳":        "vi",
+    "Malay 🇲🇾":             "ms",
+    "Ukrainian 🇺🇦":         "uk",
 }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Clip segment
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Clip segment
+─────────────────────────────────────────────────────────────────────────────
 class ClipSegment:
     """Represents a detected high-engagement segment."""
     def __init__(self, start_sec: float, end_sec: float, score: float,
@@ -128,17 +121,15 @@ class ClipSegment:
         return (f"<Clip {self.start_sec:.1f}s–{self.end_sec:.1f}s "
                 f"dur={self.duration:.1f}s score={self.score:.2f} soi={self.soi_region}>")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Optional dependency checks
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Optional dependency checks
+─────────────────────────────────────────────────────────────────────────────
 def whisper_available() -> bool:
     try:
         import whisper  # noqa: F401
         return True
     except ImportError:
         return False
-
 
 def translation_available() -> bool:
     try:
@@ -147,17 +138,15 @@ def translation_available() -> bool:
     except ImportError:
         return False
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  FFmpeg helpers
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# FFmpeg helpers
+─────────────────────────────────────────────────────────────────────────────
 def _check_ffmpeg() -> None:
     for tool in ("ffmpeg", "ffprobe"):
         try:
             subprocess.run([tool, "-version"], check=True, capture_output=True, text=True)
         except (subprocess.CalledProcessError, FileNotFoundError):
             raise ProcessingError(f"{tool} not found. Install FFmpeg and add it to PATH.")
-
 
 def _has_audio(path: str) -> bool:
     cmd = ["ffprobe", "-v", "error", "-select_streams", "a",
@@ -168,13 +157,11 @@ def _has_audio(path: str) -> bool:
     except Exception:
         return False
 
-
 def _extract_audio_wav(video_path: str, wav_path: str) -> bool:
     cmd = ["ffmpeg", "-y", "-i", video_path,
            "-ar", "16000", "-ac", "1", "-f", "wav", wav_path]
     r = subprocess.run(cmd, capture_output=True, text=True)
     return r.returncode == 0 and os.path.exists(wav_path)
-
 
 def _trim_video(input_path: str, output_path: str,
                 start_sec: float, end_sec: float) -> bool:
@@ -191,7 +178,6 @@ def _trim_video(input_path: str, output_path: str,
     r = subprocess.run(cmd, capture_output=True, text=True)
     return r.returncode == 0 and os.path.exists(output_path)
 
-
 def _ffmpeg_encode(
     video_path: str,
     audio_source: Optional[str],
@@ -204,10 +190,16 @@ def _ffmpeg_encode(
     subtitle_path: Optional[str] = None,
     subtitle_style: Optional[Dict[str, Any]] = None,
 ) -> None:
-    cmd = ["ffmpeg", "-y", "-i", video_path]
+    # Add input flags for better compatibility
+    cmd = ["ffmpeg", "-y",
+           "-fflags", "+genpts",  # Generate presentation timestamps
+           "-probesize", "50M",    # Increase probe size
+           "-analyzeduration", "10M",  # Increase analyze duration
+           "-i", video_path]
+    
     if audio_source:
         cmd += ["-i", audio_source]
-
+    
     vf_chain: List[str] = []
 
     if subtitle_path and os.path.exists(subtitle_path):
@@ -235,7 +227,7 @@ def _ffmpeg_encode(
         cmd += ["-an"]
 
     if vf_chain:
-        cmd += ["-vf", ",".join(vf_chain)]
+        cmd += ["-vf", ", ".join(vf_chain)]
 
     cmd += [
         "-c:v", "libx264",
@@ -247,16 +239,17 @@ def _ffmpeg_encode(
         "-r", str(fps),
         "-t", str(duration),
         "-movflags", "+faststart",
+        "-vsync", "2",  # Variable frame rate with timestamps
         output_path,
     ]
+    
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise ProcessingError(f"FFmpeg failed (rc={r.returncode}):\n{r.stderr[-2000:]}")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Video metadata
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Video metadata
+─────────────────────────────────────────────────────────────────────────────
 def get_video_info(path: str) -> Dict[str, Any]:
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
@@ -269,11 +262,10 @@ def get_video_info(path: str) -> Dict[str, Any]:
     return {
         "fps": fps,
         "total_frames": min(nf, MAX_FRAMES_GUARD),
-        "width": w, "height": h,
+        "width": w,  "height": h,
         "duration_seconds": nf / fps if fps > 0 else 0.0,
         "is_landscape": w > h,
     }
-
 
 def extract_thumbnail(path: str, t: float = 1.0) -> Optional[bytes]:
     cap = cv2.VideoCapture(path)
@@ -288,10 +280,9 @@ def extract_thumbnail(path: str, t: float = 1.0) -> Optional[bytes]:
     ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return buf.tobytes() if ok else None
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Resolution resolver (upscale guard)
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Resolution resolver (upscale guard)
+─────────────────────────────────────────────────────────────────────────────
 def resolve_target_size(label: str, orig_w: int, orig_h: int) -> Tuple[int, int]:
     tw, th = RESOLUTION_PRESETS.get(label, (0, 0))
     if tw == 0 and th == 0:
@@ -312,12 +303,10 @@ def resolve_target_size(label: str, orig_w: int, orig_h: int) -> Tuple[int, int]
         th = int(th * scale)
     return max(tw - (tw % 2), 2), max(th - (th % 2), 2)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  YOLO model cache
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# YOLO model cache
+─────────────────────────────────────────────────────────────────────────────
 _model_cache: Dict[str, Any] = {}   # str -> YOLO, no cv2 type at module level
-
 
 def _get_model(weights: str = "yolov8n.pt") -> Any:
     if weights not in _model_cache:
@@ -327,18 +316,15 @@ def _get_model(weights: str = "yolov8n.pt") -> Any:
             raise ProcessingError(f"Failed to load '{weights}': {e}")
     return _model_cache[weights]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Face detection  (DNN → Haar fallback)
-#  NOTE: module-level variables use plain 'None' — no cv2 type annotations
-#        here to avoid AttributeError when cv2 is not fully loaded yet.
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Face detection (DNN → Haar fallback)
+# NOTE: module-level variables use plain 'None' — no cv2 type annotations
+# here to avoid AttributeError when cv2 is not fully loaded yet.
+─────────────────────────────────────────────────────────────────────────────
 _face_net = None          # cv2.dnn.Net instance once loaded
 _haar_cascade = None      # cv2.CascadeClassifier instance once loaded
-
 _FACE_PROTO = "deploy.prototxt"
 _FACE_MODEL = "res10_300x300_ssd_iter_140000.caffemodel"
-
 
 def _load_face_net() -> Optional[Any]:
     global _face_net
@@ -352,7 +338,6 @@ def _load_face_net() -> Optional[Any]:
             pass
     return None
 
-
 def _get_haar() -> Optional[Any]:
     global _haar_cascade
     if _haar_cascade is not None:
@@ -364,7 +349,6 @@ def _get_haar() -> Optional[Any]:
             _haar_cascade = casc
             return _haar_cascade
     return None
-
 
 def detect_faces(frame: np.ndarray,
                  confidence_thresh: float = 0.6) -> List[Tuple[int, int, int, int]]:
@@ -390,7 +374,7 @@ def detect_faces(frame: np.ndarray,
                 faces.append((x1, y1, x2, y2))
         faces.sort(key=lambda f: (f[2] - f[0]) * (f[3] - f[1]), reverse=True)
         return faces
-
+    
     haar = _get_haar()
     if haar is None:
         return []
@@ -404,15 +388,13 @@ def detect_faces(frame: np.ndarray,
     faces2.sort(key=lambda f: (f[2] - f[0]) * (f[3] - f[1]), reverse=True)
     return faces2
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Lower-third guard
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Lower-third guard
+─────────────────────────────────────────────────────────────────────────────
 def _apply_lower_third_guard(cy: int, crop_h: int, subject_cy_src: int) -> int:
     """
     Ensure the subject does not appear in the bottom (1-LOWER_THIRD_GUARD)
     fraction of the crop frame.
-
     Formula: subject_y_in_crop = subject_cy_src - (cy - crop_h//2)
     We require: subject_y_in_crop <= LOWER_THIRD_GUARD * crop_h
     => cy >= subject_cy_src - LOWER_THIRD_GUARD * crop_h + crop_h//2
@@ -420,10 +402,9 @@ def _apply_lower_third_guard(cy: int, crop_h: int, subject_cy_src: int) -> int:
     min_cy = subject_cy_src - int(LOWER_THIRD_GUARD * crop_h) + crop_h // 2
     return max(cy, min_cy)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  SOI region label
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# SOI region label
+─────────────────────────────────────────────────────────────────────────────
 def _soi_region_label(cx: int, cy: int, w: int, h: int) -> str:
     col = "left" if cx < w // 3 else ("right" if cx > 2 * w // 3 else "center")
     row = "upper" if cy < h // 3 else ("lower" if cy > 2 * h // 3 else "mid")
@@ -433,10 +414,9 @@ def _soi_region_label(cx: int, cy: int, w: int, h: int) -> str:
         return col
     return f"{row}-{col}"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Talking-head crop center
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Talking-head crop center
+─────────────────────────────────────────────────────────────────────────────
 def talking_head_center(
     faces: List[Tuple[int, int, int, int]],
     orig_w: int,
@@ -447,7 +427,6 @@ def talking_head_center(
 ) -> Optional[Tuple[int, int]]:
     if not faces:
         return None
-
     ux1 = min(f[0] for f in faces)
     uy1 = min(f[1] for f in faces)
     ux2 = max(f[2] for f in faces)
@@ -471,13 +450,11 @@ def talking_head_center(
 
     return cx, cy
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Subject detection (YOLO)
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Subject detection (YOLO)
+─────────────────────────────────────────────────────────────────────────────
 DetectionResult = namedtuple("DetectionResult",
-    ["cx", "cy", "ux1", "uy1", "ux2", "uy2", "count"])
-
+                             ["cx", "cy", "ux1", "uy1", "ux2", "uy2", "count"])
 
 def detect_subjects(
     frame: np.ndarray,
@@ -491,7 +468,7 @@ def detect_subjects(
         return None
     if results.boxes is None or len(results.boxes) == 0:
         return None
-
+    
     person_pool: List[Tuple[float, int, int, int, int]] = []
     hiprio_pool: List[Tuple[float, int, int, int, int]] = []
     all_pool:    List[Tuple[float, int, int, int, int]] = []
@@ -523,7 +500,6 @@ def detect_subjects(
         len(pool),
     )
 
-
 def frame_for_union(
     ux1: int, uy1: int, ux2: int, uy2: int,
     orig_w: int, orig_h: int,
@@ -538,10 +514,9 @@ def frame_for_union(
     cy = max(hh, min(cy, orig_h - hh))
     return cx, cy
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Optical flow / saliency
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Optical flow / saliency
+─────────────────────────────────────────────────────────────────────────────
 def optical_flow_center(
     prev: np.ndarray, curr: np.ndarray, w: int, h: int
 ) -> Optional[Tuple[int, int]]:
@@ -563,7 +538,6 @@ def optical_flow_center(
     except Exception:
         return None
 
-
 def saliency_center(frame: np.ndarray) -> Tuple[int, int]:
     h, w = frame.shape[:2]
     if w < MIN_FRAME_DIM or h < MIN_FRAME_DIM:
@@ -582,7 +556,6 @@ def saliency_center(frame: np.ndarray) -> Tuple[int, int]:
     ys, xs = np.mgrid[0:h, 0:w]
     return int((xs * sal).sum() / t), int((ys * sal).sum() / t)
 
-
 def is_scene_change(
     prev: Optional[np.ndarray], curr: np.ndarray, threshold: float = 0.35
 ) -> bool:
@@ -593,10 +566,9 @@ def is_scene_change(
     except Exception:
         return False
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Framing bias (look-room + rule-of-thirds)
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Framing bias (look-room + rule-of-thirds)
+─────────────────────────────────────────────────────────────────────────────
 def apply_framing_bias(
     cx: int, cy: int, vx: float, vy: float, speed: float,
     orig_w: int, orig_h: int, crop_w: int, crop_h: int,
@@ -622,10 +594,9 @@ def apply_framing_bias(
     ny = int(ly * look + ry * (1.0 - look))
     return max(hw, min(nx, orig_w - hw)), max(hh, min(ny, orig_h - hh))
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Velocity helpers
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Velocity helpers
+─────────────────────────────────────────────────────────────────────────────
 def _compute_speeds(centers: List[Tuple[int, int]], smooth: int = 5) -> List[float]:
     n = len(centers)
     if n < 2:
@@ -636,7 +607,6 @@ def _compute_speeds(centers: List[Tuple[int, int]], smooth: int = 5) -> List[flo
         for i in range(1, n)]
     w = min(smooth, n)
     return np.convolve(raw, np.ones(w) / w, mode="same").tolist()
-
 
 def _compute_vel_vecs(centers: List[Tuple[int, int]], look: int = 4) -> List[Tuple[float, float]]:
     n = len(centers)
@@ -652,7 +622,6 @@ def _compute_vel_vecs(centers: List[Tuple[int, int]], look: int = 4) -> List[Tup
             out.append((0.0, 0.0))
     return out
 
-
 def _vel_to_window(speed: float) -> int:
     t = VELOCITY_SMOOTH_TABLE
     if speed <= t[0][0]:  return t[0][1]
@@ -665,12 +634,11 @@ def _vel_to_window(speed: float) -> int:
             return w if w % 2 == 1 else w + 1
     return 15
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Smoothing
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Smoothing
+─────────────────────────────────────────────────────────────────────────────
 def _gauss_seg(xs: np.ndarray, ys: np.ndarray,
-               window: int) -> Tuple[np.ndarray, np.ndarray]:
+              window: int) -> Tuple[np.ndarray, np.ndarray]:
     n = len(xs)
     if n < 3:
         return xs.copy(), ys.copy()
@@ -685,7 +653,6 @@ def _gauss_seg(xs: np.ndarray, ys: np.ndarray,
     sx = np.convolve(np.pad(xs, h2, "reflect"), k, "valid")[:n]
     sy = np.convolve(np.pad(ys, h2, "reflect"), k, "valid")[:n]
     return sx, sy
-
 
 def smooth_centers(
     centers: List[Tuple[int, int]],
@@ -715,10 +682,9 @@ def smooth_centers(
         ry[s:e] = ys_s
     return [(int(x), int(y)) for x, y in zip(rx, ry)]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Interpolation
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Interpolation
+─────────────────────────────────────────────────────────────────────────────
 def interpolate_centers(
     centers: List[Tuple[int, int]],
     indices: List[int],
@@ -745,10 +711,9 @@ def interpolate_centers(
         result.append(result[-1] if result else (0, 0))
     return result[:total]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Crop geometry
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Crop geometry
+─────────────────────────────────────────────────────────────────────────────
 def calculate_crop_dims(orig_w: int, orig_h: int, tw: int, th: int) -> Tuple[int, int]:
     ratio = tw / th
     if (orig_w / orig_h) > ratio:
@@ -757,17 +722,15 @@ def calculate_crop_dims(orig_w: int, orig_h: int, tw: int, th: int) -> Tuple[int
         cw = orig_w; ch = int(round(cw / ratio))
     return min(cw, orig_w), min(ch, orig_h)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Whisper → SRT
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Whisper → SRT
+─────────────────────────────────────────────────────────────────────────────
 def _seconds_to_srt_time(s: float) -> str:
     h  = int(s // 3600)
     m  = int((s % 3600) // 60)
     sc = int(s % 60)
     ms = int((s - int(s)) * 1000)
     return f"{h:02d}:{m:02d}:{sc:02d},{ms:03d}"
-
 
 def transcribe_to_srt(
     video_path: str,
@@ -810,7 +773,7 @@ def transcribe_to_srt(
         for seg in result.get("segments", []):
             for w in seg.get("words", []):
                 words.append({
-                    "word":  w["word"].strip(),
+                    "word": w["word"].strip(),
                     "start": w["start"],
                     "end":   w["end"],
                 })
@@ -851,7 +814,6 @@ def transcribe_to_srt(
             try: os.unlink(wav_path)
             except OSError: pass
 
-
 def translate_srt(
     srt_path: str,
     target_language: str,
@@ -867,7 +829,7 @@ def translate_srt(
         return bool(not target_language)  # True if no translation needed
 
     try:
-        from deep_translator import GoogleTranslator  # type: ignore
+        from deep_translator import GoogleTranslator   # type: ignore
     except ImportError:
         return False
 
@@ -904,16 +866,14 @@ def translate_srt(
         print(f"Translation failed: {e}", file=sys.stderr)
         return False
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Frame saliency score (for clip detection)
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Frame saliency score (for clip detection)
+─────────────────────────────────────────────────────────────────────────────
 def _frame_saliency_score(
     frame: np.ndarray,
     prev_frame: Optional[np.ndarray],
 ) -> float:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
     lap_var   = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     lap_score = min(lap_var / 3000.0, 1.0)
 
@@ -926,7 +886,6 @@ def _frame_saliency_score(
     sat_score = min(float(hsv[:, :, 1].mean()) / 128.0, 1.0)
 
     return 0.4 * motion_score + 0.4 * lap_score + 0.2 * sat_score
-
 
 def _compute_frame_scores(
     input_path: str,
@@ -970,10 +929,9 @@ def _compute_frame_scores(
     cap.release()
     return np.array(scores, dtype=float), scene_cuts
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Clip detection
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Clip detection
+─────────────────────────────────────────────────────────────────────────────
 def detect_clips(
     input_path: str,
     min_duration_sec: float = 25.0,
@@ -985,7 +943,6 @@ def detect_clips(
 ) -> List[ClipSegment]:
     """
     Scan a long video, detect high-engagement segments with narrative arcs.
-
     Pipeline:
       1. Sample frames, compute per-frame saliency score
       2. Smooth, find peaks
@@ -1048,14 +1005,14 @@ def detect_clips(
         raw_start = max(0.0, peak_sec - max_duration_sec * 0.4)
         raw_end   = min(duration, raw_start + max_duration_sec)
 
-        # Snap start to nearest preceding scene cut within 15 s
+        # Snap start to nearest preceding scene cut within 15s
         for sc in reversed(scene_cuts_frames):
             sc_sec = sc / fps
             if 0 < peak_sec - sc_sec < 15.0:
                 raw_start = max(0.0, sc_sec - 1.0)
                 break
 
-        # Snap end to nearest following scene cut within 15 s
+        # Snap end to nearest following scene cut within 15s
         for sc in scene_cuts_frames:
             sc_sec = sc / fps
             if 0 < sc_sec - peak_sec < 15.0:
@@ -1074,9 +1031,9 @@ def detect_clips(
 
     clip_candidates: List[Tuple[float, float, float]] = []
     for peak_i in peaks:
-        start, end  = _arc_boundaries(peak_i)
-        peak_score  = float(smooth_scores[peak_i])
-        overlaps    = any(
+        start, end = _arc_boundaries(peak_i)
+        peak_score = float(smooth_scores[peak_i])
+        overlaps = any(
             min(end, ce) - max(start, cs) > min_duration_sec * 0.5
             for cs, ce, _ in clip_candidates
         )
@@ -1095,8 +1052,8 @@ def detect_clips(
            f"🎯 Clip {ci+1}/{len(clip_candidates)}…")
 
         soi_region = "center"
-        soi_xs:  List[int] = []
-        soi_ys:  List[int] = []
+        soi_xs: List[int] = []
+        soi_ys: List[int] = []
         n_samples = min(8, max(2, int(end_sec - start_sec)))
         sample_times = np.linspace(start_sec + 1, end_sec - 1, n_samples)
 
@@ -1130,7 +1087,7 @@ def detect_clips(
         secs_s = int(start_sec % 60)
         mins_e = int(end_sec // 60)
         secs_e = int(end_sec % 60)
-        title  = f"Clip {ci+1}  ({mins_s}:{secs_s:02d} – {mins_e}:{secs_e:02d})"
+        title  = f"Clip {ci+1} ({mins_s}:{secs_s:02d} – {mins_e}:{secs_e:02d})"
 
         segments.append(ClipSegment(
             start_sec=start_sec, end_sec=end_sec, score=score,
@@ -1142,10 +1099,9 @@ def detect_clips(
     _p(1.0, f"✅ Found {len(segments)} clips")
     return segments
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Single-video verticalization
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Single-video verticalization
+─────────────────────────────────────────────────────────────────────────────
 def process_video(
     input_path: str,
     output_path: str,
@@ -1172,8 +1128,7 @@ def process_video(
     subtitle_translate_to: Optional[str] = None,
     progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> Dict[str, Any]:
-    """Convert one landscape video to 9:16.  Returns metadata dict."""
-
+    """Convert one landscape video to 9:16. Returns metadata dict."""
     def _p(v: float, msg: str = "") -> None:
         if progress_callback:
             try: progress_callback(min(max(v, 0.0), 1.0), msg)
@@ -1332,7 +1287,7 @@ def process_video(
     # Merge saliency into detection gaps
     if not det_centers:
         det_centers = sal_centers or [(orig_w // 2, orig_h // 2)]
-        det_indices = sal_indices  or [0]
+        det_indices = sal_indices or [0]
     else:
         gap = sample_interval * 4
         for si, sc_center in zip(sal_indices, sal_centers):
@@ -1379,19 +1334,20 @@ def process_video(
         for cx, cy in all_centers
     ]
     all_centers += [all_centers[-1]] * max(0, total_frames - len(all_centers))
-    all_centers  = all_centers[:total_frames]
+    all_centers = all_centers[:total_frames]
 
-    # ── Render → temp AVI → FFmpeg → output MP4 ─────────────────────────
+    # ── Render → temp MP4 → FFmpeg → output MP4 ─────────────────────────
     _p(0.46, "✂️ Rendering frames…")
-    temp_avi: Optional[str] = None
     temp_mp4: Optional[str] = None
+    temp_final: Optional[str] = None
 
     try:
-        fd, temp_avi = tempfile.mkstemp(suffix=".avi")
+        fd, temp_mp4 = tempfile.mkstemp(suffix=".mp4")
         os.close(fd)
 
-        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        writer = cv2.VideoWriter(temp_avi, fourcc, render_fps, (target_w, target_h))
+        # Use H.264 codec for better compatibility
+        fourcc = cv2.VideoWriter_fourcc(*"avc1")
+        writer = cv2.VideoWriter(temp_mp4, fourcc, render_fps, (target_w, target_h))
         if not writer.isOpened():
             raise ProcessingError("cv2.VideoWriter failed to open.")
 
@@ -1414,19 +1370,19 @@ def process_video(
         cap.release()
         writer.release()
 
-        if not os.path.exists(temp_avi) or os.path.getsize(temp_avi) < 1000:
-            raise ProcessingError("Rendered AVI is empty.")
+        if not os.path.exists(temp_mp4) or os.path.getsize(temp_mp4) < 1000:
+            raise ProcessingError("Rendered MP4 is empty.")
 
         _p(0.87, "🎵 Encoding…" + (" Burning subtitles…" if srt_path else ""))
-        fd, temp_mp4 = tempfile.mkstemp(suffix=".mp4")
+        fd, temp_final = tempfile.mkstemp(suffix=".mp4")
         os.close(fd)
 
         style = SUBTITLE_STYLES.get(subtitle_style_name,
                                     SUBTITLE_STYLES["Bold White (TikTok)"])
         _ffmpeg_encode(
-            temp_avi,
-            input_path if _has_audio(input_path) else None,
             temp_mp4,
+            input_path if _has_audio(input_path) else None,
+            temp_final,
             fps=render_fps, duration=duration,
             crf=crf, preset=encoder_preset,
             audio_bitrate=audio_bitrate,
@@ -1434,28 +1390,27 @@ def process_video(
             subtitle_style=style,
         )
 
-        if not os.path.exists(temp_mp4) or os.path.getsize(temp_mp4) < 1000:
+        if not os.path.exists(temp_final) or os.path.getsize(temp_final) < 1000:
             raise ProcessingError("FFmpeg produced empty output.")
 
-        shutil.move(temp_mp4, output_path)
-        temp_mp4 = None
+        shutil.move(temp_final, output_path)
+        temp_final = None
 
         _p(1.0, "✅ Done!")
-        print(f"✅  {output_path}  ({os.path.getsize(output_path)/1024**2:.1f} MB)",
+        print(f"✅ {output_path} ({os.path.getsize(output_path)/1024**2:.1f} MB)",
               file=sys.stderr)
         return result_meta
 
     finally:
-        for p in (temp_avi, temp_mp4):
+        for p in (temp_mp4, temp_final):
             if p and os.path.exists(p):
                 try: os.unlink(p)
                 except OSError: pass
         # srt_path is kept alive — caller reads and then deletes it
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Batch clip pipeline
-# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# Batch clip pipeline
+─────────────────────────────────────────────────────────────────────────────
 def process_clips_batch(
     input_path: str,
     output_dir: str,
@@ -1504,7 +1459,7 @@ def process_clips_batch(
 
             if not _trim_video(input_path, trimmed_path, clip.start_sec, clip.end_sec):
                 results.append({"clip": clip, "output_path": None,
-                                 "error": "trim failed"})
+                                "error": "trim failed"})
                 continue
 
             safe_name = f"clip_{i+1:02d}_{int(clip.start_sec)}s_{int(clip.end_sec)}s"
