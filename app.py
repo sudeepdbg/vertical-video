@@ -412,9 +412,31 @@ _CLIP_PRESETS = {
     "30 sec  (short reel)":       (25, 35),
     "60 sec  (full segment)":     (50, 65),
 }
-clip_min_dur  = 25
-clip_max_dur  = 60
-clip_target_n = 8
+
+# All advanced setting defaults — widgets inside the expander override these.
+# Defining them here means they are always valid even when the expander
+# is collapsed and its widgets haven't rendered yet.
+fps_label            = "Source (keep original)"
+audio_bitrate_label  = "128k"
+crf                  = 23
+encoder_preset_label = "fast"
+yolo_weights         = "yolov8n.pt"
+smooth_window        = 15
+adaptive_smoothing   = True
+confidence           = 0.45
+use_optical_flow     = True
+rule_of_thirds       = True
+scene_cut_threshold  = 0.35
+talking_head_bias    = 0.30
+burn_subtitles       = False
+whisper_model        = "base"
+whisper_language     = None
+subtitle_style_name  = "Bold White (TikTok)"
+subtitle_max_chars   = 42
+subtitle_translate_to = None
+clip_min_dur         = 25
+clip_max_dur         = 60
+clip_target_n        = 8
 
 with st.expander("⚙  Advanced settings", expanded=False):
     if app_mode == "autoClip":
@@ -539,46 +561,6 @@ with st.expander("⚙  Advanced settings", expanded=False):
                 💡 AI detects saliency peaks + scene boundaries to find narrative arcs
                 (beginning · middle · end) in your video.
                 </div>""", unsafe_allow_html=True)
-
-# Defaults for values not shown when expander is collapsed on first render
-# (Streamlit evaluates widgets lazily so these are set inside the expander
-#  above; reference them below with fallback defaults.)
-try: fps_label
-except NameError: fps_label = "Source (keep original)"
-try: audio_bitrate_label
-except NameError: audio_bitrate_label = "128k"
-try: crf
-except NameError: crf = 23
-try: encoder_preset_label
-except NameError: encoder_preset_label = "fast"
-try: yolo_weights
-except NameError: yolo_weights = "yolov8n.pt"
-try: smooth_window
-except NameError: smooth_window = 15
-try: adaptive_smoothing
-except NameError: adaptive_smoothing = True
-try: confidence
-except NameError: confidence = 0.45
-try: use_optical_flow
-except NameError: use_optical_flow = True
-try: rule_of_thirds
-except NameError: rule_of_thirds = True
-try: scene_cut_threshold
-except NameError: scene_cut_threshold = 0.35
-try: talking_head_bias
-except NameError: talking_head_bias = 0.30
-try: burn_subtitles
-except NameError: burn_subtitles = False
-try: whisper_model
-except NameError: whisper_model = "base"
-try: whisper_language
-except NameError: whisper_language = None
-try: subtitle_style_name
-except NameError: subtitle_style_name = "Bold White (TikTok)"
-try: subtitle_max_chars
-except NameError: subtitle_max_chars = 42
-try: subtitle_translate_to
-except NameError: subtitle_translate_to = None
 
 st.markdown("</div>", unsafe_allow_html=True)  # close padding div
 
