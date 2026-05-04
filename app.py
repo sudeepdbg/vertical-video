@@ -241,21 +241,30 @@ video { border-radius: var(--r) !important; width: 100% !important; }
 [data-testid="stRadio"] [data-testid="stMarkdownContainer"] p { font-size:12px !important; }
 [data-testid="stRadio"] > div { gap:6px !important; }
 
-/* Vertical 9:16 player — fills the full output column, aspect-ratio locked */
-.rf-vplayer { width: 100%; }
+/* Vertical 9:16 player — same height as the landscape source player (~400px).
+   The 9:16 video is displayed at that height; width = 400 * 9/16 = 225px,
+   centered inside the column with the rest as neutral background. */
+.rf-vplayer {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  background: #111;
+  border-radius: var(--r);
+  overflow: hidden;
+  height: 400px;
+}
 .rf-vplayer [data-testid="stVideo"] {
-  border-radius: var(--r) !important;
+  height: 400px !important;
+  width: 225px !important;
+  border-radius: 0 !important;
   overflow: hidden !important;
-  aspect-ratio: 9/16 !important;
-  width: 100% !important;
-  height: auto !important;
+  flex-shrink: 0;
 }
 .rf-vplayer video {
-  width: 100% !important;
-  height: auto !important;
-  aspect-ratio: 9/16 !important;
+  height: 400px !important;
+  width: 225px !important;
   object-fit: cover !important;
-  border-radius: var(--r) !important;
+  border-radius: 0 !important;
   display: block !important;
 }
 </style>
