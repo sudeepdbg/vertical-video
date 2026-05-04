@@ -85,6 +85,35 @@ section[data-testid="stSidebar"] { display: none !important; }
 .rf-mode-h.pur { color:var(--pur); }
 .rf-mode-s { font-size:11px; color:var(--ink2); line-height:1.5; }
 
+/* Quick settings strip */
+.rf-quick { display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+  background:var(--surf); border:1.5px solid var(--bdr); border-radius:var(--r);
+  padding:10px 14px; margin-top:10px; }
+.rf-qlabel { font-size:10px; font-weight:700; letter-spacing:0.08em;
+  text-transform:uppercase; color:var(--ink3); white-space:nowrap; }
+
+/* Advanced expander */
+[data-testid="stExpander"] {
+  border: 1.5px solid var(--bdr) !important;
+  border-radius: var(--r) !important;
+  background: var(--surf) !important;
+  margin-top: 8px !important;
+}
+[data-testid="stExpander"] summary {
+  font-size: 12px !important;
+  font-weight: 700 !important;
+  color: var(--ink2) !important;
+  padding: 10px 14px !important;
+}
+[data-testid="stExpander"] summary:hover { color: var(--acc) !important; }
+[data-testid="stExpander"] > div > div { padding: 4px 14px 14px !important; }
+
+/* Advanced inner tabs */
+[data-baseweb="tab-list"] { background:var(--surf2) !important; border-radius:var(--rs) !important; padding:3px !important; gap:2px !important; border:none !important; }
+[data-baseweb="tab"] { background:transparent !important; border-radius:6px !important; font-family:'DM Sans',sans-serif !important; font-size:12px !important; font-weight:600 !important; color:var(--ink3) !important; padding:6px 11px !important; border:none !important; }
+[aria-selected="true"][data-baseweb="tab"] { background:var(--surf) !important; color:var(--ink) !important; }
+[data-baseweb="tab-highlight"],[data-baseweb="tab-border"] { display:none !important; }
+
 /* Upload */
 [data-testid="stFileUploader"] {
   background: var(--surf) !important;
@@ -171,10 +200,6 @@ video { border-radius: var(--r) !important; width: 100% !important; }
 [data-baseweb="popover"],[data-baseweb="menu"] { background:var(--surf) !important; border:1px solid var(--bdr) !important; border-radius:10px !important; }
 [data-baseweb="option"] { background:var(--surf) !important; color:var(--ink2) !important; font-size:13px !important; }
 [data-baseweb="option"]:hover { background:var(--acc-l) !important; color:var(--acc) !important; }
-[data-baseweb="tab-list"] { background:var(--surf2) !important; border-radius:var(--rs) !important; padding:3px !important; gap:2px !important; border:none !important; }
-[data-baseweb="tab"] { background:transparent !important; border-radius:6px !important; font-family:'DM Sans',sans-serif !important; font-size:12px !important; font-weight:600 !important; color:var(--ink3) !important; padding:6px 11px !important; border:none !important; }
-[aria-selected="true"][data-baseweb="tab"] { background:var(--surf) !important; color:var(--ink) !important; }
-[data-baseweb="tab-highlight"],[data-baseweb="tab-border"] { display:none !important; }
 .stSlider label { font-size:12px !important; color:var(--ink2) !important; font-weight:600 !important; }
 .stSlider [role="slider"] { background:var(--acc) !important; border:2px solid #fff !important; }
 .stSlider [data-testid="stSliderTrackFill"] { background:var(--acc) !important; }
@@ -216,19 +241,22 @@ video { border-radius: var(--r) !important; width: 100% !important; }
 [data-testid="stRadio"] [data-testid="stMarkdownContainer"] p { font-size:12px !important; }
 [data-testid="stRadio"] > div { gap:6px !important; }
 
-/* Vertical 9:16 player — height matches landscape player (~360px) so width = 360*9/16 = 202px */
-.rf-vplayer { width:202px; flex-shrink:0; }
+/* Vertical 9:16 player — fills the full output column, aspect-ratio locked */
+.rf-vplayer { width: 100%; }
 .rf-vplayer [data-testid="stVideo"] {
-  border-radius:10px !important;
-  overflow:hidden !important;
-  height:360px !important;
+  border-radius: var(--r) !important;
+  overflow: hidden !important;
+  aspect-ratio: 9/16 !important;
+  width: 100% !important;
+  height: auto !important;
 }
 .rf-vplayer video {
-  width:202px !important;
-  height:360px !important;
-  object-fit:cover !important;
-  border-radius:10px !important;
-  display:block !important;
+  width: 100% !important;
+  height: auto !important;
+  aspect-ratio: 9/16 !important;
+  object-fit: cover !important;
+  border-radius: var(--r) !important;
+  display: block !important;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -240,14 +268,11 @@ video { border-radius: var(--r) !important; width: 100% !important; }
 _DEFAULTS = dict(
     input_path=None, uploaded_file_name=None, video_info=None,
     app_mode="single", tracking_mode="subject",
-    # single-clip
     output_path=None, processing_done=False,
     output_bytes=None, srt_bytes=None, last_settings=None,
-    # auto-clip
     detected_clips=None, selected_clip_indices=None,
     clip_results=None, scan_done=False,
     clip_out_dir=None,
-    # vertical player: index of the clip currently being previewed (-1 = none)
     playing_clip_idx=-1,
 )
 for _k, _v in _DEFAULTS.items():
@@ -309,9 +334,11 @@ st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  App-mode selector
+#  App-mode + Tracking selectors  (kept visible — these are the core choice)
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("<div style='padding:0 20px'>", unsafe_allow_html=True)
+
+# Row 1 — App mode
 st.markdown('<div class="rf-sec">Mode</div>', unsafe_allow_html=True)
 mc1, mc2 = st.columns(2, gap="small")
 with mc1:
@@ -342,22 +369,16 @@ else:
         <div class="rf-mode-h pur">Auto-Clip  <span style="background:var(--acc);color:#fff;font-size:9px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;padding:2px 6px;border-radius:99px;">AI</span></div>
         <div class="rf-mode-s">
           Upload a 30–90 min video. AI scans for saliency peaks, detects
-          narrative arcs (beginning · middle · end), identifies the SOI
-          coordinate region per clip, enforces the lower-third safe zone,
-          then verticalizes every selected clip.
+          narrative arcs, identifies the SOI region per clip, enforces the
+          lower-third safe zone, then verticalizes every selected clip.
         </div>
       </div>
     </div>""", unsafe_allow_html=True)
-st.markdown("</div>", unsafe_allow_html=True)
 
-st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Tracking mode + settings
-# ─────────────────────────────────────────────────────────────────────────────
-st.markdown("<div style='padding:0 20px'>", unsafe_allow_html=True)
-st.markdown('<div class="rf-sec">Tracking Mode</div>', unsafe_allow_html=True)
+# Row 2 — Tracking mode
+st.markdown('<div class="rf-sec">Tracking</div>', unsafe_allow_html=True)
 tm1, tm2 = st.columns(2, gap="small")
 with tm1:
     if st.button("🎯  Subject Tracking", type="secondary", use_container_width=True):
@@ -367,111 +388,25 @@ with tm2:
         st.session_state.tracking_mode = "talking_head"
 tracking_mode = st.session_state.tracking_mode
 
-# Settings tabs
-tab_list = ["🎞 Output", "🎯 Tracking", "📝 Subtitles", "⚙ Advanced"]
-if app_mode == "autoClip":
-    tab_list.append("✂️ Clips")
+# ── Quick settings: Resolution only — enough for 90 % of users ──────────────
+st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+qs1, qs2 = st.columns([3, 2], gap="medium")
+with qs1:
+    resolution_label = st.selectbox(
+        "Resolution",
+        list(RESOLUTION_PRESETS.keys()),
+        index=2,   # 720p default — upscales low-res sources to proper mobile quality
+        help="'Match source' keeps native resolution. Presets upscale if needed.",
+    )
+with qs2:
+    st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+    st.markdown(
+        '<span class="rf-safe">✓ Lower-third guard active</span>',
+        unsafe_allow_html=True)
 
-if app_mode == "autoClip":
-    tab_out, tab_trk, tab_sub, tab_adv, tab_clip = st.tabs(tab_list)
-else:
-    tab_out, tab_trk, tab_sub, tab_adv = st.tabs(tab_list)
-    tab_clip = None  # not used in single mode
-
-with tab_out:
-    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-    o1, o2 = st.columns(2, gap="medium")
-    with o1:
-        resolution_label = st.selectbox("Resolution", list(RESOLUTION_PRESETS.keys()), index=0)
-        fps_label = st.selectbox("Frame rate",
-            ["Source (keep original)", "60 fps", "30 fps", "25 fps", "24 fps"], index=0)
-    with o2:
-        crf = st.slider("Quality (CRF)", 15, 35, 23, 1)
-        st.caption("18 = near-lossless  ·  28 = compact")
-        encoder_preset_label = st.selectbox("Speed",
-            ["ultrafast", "fast", "medium", "slow"], index=1)
-    _fps_map = {"Source (keep original)": None,
-                "60 fps": 60.0, "30 fps": 30.0, "25 fps": 25.0, "24 fps": 24.0}
-    output_fps = _fps_map[fps_label]
-
-with tab_trk:
-    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-    if tracking_mode == "talking_head":
-        th1, th2 = st.columns(2, gap="medium")
-        with th1:
-            talking_head_bias = st.slider("Upper-third pull", 0.0, 1.0, 0.30, 0.05)
-            st.caption("0 = centered face  ·  1 = upper third")
-            smooth_window = st.slider("Smoothness", 3, 31, 21, 2)
-        with th2:
-            adaptive_smoothing  = st.toggle("Adaptive smoothing", value=False)
-            use_optical_flow    = st.toggle("Optical flow bridge", value=True)
-            rule_of_thirds      = st.toggle("Horizontal rule-of-thirds", value=True)
-        confidence          = 0.5
-        scene_cut_threshold = 0.35
-    else:
-        t1, t2 = st.columns(2, gap="medium")
-        with t1:
-            adaptive_smoothing  = st.toggle("Adaptive smoothing", value=True)
-            smooth_window       = st.slider("Smoothness", 3, 31, 15, 2)
-            confidence          = st.slider("Detection confidence", 0.10, 0.95, 0.45, 0.05)
-        with t2:
-            use_optical_flow    = st.toggle("Optical flow fallback", value=True)
-            rule_of_thirds      = st.toggle("Look-room / Rule-of-thirds", value=True)
-            scene_cut_threshold = st.slider("Scene-cut sensitivity", 0.10, 0.60, 0.35, 0.05)
-        talking_head_bias = 0.30
-
-with tab_sub:
-    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-    if not _whisper_ok:
-        st.markdown('<div class="rf-purp">⚠️ Install <code>openai-whisper</code> to enable subtitles.</div>',
-                    unsafe_allow_html=True)
-    s1, s2 = st.columns(2, gap="medium")
-    with s1:
-        burn_subtitles = st.toggle("Burn subtitles", value=False, disabled=not _whisper_ok)
-        if not _whisper_ok:
-            burn_subtitles = False
-        translate_subtitles = st.toggle("Translate 🌐", value=False,
-            disabled=(not _whisper_ok or not _translate_ok or not burn_subtitles))
-        if not burn_subtitles or not _translate_ok:
-            translate_subtitles = False
-        whisper_model = st.selectbox("Whisper model",
-            ["tiny", "base", "small", "medium"], index=1, disabled=not _whisper_ok)
-    with s2:
-        subtitle_style_name = st.selectbox("Style", list(SUBTITLE_STYLES.keys()),
-                                           disabled=not _whisper_ok)
-        whisper_language_raw = st.selectbox("Audio language",
-            ["Auto-detect", "en", "hi", "es", "fr", "de", "ja", "zh", "pt", "ar"],
-            disabled=not _whisper_ok)
-        whisper_language = None if whisper_language_raw == "Auto-detect" else whisper_language_raw
-        subtitle_max_chars = st.slider("Max chars/line", 20, 60, 42, 2, disabled=not _whisper_ok)
-        subtitle_translate_label = st.selectbox("Translate to",
-            list(TRANSLATION_LANGUAGES.keys()), index=0,
-            disabled=(not _whisper_ok or not _translate_ok
-                      or not burn_subtitles or not translate_subtitles))
-        subtitle_translate_to = TRANSLATION_LANGUAGES[subtitle_translate_label] or None
-        if not translate_subtitles:
-            subtitle_translate_to = None
-
-with tab_adv:
-    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-    a1, a2 = st.columns(2, gap="medium")
-    with a1:
-        audio_bitrate_label = st.selectbox("Audio bitrate",
-            ["64k", "96k", "128k", "192k"], index=2)
-    with a2:
-        if tracking_mode == "subject":
-            yolo_weights = st.selectbox("YOLO model",
-                ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt"], index=0)
-        else:
-            yolo_weights = "yolov8n.pt"
-            st.markdown("""
-            <div class="rf-purp">Talking Head uses OpenCV face detector — YOLO not needed.</div>
-            """, unsafe_allow_html=True)
-    st.markdown("""
-    <div class="rf-safe">✓ Lower-third guard — subjects kept above bottom 20% of frame</div>
-    """, unsafe_allow_html=True)
-
-# Clip settings (auto-clip mode only)
+# ─────────────────────────────────────────────────────────────────────────────
+#  Advanced settings  (single expander, tabbed inside)
+# ─────────────────────────────────────────────────────────────────────────────
 _CLIP_PRESETS = {
     "15 sec  (snappy highlight)": (13, 17),
     "30 sec  (short reel)":       (25, 35),
@@ -480,33 +415,178 @@ _CLIP_PRESETS = {
 clip_min_dur  = 25
 clip_max_dur  = 60
 clip_target_n = 8
-if app_mode == "autoClip" and tab_clip is not None:
-    with tab_clip:
-        st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-        cl1, cl2 = st.columns(2, gap="medium")
-        with cl1:
-            preset_label = st.radio(
-                "Clip length preset",
-                list(_CLIP_PRESETS.keys()),
-                index=2,
-                help="Sets the target duration window for each detected clip",
-            )
-            clip_min_dur, clip_max_dur = _CLIP_PRESETS[preset_label]
-            st.markdown(
-                f"<div style='font-size:10px;color:var(--ink3);margin-top:4px;'>"
-                f"Window: {clip_min_dur}s – {clip_max_dur}s</div>",
-                unsafe_allow_html=True)
-        with cl2:
-            clip_target_n = st.slider("Target # clips", 3, 20, 8, 1)
-            st.markdown("""
-            <div class="rf-info" style="margin-top:8px;">
-            💡 AI detects saliency peaks + scene boundaries to find narrative arcs
-            (beginning · middle · end) in your video.
-            </div>""", unsafe_allow_html=True)
 
-st.markdown("</div>", unsafe_allow_html=True)  # close settings div
+with st.expander("⚙  Advanced settings", expanded=False):
+    if app_mode == "autoClip":
+        tab_out, tab_trk, tab_sub, tab_adv, tab_clip = st.tabs(
+            ["🎞 Output", "🎯 Tracking", "📝 Subtitles", "⚙ Encoder", "✂️ Clips"])
+    else:
+        tab_out, tab_trk, tab_sub, tab_adv = st.tabs(
+            ["🎞 Output", "🎯 Tracking", "📝 Subtitles", "⚙ Encoder"])
+        tab_clip = None
+
+    # ── Output tab ──────────────────────────────────────────────────────
+    with tab_out:
+        st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+        o1, o2 = st.columns(2, gap="medium")
+        with o1:
+            fps_label = st.selectbox("Frame rate",
+                ["Source (keep original)", "60 fps", "30 fps", "25 fps", "24 fps"], index=0)
+        with o2:
+            audio_bitrate_label = st.selectbox("Audio bitrate",
+                ["64k", "96k", "128k", "192k"], index=2)
+
+    # ── Tracking tab ────────────────────────────────────────────────────
+    with tab_trk:
+        st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+        if tracking_mode == "talking_head":
+            th1, th2 = st.columns(2, gap="medium")
+            with th1:
+                talking_head_bias = st.slider("Upper-third pull", 0.0, 1.0, 0.30, 0.05)
+                st.caption("0 = centered face  ·  1 = upper third")
+                smooth_window = st.slider("Smoothness", 3, 31, 21, 2)
+            with th2:
+                adaptive_smoothing  = st.toggle("Adaptive smoothing", value=False)
+                use_optical_flow    = st.toggle("Optical flow bridge", value=True)
+                rule_of_thirds      = st.toggle("Horizontal rule-of-thirds", value=True)
+            confidence          = 0.5
+            scene_cut_threshold = 0.35
+        else:
+            t1, t2 = st.columns(2, gap="medium")
+            with t1:
+                adaptive_smoothing  = st.toggle("Adaptive smoothing", value=True)
+                smooth_window       = st.slider("Smoothness", 3, 31, 15, 2)
+                confidence          = st.slider("Detection confidence", 0.10, 0.95, 0.45, 0.05)
+            with t2:
+                use_optical_flow    = st.toggle("Optical flow fallback", value=True)
+                rule_of_thirds      = st.toggle("Look-room / Rule-of-thirds", value=True)
+                scene_cut_threshold = st.slider("Scene-cut sensitivity", 0.10, 0.60, 0.35, 0.05)
+            talking_head_bias = 0.30
+
+    # ── Subtitles tab ───────────────────────────────────────────────────
+    with tab_sub:
+        st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+        if not _whisper_ok:
+            st.markdown(
+                '<div class="rf-purp">⚠️ Install <code>openai-whisper</code> to enable subtitles.</div>',
+                unsafe_allow_html=True)
+        s1, s2 = st.columns(2, gap="medium")
+        with s1:
+            burn_subtitles = st.toggle("Burn subtitles", value=False, disabled=not _whisper_ok)
+            if not _whisper_ok:
+                burn_subtitles = False
+            translate_subtitles = st.toggle("Translate 🌐", value=False,
+                disabled=(not _whisper_ok or not _translate_ok or not burn_subtitles))
+            if not burn_subtitles or not _translate_ok:
+                translate_subtitles = False
+            whisper_model = st.selectbox("Whisper model",
+                ["tiny", "base", "small", "medium"], index=1, disabled=not _whisper_ok)
+        with s2:
+            subtitle_style_name = st.selectbox("Style", list(SUBTITLE_STYLES.keys()),
+                                               disabled=not _whisper_ok)
+            whisper_language_raw = st.selectbox("Audio language",
+                ["Auto-detect", "en", "hi", "es", "fr", "de", "ja", "zh", "pt", "ar"],
+                disabled=not _whisper_ok)
+            whisper_language = None if whisper_language_raw == "Auto-detect" else whisper_language_raw
+            subtitle_max_chars = st.slider("Max chars/line", 20, 60, 42, 2, disabled=not _whisper_ok)
+            subtitle_translate_label = st.selectbox("Translate to",
+                list(TRANSLATION_LANGUAGES.keys()), index=0,
+                disabled=(not _whisper_ok or not _translate_ok
+                          or not burn_subtitles or not translate_subtitles))
+            subtitle_translate_to = TRANSLATION_LANGUAGES[subtitle_translate_label] or None
+            if not translate_subtitles:
+                subtitle_translate_to = None
+
+    # ── Encoder tab ─────────────────────────────────────────────────────
+    with tab_adv:
+        st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+        a1, a2 = st.columns(2, gap="medium")
+        with a1:
+            crf = st.slider("Quality (CRF)", 15, 35, 23, 1)
+            st.caption("18 = near-lossless  ·  28 = compact")
+            encoder_preset_label = st.selectbox("Speed preset",
+                ["ultrafast", "fast", "medium", "slow"], index=1)
+        with a2:
+            if tracking_mode == "subject":
+                yolo_weights = st.selectbox("YOLO model",
+                    ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt"], index=0)
+            else:
+                yolo_weights = "yolov8n.pt"
+                st.markdown(
+                    '<div class="rf-purp" style="margin-top:8px;">Talking Head uses OpenCV face detector — YOLO not needed.</div>',
+                    unsafe_allow_html=True)
+
+    # ── Clips tab (auto-clip only) ───────────────────────────────────────
+    if app_mode == "autoClip" and tab_clip is not None:
+        with tab_clip:
+            st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+            cl1, cl2 = st.columns(2, gap="medium")
+            with cl1:
+                preset_label = st.radio(
+                    "Clip length preset",
+                    list(_CLIP_PRESETS.keys()),
+                    index=2,
+                )
+                clip_min_dur, clip_max_dur = _CLIP_PRESETS[preset_label]
+                st.markdown(
+                    f"<div style='font-size:10px;color:var(--ink3);margin-top:4px;'>"
+                    f"Window: {clip_min_dur}s – {clip_max_dur}s</div>",
+                    unsafe_allow_html=True)
+            with cl2:
+                clip_target_n = st.slider("Target # clips", 3, 20, 8, 1)
+                st.markdown("""
+                <div class="rf-info" style="margin-top:8px;">
+                💡 AI detects saliency peaks + scene boundaries to find narrative arcs
+                (beginning · middle · end) in your video.
+                </div>""", unsafe_allow_html=True)
+
+# Defaults for values not shown when expander is collapsed on first render
+# (Streamlit evaluates widgets lazily so these are set inside the expander
+#  above; reference them below with fallback defaults.)
+try: fps_label
+except NameError: fps_label = "Source (keep original)"
+try: audio_bitrate_label
+except NameError: audio_bitrate_label = "128k"
+try: crf
+except NameError: crf = 23
+try: encoder_preset_label
+except NameError: encoder_preset_label = "fast"
+try: yolo_weights
+except NameError: yolo_weights = "yolov8n.pt"
+try: smooth_window
+except NameError: smooth_window = 15
+try: adaptive_smoothing
+except NameError: adaptive_smoothing = True
+try: confidence
+except NameError: confidence = 0.45
+try: use_optical_flow
+except NameError: use_optical_flow = True
+try: rule_of_thirds
+except NameError: rule_of_thirds = True
+try: scene_cut_threshold
+except NameError: scene_cut_threshold = 0.35
+try: talking_head_bias
+except NameError: talking_head_bias = 0.30
+try: burn_subtitles
+except NameError: burn_subtitles = False
+try: whisper_model
+except NameError: whisper_model = "base"
+try: whisper_language
+except NameError: whisper_language = None
+try: subtitle_style_name
+except NameError: subtitle_style_name = "Bold White (TikTok)"
+try: subtitle_max_chars
+except NameError: subtitle_max_chars = 42
+try: subtitle_translate_to
+except NameError: subtitle_translate_to = None
+
+st.markdown("</div>", unsafe_allow_html=True)  # close padding div
 
 # Settings fingerprint for change detection
+_fps_map = {"Source (keep original)": None,
+            "60 fps": 60.0, "30 fps": 30.0, "25 fps": 25.0, "24 fps": 24.0}
+output_fps = _fps_map.get(fps_label)
+
 current_settings = dict(
     app_mode=app_mode, tracking_mode=tracking_mode,
     resolution_label=resolution_label, fps_label=fps_label, crf=crf,
@@ -611,7 +691,9 @@ with col_out:
             out_mb = len(st.session_state.output_bytes) / (1024 ** 2)
             st.markdown(f'<div class="rf-ok">✓ Done — {out_mb:.1f} MB</div>',
                         unsafe_allow_html=True)
+            st.markdown('<div class="rf-vplayer">', unsafe_allow_html=True)
             st.video(st.session_state.output_bytes, format="video/mp4")
+            st.markdown('</div>', unsafe_allow_html=True)
             st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
             stem = os.path.splitext(st.session_state.uploaded_file_name or "video")[0]
             st.download_button(
@@ -658,15 +740,11 @@ with col_out:
                 f"{len(clips)} clips found · {len(sel)} selected</div>",
                 unsafe_allow_html=True)
 
-            # Build index-based results map: clip_index -> result dict
-            # (reliable across reruns unlike id())
             clip_results_map: dict = {}
             if st.session_state.clip_results:
-                # clip_results are stored in selection order; map by start_sec key
                 for r in st.session_state.clip_results:
                     clip_obj = r.get("clip")
                     if clip_obj is not None:
-                        # Key = (start_sec, end_sec) tuple — stable across reruns
                         clip_results_map[(round(clip_obj.start_sec, 1),
                                           round(clip_obj.end_sec, 1))] = r
 
@@ -678,7 +756,6 @@ with col_out:
                 is_sel    = ci in sel
                 is_playing = (playing_idx == ci)
 
-                # Stable key lookup
                 clip_key = (round(clip.start_sec, 1), round(clip.end_sec, 1))
                 result_for_clip = clip_results_map.get(clip_key)
                 is_done = (
@@ -710,7 +787,6 @@ with col_out:
                 </div>""", unsafe_allow_html=True)
 
                 if is_done:
-                    # Buttons row: Play toggle | Download
                     btn_col, dl_col = st.columns([1, 1])
                     with btn_col:
                         play_label = "⏹ Close" if is_playing else "▶ Play 9:16"
@@ -732,24 +808,16 @@ with col_out:
                         except Exception:
                             pass
 
-                    # Vertical player — only for the active clip, same height as landscape player
                     if is_playing:
                         try:
                             with open(result_for_clip["output_path"], "rb") as f:
                                 clip_bytes_play = f.read()
-                            # Use columns: narrow (9:16 width) | spacer
-                            # 202px ≈ 360px * 9/16  so it matches horizontal player height
-                            vcol, _ = st.columns([202, 400])
-                            with vcol:
-                                st.markdown('<div class="rf-vplayer">',
-                                            unsafe_allow_html=True)
-                                st.video(clip_bytes_play, format="video/mp4")
-                                st.markdown('</div>', unsafe_allow_html=True)
+                            st.markdown('<div class="rf-vplayer">', unsafe_allow_html=True)
+                            st.video(clip_bytes_play, format="video/mp4")
+                            st.markdown('</div>', unsafe_allow_html=True)
                         except Exception:
                             pass
-
                 else:
-                    # Not yet converted — show include checkbox
                     cb_col, _ = st.columns([2, 1])
                     with cb_col:
                         toggled = st.checkbox(
@@ -766,14 +834,14 @@ with col_out:
             <div class="rf-empty">
               <div class="rf-empty-icon">🔍</div>
               <div class="rf-empty-h">No clips found</div>
-              <div class="rf-empty-s">try adjusting clip duration in the Clips tab</div>
+              <div class="rf-empty-s">try adjusting clip duration in Advanced → Clips</div>
             </div>""", unsafe_allow_html=True)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Action bar (only shown when a file is uploaded)
+#  Action bar
 # ─────────────────────────────────────────────────────────────────────────────
 if uploaded_file is not None and st.session_state.input_path:
     info = st.session_state.video_info
