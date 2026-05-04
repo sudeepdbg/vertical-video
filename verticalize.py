@@ -1,12 +1,11 @@
 """
 verticalize.py
-──────────────
 Convert landscape video to 9:16 vertical with AI subject tracking.
 Modes:
-• Subject tracking  — YOLOv8 + optical flow
-• Talking Head Mode — DNN/Haar face detector, upper-third framing
-• Auto-clip detect  — scan long video, find high-engagement segments
-• Lower-third guard — subjects kept above bottom 20% of vertical frame
+- Subject tracking  — YOLOv8 + optical flow
+- Talking Head Mode — DNN/Haar face detector, upper-third framing
+- Auto-clip detect  — scan long video, find high-engagement segments
+- Lower-third guard — subjects kept above bottom 20% of vertical frame
 Dependencies: opencv-python, ultralytics, numpy, ffmpeg (system)
 Optional:     openai-whisper, deep-translator
 """
@@ -23,17 +22,16 @@ import shutil
 from collections import namedtuple
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-# --- Error Handling ---
 class ProcessingError(Exception):
     pass
 
-# --- Constants ---
+# Constants
 PERSON_CLASS_ID   = 0
 HIGH_PRIO_CLASSES = {0, 2, 3, 5, 7, 15, 16}
 MAX_FILE_SIZE_MB  = 2000
 MIN_FRAME_DIM     = 240
 MAX_FRAMES_GUARD  = 1_080_000
-LOWER_THIRD_GUARD = 0.80   # bottom 20% is reserved for platform UI
+LOWER_THIRD_GUARD = 0.80
 
 VELOCITY_SMOOTH_TABLE: List[Tuple[float, int]] = [
     (0.0,   51), (3.0,   45), (8.0,   37),
@@ -42,10 +40,10 @@ VELOCITY_SMOOTH_TABLE: List[Tuple[float, int]] = [
 
 RESOLUTION_PRESETS: Dict[str, Tuple[int, int]] = {
     "Match source (no upscale)":    (0, 0),
-    "1080p  (1080×1920 — Full HD)": (1080, 1920),
-    "720p   (720×1280  — HD)":      (720,  1280),
-    "540p   (540×960   — SD)":      (540,  960),
-    "480p   (480×854   — Low)":     (480,  854),
+    "1080p  (1080x1920 - Full HD)": (1080, 1920),
+    "720p   (720x1280  - HD)":      (720,  1280),
+    "540p   (540x960   - SD)":      (540,  960),
+    "480p   (480x854   - Low)":     (480,  854),
 }
 
 SUBTITLE_STYLES: Dict[str, Dict[str, Any]] = {
@@ -71,20 +69,18 @@ SUBTITLE_STYLES: Dict[str, Dict[str, Any]] = {
 
 TRANSLATION_LANGUAGES: Dict[str, str] = {
     "None (keep original)": "",
-    "French 🇫🇷": "fr", "German 🇩🇪": "de", "Spanish 🇪🇸": "es",
-    "Italian 🇮": "it", "Portuguese 🇵🇹": "pt", "Dutch 🇳": "nl",
-    "Polish 🇵🇱": "pl", "Russian 🇷": "ru", "Japanese 🇯🇵": "ja",
-    "Korean 🇰": "ko", "Chinese (Simplified) 🇨": "zh-CN",
-    "Arabic 🇸🇦": "ar", "Hindi 🇮🇳": "hi", "Turkish 🇹🇷": "tr",
-    "Indonesian 🇮🇩": "id", "Swedish 🇸": "sv", "Norwegian 🇳🇴": "no",
-    "Danish 🇩🇰": "da", "Finnish 🇫🇮": "fi", "Greek 🇬🇷": "el",
-    "Hebrew 🇮": "iw", "Thai 🇹🇭": "th", "Vietnamese 🇻🇳": "vi",
-    "Malay 🇲🇾": "ms", "Ukrainian 🇺": "uk",
+    "French": "fr", "German": "de", "Spanish": "es",
+    "Italian": "it", "Portuguese": "pt", "Dutch": "nl",
+    "Polish": "pl", "Russian": "ru", "Japanese": "ja",
+    "Korean": "ko", "Chinese (Simplified)": "zh-CN",
+    "Arabic": "ar", "Hindi": "hi", "Turkish": "tr",
+    "Indonesian": "id", "Swedish": "sv", "Norwegian": "no",
+    "Danish": "da", "Finnish": "fi", "Greek": "el",
+    "Hebrew": "iw", "Thai": "th", "Vietnamese": "vi",
+    "Malay": "ms", "Ukrainian": "uk",
 }
 
-# --- Clip segment ---
 class ClipSegment:
-    """Represents a detected high-engagement segment."""
     def __init__(self, start_sec: float, end_sec: float, score: float,
                  soi_region: str = "center", peak_frame: int = 0, title: str = ""):
         self.start_sec = start_sec
@@ -99,7 +95,6 @@ class ClipSegment:
         return (f"<Clip {self.start_sec:.1f}s–{self.end_sec:.1f}s "
                 f"dur={self.duration:.1f}s score={self.score:.2f} soi={self.soi_region}>")
 
-# --- Optional dependency checks ---
 def whisper_available() -> bool:
     try:
         import whisper; return True
@@ -112,7 +107,6 @@ def translation_available() -> bool:
     except ImportError:
         return False
 
-# --- FFmpeg helpers ---
 def _check_ffmpeg() -> None:
     for tool in ("ffmpeg", "ffprobe"):
         try:
@@ -130,11 +124,8 @@ def _has_audio(path: str) -> bool:
         return False
 
 def _get_video_duration_ffprobe(path: str) -> Optional[float]:
-    """Get precise duration via ffprobe."""
-    cmd = [
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", path
-    ]
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+           "-of", "default=noprint_wrappers=1:nokey=1", path]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         return float(r.stdout.strip())
@@ -147,18 +138,10 @@ def _extract_audio_wav(video_path: str, wav_path: str) -> bool:
     return r.returncode == 0 and os.path.exists(wav_path)
 
 def _trim_video(input_path: str, output_path: str, start_sec: float, end_sec: float) -> bool:
-    """Fast stream-copy trim with re-encode to fix keyframe alignment."""
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(start_sec),
-        "-to", str(end_sec),
-        "-i", input_path,
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
-        "-c:a", "aac", "-b:a", "128k",
-        "-avoid_negative_ts", "make_zero",
-        "-reset_timestamps", "1",
-        output_path,
-    ]
+    cmd = ["ffmpeg", "-y", "-ss", str(start_sec), "-to", str(end_sec),
+           "-i", input_path, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+           "-c:a", "aac", "-b:a", "128k", "-avoid_negative_ts", "make_zero",
+           "-reset_timestamps", "1", output_path]
     r = subprocess.run(cmd, capture_output=True, text=True)
     return r.returncode == 0 and os.path.exists(output_path)
 
@@ -166,7 +149,6 @@ def _ffmpeg_encode(video_path: str, audio_source: Optional[str], output_path: st
                    fps: float, duration: float, crf: int = 23, preset: str = "fast",
                    audio_bitrate: str = "128k", subtitle_path: Optional[str] = None,
                    subtitle_style: Optional[Dict[str, Any]] = None) -> None:
-    # Robust input flags for reading intermediate files
     cmd = ["ffmpeg", "-y",
            "-fflags", "+genpts",
            "-probesize", "50M",
@@ -208,7 +190,6 @@ def _ffmpeg_encode(video_path: str, audio_source: Optional[str], output_path: st
     if r.returncode != 0:
         raise ProcessingError(f"FFmpeg failed (rc={r.returncode}):\n{r.stderr[-2000:]}")
 
-# --- Video metadata ---
 def get_video_info(path: str) -> Dict[str, Any]:
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
@@ -218,10 +199,8 @@ def get_video_info(path: str) -> Dict[str, Any]:
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
-    # Use ffprobe for precise duration (OpenCV frame count is often wrong)
     ffprobe_dur = _get_video_duration_ffprobe(path)
     duration = ffprobe_dur if ffprobe_dur and ffprobe_dur > 0 else (nf / fps if fps > 0 else 0.0)
-    # Recompute total_frames from precise duration
     total_frames = min(int(duration * fps), MAX_FRAMES_GUARD)
     return {"fps": fps, "total_frames": total_frames,
             "width": w, "height": h, "duration_seconds": duration,
@@ -237,7 +216,6 @@ def extract_thumbnail(path: str, t: float = 1.0) -> Optional[bytes]:
     ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return buf.tobytes() if ok else None
 
-# --- Resolution resolver ---
 def resolve_target_size(label: str, orig_w: int, orig_h: int) -> Tuple[int, int]:
     tw, th = RESOLUTION_PRESETS.get(label, (0, 0))
     if tw == 0 and th == 0:
@@ -251,7 +229,6 @@ def resolve_target_size(label: str, orig_w: int, orig_h: int) -> Tuple[int, int]
         scale = orig_w / tw; tw, th = int(orig_w), int(th * scale)
     return max(tw - (tw % 2), 2), max(th - (th % 2), 2)
 
-# --- YOLO model cache ---
 _model_cache: Dict[str, Any] = {}
 def _get_model(weights: str = "yolov8n.pt") -> Any:
     if weights not in _model_cache:
@@ -259,7 +236,6 @@ def _get_model(weights: str = "yolov8n.pt") -> Any:
         except Exception as e: raise ProcessingError(f"Failed to load '{weights}': {e}")
     return _model_cache[weights]
 
-# --- Face detection (DNN → Haar fallback) ---
 _face_net = None
 _haar_cascade = None
 _FACE_PROTO, _FACE_MODEL = "deploy.prototxt", "res10_300x300_ssd_iter_140000.caffemodel"
@@ -303,15 +279,12 @@ def detect_faces(frame: np.ndarray, confidence_thresh: float = 0.6) -> List[Tupl
     faces2.sort(key=lambda f: (f[2]-f[0])*(f[3]-f[1]), reverse=True)
     return faces2
 
-# --- Lower-third guard ---
 def _apply_lower_third_guard(cy: int, crop_h: int, subject_cy_src: int, orig_h: int) -> int:
-    """Ensure the subject does not appear in the bottom (1-LOWER_THIRD_GUARD) fraction of the crop frame."""
     hh = crop_h // 2
     max_cy = subject_cy_src - int((1.0 - LOWER_THIRD_GUARD) * crop_h) + hh
     max_cy = min(max_cy, orig_h - hh)
     return min(cy, max_cy)
 
-# --- SOI region label ---
 def _soi_region_label(cx: int, cy: int, w: int, h: int) -> str:
     col = "left" if cx < w//3 else ("right" if cx > 2*w//3 else "center")
     row = "upper" if cy < h//3 else ("lower" if cy > 2*h//3 else "mid")
@@ -319,7 +292,6 @@ def _soi_region_label(cx: int, cy: int, w: int, h: int) -> str:
     if row == "mid": return col
     return f"{row}-{col}"
 
-# --- Talking-head crop center ---
 def talking_head_center(faces, orig_w, orig_h, crop_w, crop_h, upper_third_bias=0.30):
     if not faces: return None
     ux1, uy1 = min(f[0] for f in faces), min(f[1] for f in faces)
@@ -333,11 +305,10 @@ def talking_head_center(faces, orig_w, orig_h, crop_w, crop_h, upper_third_bias=
     cy = _apply_lower_third_guard(cy, crop_h, face_cy, orig_h)
     return max(hw, min(cx, orig_w-hw)), max(hh, min(cy, orig_h-hh))
 
-# --- Subject detection (YOLO) ---
 DetectionResult = namedtuple("DetectionResult", ["cx","cy","ux1","uy1","ux2","uy2","count"])
 def detect_subjects(frame, model, confidence=0.45):
     try: results = model(frame, verbose=False, conf=confidence)[0]
-    except Exception as e: print(f"⚠ Detection: {e}", file=sys.stderr); return None
+    except Exception as e: print(f"Detection: {e}", file=sys.stderr); return None
     if results.boxes is None or len(results.boxes) == 0: return None
     person_pool, hiprio_pool, all_pool = [], [], []
     for box in results.boxes:
@@ -363,7 +334,6 @@ def frame_for_union(ux1, uy1, ux2, uy2, orig_w, orig_h, crop_w, crop_h):
     cy = _apply_lower_third_guard(cy, crop_h, ucy, orig_h)
     return max(hw, min(cx, orig_w-hw)), max(hh, min(cy, orig_h-hh))
 
-# --- Optical flow / saliency ---
 def optical_flow_center(prev, curr, w, h):
     if prev is None or curr is None: return None
     try:
@@ -395,7 +365,6 @@ def is_scene_change(prev, curr, threshold=0.35):
     try: return float(cv2.absdiff(prev, curr).mean())/255.0 > threshold
     except Exception: return False
 
-# --- Framing bias ---
 def apply_framing_bias(cx, cy, vx, vy, speed, orig_w, orig_h, crop_w, crop_h, look_room_frac=0.12, rot_bias=0.15):
     hw, hh = crop_w//2, crop_h//2
     look = min(speed / 60.0, 1.0)
@@ -411,7 +380,6 @@ def apply_framing_bias(cx, cy, vx, vy, speed, orig_w, orig_h, crop_w, crop_h, lo
     nx = int(lx*look + rx*(1.0-look)); ny = int(ly*look + ry*(1.0-look))
     return max(hw, min(nx, orig_w-hw)), max(hh, min(ny, orig_h-hh))
 
-# --- Velocity & Smoothing ---
 def _compute_speeds(centers, smooth=9):
     n = len(centers)
     if n < 2: return [0.0]*n
@@ -470,7 +438,6 @@ def _cubic_hermite(p0, p1, m0, m1, t):
     return ((2*t3 - 3*t2 + 1)*p0 + (t3 - 2*t2 + t)*m0 + (-2*t3 + 3*t2)*p1 + (t3 - t2)*m1)
 
 def interpolate_centers(centers, indices, total):
-    """Cubic Hermite spline interpolation for ultra-smooth camera paths."""
     if total<=0: return []
     if not centers: return [(0,0)]*total
     if len(centers) == 1: return [centers[0]]*total
@@ -502,7 +469,6 @@ def calculate_crop_dims(orig_w, orig_h, tw, th):
     else: cw = orig_w; ch = int(round(cw/ratio))
     return min(cw, orig_w), min(ch, orig_h)
 
-# --- Whisper → SRT ---
 def _seconds_to_srt_time(s):
     h, m, sc, ms = int(s//3600), int((s%3600)//60), int(s%60), int((s-int(s))*1000)
     return f"{h:02d}:{m:02d}:{sc:02d},{ms:03d}"
@@ -515,16 +481,16 @@ def transcribe_to_srt(video_path, srt_path, whisper_model="base", language=None,
             except: pass
     if not whisper_available(): return False
     import whisper
-    _p(0.0, "🎙️ Extracting audio…")
+    _p(0.0, "Extracting audio...")
     wav_fd, wav_path = tempfile.mkstemp(suffix=".wav"); os.close(wav_fd)
     try:
         if not _extract_audio_wav(video_path, wav_path): return False
-        _p(0.2, f"📝 Transcribing with Whisper ({whisper_model})…")
+        _p(0.2, f"Transcribing with Whisper ({whisper_model})...")
         model = whisper.load_model(whisper_model)
         opts = {"word_timestamps": True, "verbose": False}
         if language: opts["language"] = language
         result = model.transcribe(wav_path, **opts)
-        _p(0.85, "✍️ Writing subtitles…")
+        _p(0.85, "Writing subtitles...")
         lines, idx, words = [], 1, []
         for seg in result.get("segments", []):
             for w in seg.get("words", []): words.append({"word": w["word"].strip(), "start": w["start"], "end": w["end"]})
@@ -540,7 +506,7 @@ def transcribe_to_srt(video_path, srt_path, whisper_model="base", language=None,
             buf.append(w); buf_len += wlen
         flush_buf()
         with open(srt_path, "w", encoding="utf-8") as f: f.write("\n".join(lines))
-        _p(1.0, f"✅ {len(lines)} subtitle lines written")
+        _p(1.0, f"{len(lines)} subtitle lines written")
         return True
     except Exception as e:
         print(f"Whisper transcription failed: {e}", file=sys.stderr); return False
@@ -570,14 +536,13 @@ def translate_srt(srt_path, target_language, source_language="auto", progress_ca
             try: translated = translator.translate(text) or text
             except: translated = text
             translated_blocks.append(f"{ls[0]}\n{ls[1]}\n{translated}")
-            if i%10==0: _p(i/max(len(blocks),1), f"🌐 Translating… {i}/{len(blocks)}")
+            if i%10==0: _p(i/max(len(blocks),1), f"Translating... {i}/{len(blocks)}")
         with open(srt_path, "w", encoding="utf-8") as f: f.write("\n\n".join(translated_blocks)+"\n")
-        _p(1.0, f"✅ Translated {len(translated_blocks)} subtitle blocks to [{target_language}]")
+        _p(1.0, f"Translated {len(translated_blocks)} subtitle blocks to [{target_language}]")
         return True
     except Exception as e:
         print(f"Translation failed: {e}", file=sys.stderr); return False
 
-# --- Frame saliency score ---
 def _frame_saliency_score(frame, prev_frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var()); lap_score = min(lap_var/3000.0, 1.0)
@@ -607,12 +572,11 @@ def _compute_frame_scores(input_path, fps, total_frames, sample_every=15, progre
                 if diff_ratio > 0.30: scene_cuts.append(frame_idx)
             scores.append(_frame_saliency_score(frame, prev_frame))
             prev_gray = curr_gray; prev_frame = frame.copy()
-        if frame_idx%report_n == 0: _p(frame_idx/total_frames, f"Scanning {frame_idx}/{total_frames}…")
+        if frame_idx%report_n == 0: _p(frame_idx/total_frames, f"Scanning {frame_idx}/{total_frames}...")
         frame_idx += 1
     cap.release()
     return np.array(scores, dtype=float), scene_cuts
 
-# --- Clip detection ---
 def detect_clips(input_path, min_duration_sec=25.0, max_duration_sec=65.0, target_n_clips=10,
                  model=None, confidence=0.45, progress_callback=None):
     def _p(v, msg=""):
@@ -623,10 +587,10 @@ def detect_clips(input_path, min_duration_sec=25.0, max_duration_sec=65.0, targe
     fps, total_frames, duration = info["fps"], info["total_frames"], info["duration_seconds"]
     orig_w, orig_h = info["width"], info["height"]
     sample_every = max(1, int(fps))
-    _p(0.0, "🔍 Scanning for engagement peaks…")
+    _p(0.0, "Scanning for engagement peaks...")
     scores, scene_cuts_frames = _compute_frame_scores(input_path, fps, total_frames, sample_every=sample_every, progress_callback=lambda v, m: _p(v*0.45, m))
     if len(scores)==0: return []
-    _p(0.45, "📊 Computing narrative arcs…")
+    _p(0.45, "Computing narrative arcs...")
     window = max(5, int(30/(sample_every/fps)))
     smooth_scores = np.convolve(scores, np.ones(window)/window, mode="same") if len(scores)>=window else scores.copy()
     if smooth_scores.max()>0: smooth_scores = smooth_scores/smooth_scores.max()
@@ -658,10 +622,10 @@ def detect_clips(input_path, min_duration_sec=25.0, max_duration_sec=65.0, targe
         if not overlaps: clip_candidates.append((start, end, peak_score))
     clip_candidates.sort(key=lambda x: x[2], reverse=True); clip_candidates = clip_candidates[:target_n_clips]
     clip_candidates.sort(key=lambda x: x[0])
-    _p(0.55, "🎯 Detecting SOI per clip…")
+    _p(0.55, "Detecting SOI per clip...")
     segments = []
     for ci, (start_sec, end_sec, score) in enumerate(clip_candidates):
-        _p(0.55+0.35*(ci/max(len(clip_candidates),1)), f"🎯 Clip {ci+1}/{len(clip_candidates)}…")
+        _p(0.55+0.35*(ci/max(len(clip_candidates),1)), f"Clip {ci+1}/{len(clip_candidates)}...")
         soi_region, soi_xs, soi_ys = "center", [], []
         n_samples = min(8, max(2, int(end_sec-start_sec)))
         sample_times = np.linspace(start_sec+1, end_sec-1, n_samples)
@@ -681,12 +645,11 @@ def detect_clips(input_path, min_duration_sec=25.0, max_duration_sec=65.0, targe
         cap.release()
         if soi_xs: soi_region = _soi_region_label(int(np.median(soi_xs)), int(np.median(soi_ys)), orig_w, orig_h)
         mins_s, secs_s = int(start_sec//60), int(start_sec%60); mins_e, secs_e = int(end_sec//60), int(end_sec%60)
-        title = f"Clip {ci+1} ({mins_s}:{secs_s:02d} – {mins_e}:{secs_e:02d})"
+        title = f"Clip {ci+1} ({mins_s}:{secs_s:02d} - {mins_e}:{secs_e:02d})"
         segments.append(ClipSegment(start_sec, end_sec, score, soi_region, int(sample_times[len(sample_times)//2]*fps), title))
-    _p(1.0, f"✅ Found {len(segments)} clips")
+    _p(1.0, f"Found {len(segments)} clips")
     return segments
 
-# --- EMA polish ---
 def _ema_polish(centers, alpha=0.12):
     if len(centers)<3: return centers
     n = len(centers)
@@ -701,7 +664,6 @@ def _ema_polish(centers, alpha=0.12):
     rx.reverse(); ry.reverse()
     return [(int(x), int(y)) for x, y in zip(rx, ry)]
 
-# --- Single-video verticalization ---
 def process_video(input_path, output_path, target_preset_label="Match source (no upscale)", tracking_mode="subject",
                   talking_head_bias=0.30, sample_interval=None, confidence=0.45, use_optical_flow=True,
                   smooth_window=27, adaptive_smoothing=True, rule_of_thirds=True, scene_cut_threshold=0.35,
@@ -721,19 +683,19 @@ def process_video(input_path, output_path, target_preset_label="Match source (no
     orig_w, orig_h = info["width"], info["height"]
     duration = info["duration_seconds"]
     if total_frames<=0 or orig_w<=0 or orig_h<=0: raise ProcessingError("Corrupt or unreadable video.")
-    if not info["is_landscape"]: raise ProcessingError("Video is already vertical — upload a landscape video.")
+    if not info["is_landscape"]: raise ProcessingError("Video is already vertical - upload a landscape video.")
     lbl = target_preset_label if target_preset_label in RESOLUTION_PRESETS else "Match source (no upscale)"
     target_w, target_h = resolve_target_size(lbl, orig_w, orig_h)
     req_w, req_h = RESOLUTION_PRESETS.get(lbl, (0,0))
     clamped = req_h>0 and (target_h<req_h or target_w<req_w)
     result_meta.update(clamped=clamped, effective_size=(target_w, target_h), duration=duration)
-    _p(0.01, f"📐 Output {target_w}×{target_h}")
+    _p(0.01, f"Output {target_w}x{target_h}")
     if not sample_interval: sample_interval = max(1, int(fps/3))
     render_fps = float(output_fps) if output_fps and output_fps>0 else fps
     crop_w, crop_h = calculate_crop_dims(orig_w, orig_h, target_w, target_h)
     srt_path = None
     if burn_subtitles and _has_audio(input_path):
-        _p(0.02, "🎙️ Transcribing…")
+        _p(0.02, "Transcribing...")
         srt_fd, srt_path = tempfile.mkstemp(suffix=".srt"); os.close(srt_fd)
         ok = transcribe_to_srt(input_path, srt_path, whisper_model=whisper_model, language=whisper_language,
                                max_chars_per_line=subtitle_max_chars, progress_callback=lambda v, m: _p(0.02+v*0.08, m))
@@ -745,11 +707,11 @@ def process_video(input_path, output_path, target_preset_label="Match source (no
             result_meta["subtitle_path"] = srt_path
     start_pct = 0.10; model_obj = None
     if tracking_mode == "subject":
-        _p(start_pct, "🤖 Loading YOLO model…"); model_obj = _get_model(yolo_weights)
+        _p(start_pct, "Loading YOLO model..."); model_obj = _get_model(yolo_weights)
     else:
-        _p(start_pct, "👤 Loading face detector…")
+        _p(start_pct, "Loading face detector...")
         if _get_haar() is None and _load_face_net() is None: raise ProcessingError("No face detector available. Reinstall opencv-python.")
-    _p(start_pct+0.02, f"🔎 Analysing {total_frames} frames…")
+    _p(start_pct+0.02, f"Analysing {total_frames} frames...")
     det_centers, det_indices = [], []
     sal_centers, sal_indices = [], []
     scene_cuts = []
@@ -793,9 +755,9 @@ def process_video(input_path, output_path, target_preset_label="Match source (no
         frame_idx += 1
         if frame_idx%report_n == 0:
             pct = start_pct+0.02+(det_end-start_pct-0.02)*(frame_idx/total_frames)
-            _p(pct, f"🔎 {frame_idx}/{total_frames}…")
+            _p(pct, f"{frame_idx}/{total_frames}...")
     cap.release()
-    _p(det_end, f"📍 {len(det_centers)} anchors · {len(scene_cuts)} cuts")
+    _p(det_end, f"{len(det_centers)} anchors - {len(scene_cuts)} cuts")
     if not det_centers:
         det_centers = sal_centers or [(orig_w//2, orig_h//2)]; det_indices = sal_indices or [0]
     else:
@@ -803,7 +765,7 @@ def process_video(input_path, output_path, target_preset_label="Match source (no
         for si, sc_center in zip(sal_indices, sal_centers):
             if not det_indices or min(abs(si-di) for di in det_indices)>gap: det_indices.append(si); det_centers.append(sc_center)
         pairs = sorted(zip(det_indices, det_centers)); det_indices = [p[0] for p in pairs]; det_centers = [p[1] for p in pairs]
-    _p(0.43, "📈 Computing crop path…")
+    _p(0.43, "Computing crop path...")
     all_centers = interpolate_centers(det_centers, det_indices, total_frames)
     speeds = _compute_speeds(all_centers, smooth=11)
     if rule_of_thirds and tracking_mode != "talking_head":
@@ -821,12 +783,12 @@ def process_video(input_path, output_path, target_preset_label="Match source (no
     hw, hh = crop_w//2, crop_h//2
     all_centers = [(max(hw, min(cx, orig_w-hw)), max(hh, min(cy, orig_h-hh))) for cx, cy in all_centers]
     all_centers += [all_centers[-1]]*max(0, total_frames-len(all_centers)); all_centers = all_centers[:total_frames]
-    _p(0.46, "✂️ Rendering frames…")
+    _p(0.46, "Rendering frames...")
     temp_avi = None; temp_mp4 = None
     try:
         fd, temp_avi = tempfile.mkstemp(suffix=".mp4"); os.close(fd)
-        # FIX: Try multiple codecs in order - avc1, mp4v, X264
-        fourcc_codes = ["avc1", "mp4v", "X264"]
+        # FIX: Try multiple codecs in order for maximum compatibility
+        fourcc_codes = ["mp4v", "X264", "avc1"]
         writer = None
         fourcc_used = None
         for fourcc_code in fourcc_codes:
@@ -852,11 +814,11 @@ def process_video(input_path, output_path, target_preset_label="Match source (no
             if crop.shape[1]!=target_w or crop.shape[0]!=target_h:
                 crop = cv2.resize(crop, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
             writer.write(crop); frames_written += 1
-            if (fn+1)%rpt_n == 0: _p(0.46+0.40*((fn+1)/total_frames), f"✂️ {fn+1}/{total_frames}…")
+            if (fn+1)%rpt_n == 0: _p(0.46+0.40*((fn+1)/total_frames), f"{fn+1}/{total_frames}...")
         cap.release(); writer.release()
         if not os.path.exists(temp_avi) or os.path.getsize(temp_avi)<1000: raise ProcessingError("Rendered MP4 is empty.")
         actual_duration = frames_written/render_fps
-        _p(0.87, "🎵 Encoding…" + (" Burning subtitles…" if srt_path else ""))
+        _p(0.87, "Encoding..." + (" Burning subtitles..." if srt_path else ""))
         fd, temp_mp4 = tempfile.mkstemp(suffix=".mp4"); os.close(fd)
         style = SUBTITLE_STYLES.get(subtitle_style_name, SUBTITLE_STYLES["Bold White (TikTok)"])
         _ffmpeg_encode(temp_avi, input_path if _has_audio(input_path) else None, temp_mp4,
@@ -864,8 +826,8 @@ def process_video(input_path, output_path, target_preset_label="Match source (no
                       audio_bitrate=audio_bitrate, subtitle_path=srt_path, subtitle_style=style)
         if not os.path.exists(temp_mp4) or os.path.getsize(temp_mp4)<1000: raise ProcessingError("FFmpeg produced empty output.")
         shutil.move(temp_mp4, output_path); temp_mp4 = None
-        _p(1.0, "✅ Done!")
-        print(f"✅ {output_path} ({os.path.getsize(output_path)/1024**2:.1f} MB)", file=sys.stderr)
+        _p(1.0, "Done!")
+        print(f"Output: {output_path} ({os.path.getsize(output_path)/1024**2:.1f} MB)", file=sys.stderr)
         return result_meta
     finally:
         for p in (temp_avi, temp_mp4):
@@ -873,8 +835,7 @@ def process_video(input_path, output_path, target_preset_label="Match source (no
                 try: os.unlink(p)
                 except: pass
 
-# --- Batch clip pipeline ---
-def process_clips_batch(input_path, output_dir, clips, target_preset_label="720p   (720×1280  — HD)", tracking_mode="subject",
+def process_clips_batch(input_path, output_dir, clips, target_preset_label="720p   (720x1280  - HD)", tracking_mode="subject",
                         talking_head_bias=0.30, confidence=0.45, smooth_window=27, adaptive_smoothing=True, use_optical_flow=True,
                         rule_of_thirds=True, crf=23, encoder_preset="fast", audio_bitrate="128k", yolo_weights="yolov8n.pt",
                         burn_subtitles=False, whisper_model="base", subtitle_style_name="Bold White (TikTok)",
@@ -886,7 +847,7 @@ def process_clips_batch(input_path, output_dir, clips, target_preset_label="720p
     os.makedirs(output_dir, exist_ok=True); results = []
     for i, clip in enumerate(clips):
         base_pct = i/max(len(clips),1); next_pct = (i+1)/max(len(clips),1)
-        _p(base_pct, f"✂️ Processing clip {i+1}/{len(clips)}…")
+        _p(base_pct, f"Processing clip {i+1}/{len(clips)}...")
         trimmed_path, out_path = None, None
         try:
             fd, trimmed_path = tempfile.mkstemp(suffix=".mp4"); os.close(fd)
@@ -911,5 +872,5 @@ def process_clips_batch(input_path, output_dir, clips, target_preset_label="720p
                 try: os.unlink(trimmed_path)
                 except: pass
     n_ok = sum(1 for r in results if not r.get("error"))
-    _p(1.0, f"✅ Batch complete — {n_ok}/{len(results)} clips done")
+    _p(1.0, f"Batch complete - {n_ok}/{len(results)} clips done")
     return results
