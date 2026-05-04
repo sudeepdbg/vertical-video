@@ -307,6 +307,8 @@ def extract_thumbnail(path: str, t: float = 1.0) -> Optional[bytes]:
 # ─────────────────────────────────────────────────────────────────────────────
 def resolve_target_size(label: str, orig_w: int, orig_h: int) -> Tuple[int, int]:
     tw, th = RESOLUTION_PRESETS.get(label, (0, 0))
+
+    # "Match source" — crop to 9:16 at native resolution, never upscale
     if tw == 0 and th == 0:
         cw = int(orig_h * 9 / 16)
         if cw > orig_w:
@@ -315,14 +317,11 @@ def resolve_target_size(label: str, orig_w: int, orig_h: int) -> Tuple[int, int]
         else:
             ch = orig_h
         return cw - (cw % 2), ch - (ch % 2)
-    if th > orig_h:
-        scale = orig_h / th
-        tw = int(tw * scale)
-        th = int(orig_h)
-    if tw > orig_w:
-        scale = orig_w / tw
-        tw = int(orig_w)
-        th = int(th * scale)
+
+    # Explicit preset chosen — upscaling IS allowed so that low-res
+    # sources (e.g. 640×360) reach the requested output resolution.
+    # We only scale down if the source is smaller in BOTH axes; otherwise
+    # we honour the preset as-is and let FFmpeg/Lanczos do the upscale.
     return max(tw - (tw % 2), 2), max(th - (th % 2), 2)
 
 
