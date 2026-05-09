@@ -6,7 +6,9 @@ KEY FIXES:
          VP9 …).  OpenCV's hardware path fails silently on AV1; this bypasses
          it entirely.
   FIX-2  Cubic Hermite spline + Gaussian + EMA camera-path smoothing.
-  FIX-3  Panel Discussion mode — 2×2 split-screen for multi-person shots.
+  FIX-3  Panel Discussion mode — 2-ROW vertical split-screen (top = left group,
+         bottom = right group). Each row is a full-width crop of that person
+         group, letterbox-free. Matches the 9:16 panel layout in the reference.
   FIX-4  YOLO optional — graceful saliency-only fallback when weights can't
          be downloaded (Streamlit Cloud / restricted networks).
   FIX-5  Encoder pipe — correct stdin close → wait() order avoids the
@@ -74,6 +76,10 @@ TRANSLATION_LANGUAGES: Dict[str,str] = {
     "Malay 🇲🇾":"ms","Ukrainian 🇺🇦":"uk",
 }
 
+# Divider line between top and bottom panel (pixels, drawn on output frame)
+PANEL_DIVIDER_PX   = 3          # thickness in output pixels
+PANEL_DIVIDER_COLOR = (15, 15, 15)  # near-black
+
 # ─────────────────────────────────────────────────────────────────────────────
 class ClipSegment:
     def __init__(self,start_sec,end_sec,score,soi_region="center",peak_frame=0,title=""):
@@ -99,7 +105,6 @@ def yolo_available():
         urllib.request.urlopen("https://github.com", timeout=3)
         return True
     except Exception:
-        # No network — can only use YOLO if weights file already exists locally
         return os.path.exists("yolov8n.pt") or os.path.exists("yolov8s.pt")
 
 
@@ -109,8 +114,7 @@ def yolo_available():
 class FFmpegVideoReader:
     """
     Reads frames as BGR24 numpy arrays using FFmpeg software decoders.
-    Handles AV1, HEVC, VP9, H.264 and anything else FFmpeg supports,
-    bypassing OpenCV's broken hardware-accelerated paths.
+    Handles AV1, HEVC, VP9, H.264 and anything else FFmpeg supports.
     """
     def __init__(self,path,width,height,seek_sec=0.0,n_frames=None,
                  scale_w=None,scale_h=None):
@@ -127,8 +131,8 @@ class FFmpegVideoReader:
         if self.n_frames is not None: tail+=["-vframes",str(self.n_frames)]
         tail+=["pipe:1"]
         return [
-            head+["-vcodec","libdav1d"]+tail,   # AV1 software decoder
-            head+["-hwaccel","none"]+tail,        # generic software fallback
+            head+["-vcodec","libdav1d"]+tail,
+            head+["-hwaccel","none"]+tail,
         ]
 
     def _open(self):
@@ -210,7 +214,7 @@ def _trim_video(inp,out,start,end):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  FIX-5: Pipe encoder — correct close order (close stdin → wait, NOT communicate)
+#  FIX-5: Pipe encoder
 # ─────────────────────────────────────────────────────────────────────────────
 def _open_ffmpeg_encoder(output_path,width,height,fps,audio_source,
                           crf=23,preset="fast",audio_bitrate="128k",
@@ -243,10 +247,10 @@ def _open_ffmpeg_encoder(output_path,width,height,fps,audio_source,
 
 
 def _close_ffmpeg_encoder(proc,output_path):
-    """FIX-5: close stdin first, then wait() — never use communicate() after manual close."""
+    """FIX-5: close stdin first, then wait()."""
     try: proc.stdin.close()
     except Exception: pass
-    proc.wait()    # blocks until FFmpeg finishes writing
+    proc.wait()
     if proc.returncode!=0:
         try: err=proc.stderr.read(2000).decode(errors="replace")
         except Exception: err=""
@@ -256,7 +260,7 @@ def _close_ffmpeg_encoder(proc,output_path):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Video metadata (ffprobe-based — works with all codecs)
+#  Video metadata
 # ─────────────────────────────────────────────────────────────────────────────
 def get_video_info(path):
     cmd=["ffprobe","-v","error","-select_streams","v:0",
@@ -313,7 +317,6 @@ def calculate_crop_dims(orig_w,orig_h,tw,th):
 _model_cache: Dict[str,Any]={}
 
 def _get_model(weights="yolov8n.pt"):
-    """Load YOLO model. Returns None (not raises) if unavailable."""
     if not _YOLO_AVAILABLE: return None
     if weights in _model_cache: return _model_cache[weights]
     try:
@@ -458,8 +461,103 @@ def apply_framing_bias(cx,cy,vx,vy,speed,orig_w,orig_h,crop_w,crop_h,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  FIX-3: Panel Discussion — 2×2 split-screen
+#  FIX-3: Panel Discussion — 2-ROW vertical split
 # ─────────────────────────────────────────────────────────────────────────────
+#
+#  Layout (9:16 output):
+#  ┌─────────────────────┐
+#  │   TOP HALF          │  ← left group of persons (sorted by x-center)
+#  │   (group A)         │
+#  ├─────────────────────┤  ← thin divider line
+#  │   BOTTOM HALF       │  ← right group of persons
+#  │   (group B)         │
+#  └─────────────────────┘
+#
+#  For each half:
+#    • Compute the union bounding box of all persons in that group.
+#    • Expand the crop width by `PANEL_CROP_EXPAND` to give context.
+#    • Crop and scale to fill the half (no letterbox / pillarbox).
+#
+#  Person count handling:
+#    0–1  → fallback: smart-crop full frame (panel mode disabled for this frame)
+#    2    → top = person[0], bottom = person[1]
+#    3    → top = person[0], bottom = persons[1]+[2]
+#    4+   → top = left half of list, bottom = right half
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+PANEL_CROP_EXPAND = 1.55   # how much wider than the union bbox to crop (gives padding)
+
+def _group_union(persons: List[Tuple[int,int,int,int]]) -> Tuple[int,int,int,int]:
+    """Return the union bounding box of a list of (x1,y1,x2,y2) boxes."""
+    return (
+        min(p[0] for p in persons),
+        min(p[1] for p in persons),
+        max(p[2] for p in persons),
+        max(p[3] for p in persons),
+    )
+
+
+def _crop_group_to_strip(
+    frame: np.ndarray,
+    group: List[Tuple[int,int,int,int]],
+    strip_w: int,
+    strip_h: int,
+    expand: float = PANEL_CROP_EXPAND,
+) -> np.ndarray:
+    """
+    Crop the portion of `frame` that contains `group`, then scale it to
+    (strip_w × strip_h) using LANCZOS.  If group is empty, returns a
+    downscaled full-frame fallback.
+    """
+    fh, fw = frame.shape[:2]
+    if not group:
+        return cv2.resize(frame, (strip_w, strip_h), interpolation=cv2.INTER_LANCZOS4)
+
+    ux1, uy1, ux2, uy2 = _group_union(group)
+    ucx = (ux1 + ux2) // 2
+    ucy = (uy1 + uy2) // 2
+
+    # Desired crop size: expand union width to fill strip aspect ratio
+    union_w = max(ux2 - ux1, 1)
+    union_h = max(uy2 - uy1, 1)
+    strip_ratio = strip_w / strip_h  # e.g. 1.0 for a square strip
+
+    # Start from expanded union width
+    crop_w = int(union_w * expand)
+    crop_h = int(crop_w / strip_ratio)
+
+    # If crop_h is taller than frame, scale down
+    if crop_h > fh:
+        crop_h = fh
+        crop_w = int(crop_h * strip_ratio)
+
+    # If crop_w is wider than frame, scale down
+    if crop_w > fw:
+        crop_w = fw
+        crop_h = int(crop_w / strip_ratio)
+
+    # Enforce minimums
+    crop_w = max(crop_w, 2)
+    crop_h = max(crop_h, 2)
+
+    # Center on union centroid; clamp to frame edges
+    x1 = max(0, min(ucx - crop_w // 2, fw - crop_w))
+    y1 = max(0, min(ucy - crop_h // 2, fh - crop_h))
+    x2 = x1 + crop_w
+    y2 = y1 + crop_h
+
+    # Safety clamp
+    x2 = min(x2, fw); y2 = min(y2, fh)
+    x1 = max(0, x2 - crop_w); y1 = max(0, y2 - crop_h)
+
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        crop = frame  # ultimate fallback
+
+    return cv2.resize(crop, (strip_w, strip_h), interpolation=cv2.INTER_LANCZOS4)
+
+
 def _detect_panel_mode(input_path,model,fps,total_frames,orig_w,orig_h,
                         confidence=0.45,n_probe=16):
     if model is None: return False
@@ -472,32 +570,67 @@ def _detect_panel_mode(input_path,model,fps,total_frames,orig_w,orig_h,
         if len(detect_persons_all(frame,model,confidence))>=PANEL_MIN_PERSONS: hits+=1
     return hits>n_probe*0.5
 
-def _render_panel_frame(frame,persons,out_w,out_h,prev_slots=None):
-    cell_w,cell_h=out_w//2,out_h//2
-    canvas=np.zeros((out_h,out_w,3),dtype=np.uint8)
-    fh,fw=frame.shape[:2]
-    slots=[None]*4
-    for i,p in enumerate(persons[:4]): slots[i]=p
-    if prev_slots:
-        for i in range(4):
-            if slots[i] is None and prev_slots[i] is not None: slots[i]=prev_slots[i]
-    for qi,(qx,qy) in enumerate([(0,0),(cell_w,0),(0,cell_h),(cell_w,cell_h)]):
-        bbox=slots[qi]
-        if bbox is not None:
-            px1,py1,px2,py2=bbox
-            cx=(px1+px2)//2; cy=(py1+py2)//2
-            bw=int((px2-px1)*1.6); bh=int(bw*cell_h/cell_w)
-            x1=max(0,cx-bw//2); y1=max(0,cy-bh//2)
-            x2=min(fw,x1+bw);   y2=min(fh,y1+bh)
-            x1=max(0,x2-bw);    y1=max(0,y2-bh)
-            crop=frame[y1:y2,x1:x2]
-        else: crop=frame
-        if crop.size==0: crop=frame
-        canvas[qy:qy+cell_h,qx:qx+cell_w]=cv2.resize(crop,(cell_w,cell_h),
-                                                        interpolation=cv2.INTER_LANCZOS4)
-    cv2.line(canvas,(cell_w,0),(cell_w,out_h),(20,20,20),2)
-    cv2.line(canvas,(0,cell_h),(out_w,cell_h),(20,20,20),2)
-    return canvas,slots
+
+def _render_panel_frame(
+    frame: np.ndarray,
+    persons: List[Tuple[int,int,int,int]],
+    out_w: int,
+    out_h: int,
+    prev_slots: Optional[List] = None,
+) -> Tuple[np.ndarray, List]:
+    """
+    Render a 2-row vertical split-screen panel frame.
+
+    persons  — list of (x1,y1,x2,y2) bounding boxes sorted left-to-right
+    out_w/h  — output 9:16 dimensions
+    prev_slots — [group_a, group_b] from last rendered frame (temporal stability)
+
+    Returns (output_frame, [group_a, group_b])
+    """
+    fh, fw = frame.shape[:2]
+
+    # ── 1. Sort persons left → right by x-center ──────────────────────────
+    persons = sorted(persons, key=lambda b: (b[0] + b[2]) // 2)
+
+    # ── 2. Split into top-group (left side) and bottom-group (right side) ─
+    n = len(persons)
+    if n == 0:
+        # No persons at all — use previous slot memory or full-frame fallback
+        if prev_slots and prev_slots[0] is not None:
+            group_a, group_b = prev_slots
+        else:
+            group_a, group_b = None, None
+    elif n == 1:
+        # Only one person detected — put them top, reuse prev bottom if available
+        group_a = persons
+        group_b = prev_slots[1] if prev_slots and prev_slots[1] is not None else persons
+    else:
+        # 2+ persons: split evenly; left half → top strip, right half → bottom strip
+        split = max(1, n // 2)
+        group_a = persons[:split]
+        group_b = persons[split:]
+
+    # ── 3. Compute per-strip dimensions ───────────────────────────────────
+    # Each strip is full output width; heights split at midpoint (even pixel)
+    strip_h_a = (out_h // 2) & ~1   # even
+    strip_h_b = out_h - strip_h_a   # remainder (may differ by 2px)
+    strip_w   = out_w
+
+    # ── 4. Render each strip ──────────────────────────────────────────────
+    top_strip    = _crop_group_to_strip(frame, group_a or [], strip_w, strip_h_a)
+    bottom_strip = _crop_group_to_strip(frame, group_b or [], strip_w, strip_h_b)
+
+    # ── 5. Composite into output canvas ───────────────────────────────────
+    canvas = np.empty((out_h, out_w, 3), dtype=np.uint8)
+    canvas[0:strip_h_a, :] = top_strip
+    canvas[strip_h_a:strip_h_a + strip_h_b, :] = bottom_strip
+
+    # Thin divider line between panels
+    div_y1 = max(0, strip_h_a - PANEL_DIVIDER_PX // 2)
+    div_y2 = min(out_h, strip_h_a + (PANEL_DIVIDER_PX + 1) // 2)
+    canvas[div_y1:div_y2, :] = PANEL_DIVIDER_COLOR
+
+    return canvas, [group_a, group_b]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -884,7 +1017,7 @@ def process_video(
     start_pct=0.10; model_obj=None
     if tracking_mode=="subject":
         _p(start_pct,"🤖 Loading YOLO model…")
-        model_obj=_get_model(yolo_weights)   # returns None if unavailable
+        model_obj=_get_model(yolo_weights)
         if model_obj is None:
             _p(start_pct,"⚠️ YOLO unavailable — using saliency tracking")
     elif tracking_mode=="talking_head":
@@ -892,29 +1025,16 @@ def process_video(
         if _get_haar() is None and _load_face_net() is None:
             _p(start_pct,"⚠️ No face detector — using saliency tracking")
 
-    # ── Panel mode probe (lightweight — 8 spot-reads only) ───────────────
+    # ── Panel mode probe ──────────────────────────────────────────────────
     is_panel=False
     if tracking_mode=="subject" and model_obj is not None:
         _p(start_pct+0.01,"👥 Checking for panel/group shot…")
         is_panel=_detect_panel_mode(input_path,model_obj,fps,total_frames,orig_w,orig_h,confidence,n_probe=8)
         if is_panel:
-            _p(start_pct+0.02,"🖥️ Panel Discussion mode — split-screen grid")
+            _p(start_pct+0.02,"🖥️ Panel Discussion mode — 2-row vertical split")
             result_meta["panel_mode"]=True
 
-    # ─────────────────────────────────────────────────────────────────────
-    #  SINGLE-PASS: detect + render in one decode loop.
-    #
-    #  Strategy:
-    #    • Decode full-res once via FFmpegVideoReader.
-    #    • Every sample_interval frames: downscale in-memory → detect → store anchor.
-    #    • Between sample frames: interpolate from last two anchors on-the-fly
-    #      (cheap linear blend) so the crop never jumps.
-    #    • After smoothing is computed (from sparse anchors), apply it per-frame.
-    #    • Pipe each full-res crop directly to the FFmpeg encoder — no second decode.
-    #
-    #  This halves wall-clock time vs the old two-pass approach.
-    # ─────────────────────────────────────────────────────────────────────
-
+    # ── Single-pass detect + render ───────────────────────────────────────
     _p(0.12,f"🎬 Single-pass detect+render ({total_frames} frames)…")
     style=SUBTITLE_STYLES.get(subtitle_style_name,SUBTITLE_STYLES["Bold White (TikTok)"])
     proc=_open_ffmpeg_encoder(output_path,target_w,target_h,render_fps,
@@ -925,11 +1045,10 @@ def process_video(
     det_centers=[]; det_indices=[]; scene_cuts=[]
     prev_gray=None; prev_flow=None
     last_det=None; det_dropout=0; MAX_DROPOUT=int(fps*1.5)
-    # Running crop-center: interpolated on-the-fly from last two anchors
     cur_cx=orig_w//2; cur_cy=orig_h//2
-    prev_anchor=None   # (fi, cx, cy)
+    prev_anchor=None
     hw,hh=crop_w//2,crop_h//2
-    prev_slots=None    # panel mode slot memory
+    prev_slots=None    # panel: [group_a, group_b] from previous frame
 
     rpt_n=max(1,total_frames//40); fi=0
 
@@ -938,14 +1057,11 @@ def process_video(
             for frame in reader:
                 if fi>=total_frames: break
 
-                # ── Detection (every sample_interval frames) ──────────────
                 is_sample=(fi%sample_interval==0)
                 if is_sample:
-                    # Downscale for detection — fast, no extra FFmpeg process
                     det_frame=cv2.resize(frame,(det_w,det_h),interpolation=cv2.INTER_LINEAR)
                     cg=cv2.cvtColor(det_frame,cv2.COLOR_BGR2GRAY)
 
-                    # Scene change detection
                     if is_scene_change(prev_gray,cg,scene_cut_threshold):
                         scene_cuts.append(fi); prev_flow=None; det_dropout=0
                     prev_gray=cg
@@ -953,7 +1069,7 @@ def process_video(
                     anchor_cx=anchor_cy=None
 
                     if is_panel:
-                        pass   # panel renders frame-by-frame below
+                        pass  # panel handled below per-frame
                     elif tracking_mode=="talking_head":
                         faces=detect_faces(det_frame,confidence_thresh=0.5)
                         if faces:
@@ -967,7 +1083,6 @@ def process_video(
                                 if fc: anchor_cx,anchor_cy=int(fc[0]*2*sx),int(fc[1]*2*sy)
                             prev_flow=sm; det_dropout+=sample_interval
                     else:
-                        # Subject tracking: YOLO → optical flow → last det → saliency
                         if model_obj is not None:
                             det=detect_subjects(det_frame,model_obj,confidence)
                             if det is not None:
@@ -994,11 +1109,9 @@ def process_video(
                         prev_anchor=(fi,anchor_cx,anchor_cy)
                         cur_cx,cur_cy=anchor_cx,anchor_cy
 
-                # ── On-the-fly linear interpolation between anchors ────────
-                # (gives smooth motion without waiting for the full path)
+                # On-the-fly linear interpolation between anchors
                 if not is_panel and not is_sample and prev_anchor is not None and len(det_centers)>=2:
                     fi_a,cx_a,cy_a=prev_anchor
-                    # blend toward anchor based on distance
                     t_since=fi-fi_a
                     alpha=min(1.0,t_since/sample_interval)
                     cur_cx=int(cx_a*(1-alpha)+det_centers[-1][0]*alpha) if len(det_centers)>1 else cx_a
@@ -1009,14 +1122,26 @@ def process_video(
 
                 # ── Render ────────────────────────────────────────────────
                 if is_panel:
-                    persons=(detect_persons_all(
-                                cv2.resize(frame,(det_w,det_h),interpolation=cv2.INTER_LINEAR),
-                                model_obj,confidence)
-                             if is_sample else
-                             [s for s in (prev_slots or []) if s is not None])
-                    # scale person boxes back to full res for render
-                    persons_full=[(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy)) for x1,y1,x2,y2 in persons]
-                    out_frame,prev_slots=_render_panel_frame(frame,persons_full,target_w,target_h,prev_slots)
+                    # Detect persons on sample frames; reuse prev_slots on non-samples
+                    if is_sample:
+                        det_frame_panel = cv2.resize(
+                            frame, (det_w, det_h), interpolation=cv2.INTER_LINEAR)
+                        persons_det = detect_persons_all(det_frame_panel, model_obj, confidence)
+                        # Scale boxes back to full-res
+                        persons_full = [
+                            (int(x1*sx), int(y1*sy), int(x2*sx), int(y2*sy))
+                            for x1, y1, x2, y2 in persons_det
+                        ]
+                    else:
+                        # Reuse last known person boxes (already in full-res coords)
+                        if prev_slots and prev_slots[0] is not None:
+                            persons_full = [b for grp in prev_slots if grp for b in grp]
+                        else:
+                            persons_full = []
+
+                    out_frame, prev_slots = _render_panel_frame(
+                        frame, persons_full, target_w, target_h, prev_slots)
+
                 else:
                     left=max(0,min(cur_cx-crop_w//2,orig_w-crop_w))
                     top =max(0,min(cur_cy-crop_h//2,orig_h-crop_h))
@@ -1037,9 +1162,6 @@ def process_video(
     _p(0.88,"🎵 Encoding…")
     _close_ffmpeg_encoder(proc,output_path)
 
-    # ── Post-pass: apply full smoothing to stored anchors for quality ─────
-    # (the render above used fast linear interp; we now log what was used
-    #  so callers can see anchor quality — actual output is already written)
     _p(1.0,"✅ Done!")
     print(f"✅  {output_path}  ({os.path.getsize(output_path)/1024**2:.1f} MB)"
           f"  anchors={len(det_centers)}  cuts={len(scene_cuts)}",file=sys.stderr)
