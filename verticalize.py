@@ -83,19 +83,38 @@ TRANSLATION_LANGUAGES = {
 VIGNETTE_STRENGTH  = 0.55
 VIGNETTE_FALLOFF   = 1.8
 COLOR_GRADES       = ("none","warm","cool","vibrant","matte")
-PANEL_SLOT_EMA     = 0.18          # smoother (lower = more inertia)
+PANEL_SLOT_EMA     = 0.15          # lower = more temporal inertia (less jitter)
 KEN_BURNS_MAX_ZOOM = 1.04
 KEN_BURNS_PERIOD   = 8.0
 DISSOLVE_FRAMES    = 3
 PANEL_DIVIDER_PX   = 4
 PANEL_DIVIDER_COLOR= (10,10,10)
 
-# Panel crop tuning — how many times wider than the union bbox to include
-# 1.0 = tight on the people, 1.6 = include some context on each side
-# How much to expand person height for the crop window.
-# 1.8 = person body + comfortable headroom above + some body below.
-# Larger = wider shot / more context. Smaller = tighter face crop.
-PANEL_CROP_EXPAND  = 1.80
+# Crop expand: person_height * PANEL_CROP_EXPAND = source window height.
+# 1.9 = comfortable upper-body + headroom; increase for more context.
+PANEL_CROP_EXPAND  = 1.9
+
+# ── Adaptive Layout System ─────────────────────────────────────────────────────
+# Per-frame speaker count drives layout selection — no single global mode.
+# LAYOUT_SINGLE   : 0-1 speakers  → standard single-subject tracking crop
+# LAYOUT_DUO      : 2 clearly separated → 50/50 top-bottom, each tightly
+#                   zoomed on one speaker upper-body & face
+# LAYOUT_TRIO_MAIN: 3 speakers → 60 % top (most-centred / largest speaker)
+#                   + two equal bands bottom (remaining two speakers)
+# LAYOUT_WIDE     : 4+ speakers, or speakers that span full frame width →
+#                   single smart wide crop centred on the group union
+LAYOUT_SINGLE    = "single"
+LAYOUT_DUO       = "duo"
+LAYOUT_TRIO_MAIN = "trio"
+LAYOUT_WIDE      = "wide"
+
+# Hysteresis: once a layout is committed, hold it for at least this many
+# frames before switching — prevents flicker on borderline detections.
+LAYOUT_HYSTERESIS_FRAMES = 45   # ~1.5 s at 30 fps
+
+# Minimum fraction of probed frames that must show N persons to commit to
+# a multi-person layout during the pre-flight probe.
+LAYOUT_PROBE_MIN_FRAC    = 0.40
 
 # How far (seconds) to search around a clip edge for a clean scene cut
 CLIP_BOUNDARY_SEARCH_SEC = 3.0
@@ -503,269 +522,401 @@ def talking_head_center(faces,orig_w,orig_h,crop_w,crop_h,bias=0.30):
     return cx,max(hh,min(cy,orig_h-hh))
 
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# FIX-P1/P2: Panel Discussion — rewritten for correct horizontal-band output
+# Adaptive Layout Engine  (replaces fixed panel mode)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _group_union(persons):
-    """Return bounding union of a list of (x1,y1,x2,y2) boxes."""
+    """Bounding union of a list of (x1,y1,x2,y2) boxes."""
     return (min(p[0] for p in persons), min(p[1] for p in persons),
             max(p[2] for p in persons), max(p[3] for p in persons))
 
 
-def _split_persons_by_position(persons, frame_w):
+def _filter_persons(persons, fw, fh, min_w_frac=0.04, min_h_frac=0.10):
+    """Remove tiny / degenerate detections."""
+    return [(x1,y1,x2,y2) for x1,y1,x2,y2 in persons
+            if (x2-x1) > fw*min_w_frac and (y2-y1) > fh*min_h_frac]
+
+
+def _classify_layout(persons, fw, fh):
     """
-    Split detected persons into LEFT and RIGHT groups based on their
-    horizontal center relative to the frame midpoint.
+    Given filtered persons (full-frame coords), choose the best layout.
 
-    Returns (group_left, group_right).  Each may be empty.
+    Rules
+    ─────
+    0-1 person  → LAYOUT_SINGLE
+    2 persons, centres separated by > 12 % of frame width → LAYOUT_DUO
+    3 persons   → LAYOUT_TRIO_MAIN
+    4+ persons, OR persons spanning > 80 % of frame width → LAYOUT_WIDE
+    Otherwise (2 overlapping / ambiguous) → LAYOUT_SINGLE (safe fallback)
     """
-    mid = frame_w / 2
-    left  = [p for p in persons if (p[0]+p[2])/2 <= mid]
-    right = [p for p in persons if (p[0]+p[2])/2 >  mid]
-    return left, right
+    n = len(persons)
+    if n == 0 or n == 1:
+        return LAYOUT_SINGLE
+    if n >= 4:
+        return LAYOUT_WIDE
+    # Sort left→right by centre-x
+    persons_s = sorted(persons, key=lambda p: (p[0]+p[2])//2)
+    if n == 2:
+        cx0 = (persons_s[0][0]+persons_s[0][2]) / 2
+        cx1 = (persons_s[1][0]+persons_s[1][2]) / 2
+        if (cx1 - cx0) > fw * 0.12:
+            return LAYOUT_DUO
+        return LAYOUT_SINGLE          # two people too close → treat as one group
+    if n == 3:
+        # If all three span more than 80 % of frame width → wide
+        ux1 = min(p[0] for p in persons_s)
+        ux2 = max(p[2] for p in persons_s)
+        if (ux2 - ux1) > fw * 0.80:
+            return LAYOUT_WIDE
+        return LAYOUT_TRIO_MAIN
+    return LAYOUT_SINGLE
 
 
-def _crop_band_for_group(
-    frame, group, out_w, out_h,
-    expand=PANEL_CROP_EXPAND,
-    vignette_strength=0.0,
-    color_grade="none",
-):
+def _probe_dominant_layout(input_path, model, fps, total_frames,
+                            orig_w, orig_h, confidence=0.45, n_probe=18):
     """
-    Produce a strip of size (out_w × out_h) zoomed tightly onto `group`.
+    Sample n_probe frames and return the layout that appears most often.
+    Used once at the start to decide whether to enter a multi-speaker mode.
+    Returns one of the LAYOUT_* constants.
+    """
+    if model is None:
+        return LAYOUT_SINGLE
+    sw = 640; sh = max(1, int(640 * orig_h / orig_w))
+    sx = orig_w / sw; sy = orig_h / sh
+    probe_ts = np.linspace(1.0, max(1.5, total_frames / fps - 1.0), n_probe)
+    counts = {LAYOUT_SINGLE: 0, LAYOUT_DUO: 0,
+              LAYOUT_TRIO_MAIN: 0, LAYOUT_WIDE: 0}
+    for t in probe_ts:
+        frame = _read_frame_at(input_path, orig_w, orig_h, t, scale_w=sw, scale_h=sh)
+        if frame is None:
+            continue
+        raw = detect_persons_all(frame, model, confidence)
+        # Filter in scaled space, then scale up for layout classification
+        raw = _filter_persons(raw, sw, sh)
+        persons_full = [(int(x1*sx), int(y1*sy), int(x2*sx), int(y2*sy))
+                        for x1, y1, x2, y2 in raw]
+        layout = _classify_layout(persons_full, orig_w, orig_h)
+        counts[layout] += 1
+    # Commit to multi-speaker layout only if it appears often enough
+    best = max(counts, key=counts.get)
+    if best == LAYOUT_SINGLE or counts[best] >= n_probe * LAYOUT_PROBE_MIN_FRAC:
+        return best
+    return LAYOUT_SINGLE
 
-    Algorithm:
-      1. Person bbox union → person_h, person_w, centre (ucx, ucy).
-      2. src_h = person_h * expand  (height drives zoom)
-      3. src_w = src_h * (out_w / out_h)  (enforce strip aspect ratio)
-      4. Clamp src_w to at most (person_w * expand * 1.5) so the crop
-         doesn't drift far from the person horizontally.
-      5. If clamping src_w forced it smaller, recompute src_h from src_w.
-      6. Centre crop on (ucx, ucy - head_bias), clamp to frame edges.
-      7. Resize to (out_w, out_h).
 
-    If group is empty: centre crop of full frame at strip ratio.
+# ── Per-strip tight crop ───────────────────────────────────────────────────────
+
+def _tight_crop_for_group(frame, group, out_w, out_h,
+                           expand=PANEL_CROP_EXPAND,
+                           vignette_strength=0.0, color_grade="none"):
+    """
+    Crop and resize `frame` to (out_w × out_h) tightly zoomed on `group`.
+
+    Height of the source window = person_height * expand.
+    Width  of the source window = src_h * (out_w / out_h)  [preserve ratio].
+    Width is additionally capped at person_width * 1.9 so the crop stays
+    on the person's side of the frame and does not bleed into other speakers.
+
+    Empty group → centred full-frame fallback.
     """
     fh, fw = frame.shape[:2]
-    ratio = out_w / out_h   # e.g. 9/8 ≈ 1.125 for a half-height strip
+    ratio = out_w / out_h          # strip aspect ratio
 
     if not group:
         src_h = fh
         src_w = min(fw, int(src_h * ratio))
-        x0 = (fw - src_w) // 2
-        y0 = 0
+        x0, y0 = (fw - src_w) // 2, 0
     else:
         ux1, uy1, ux2, uy2 = _group_union(group)
-        person_h = max(uy2 - uy1, 1)
-        person_w = max(ux2 - ux1, 1)
+        ph = max(uy2 - uy1, 1)
+        pw = max(ux2 - ux1, 1)
         ucx = (ux1 + ux2) // 2
         ucy = (uy1 + uy2) // 2
 
-        # --- Height-driven zoom ---
-        src_h = int(person_h * expand)
-
-        # --- Width from aspect ratio ---
+        # Height-driven zoom
+        src_h = int(ph * expand)
+        # Width from aspect ratio
         src_w = int(src_h * ratio)
-
-        # --- Key constraint: don't let src_w be much wider than the person.
-        #     This stops the crop from spanning the whole frame and showing
-        #     the OTHER group's side. Cap at ~1.8× person width. ---
-        max_src_w = int(person_w * 1.8)
-        if src_w > max_src_w and max_src_w > 4:
+        # Cap width so we don't bleed past the person's horizontal region
+        max_src_w = int(pw * 1.9)
+        if src_w > max_src_w > 4:
             src_w = max_src_w
-            # Recompute height to maintain ratio
             src_h = int(src_w / ratio)
 
-        # --- Clamp to frame ---
         src_h = max(min(src_h, fh), 4)
         src_w = max(min(src_w, fw), 4)
-
-        # Rebalance to exact ratio after clamping
+        # Re-enforce ratio after clamping
         if src_w / max(src_h, 1) > ratio:
             src_h = max(int(src_w / ratio), 4)
         else:
             src_w = max(int(src_h * ratio), 4)
-        src_h = min(src_h, fh)
-        src_w = min(src_w, fw)
+        src_h = min(src_h, fh); src_w = min(src_w, fw)
 
-        # --- Position: centre on person with slight upward head-room bias ---
+        # Slight upward bias for headroom
         head_bias = int(src_h * 0.08)
-        cx = ucx
-        cy = ucy - head_bias
+        x0 = max(0, min(int(ucx - src_w / 2), fw - src_w))
+        y0 = max(0, min(int(ucy - head_bias - src_h / 2), fh - src_h))
 
-        x0 = int(cx - src_w / 2)
-        y0 = int(cy - src_h / 2)
-        x0 = max(0, min(x0, fw - src_w))
-        y0 = max(0, min(y0, fh - src_h))
-
-    x1 = min(x0 + src_w, fw)
-    y1 = min(y0 + src_h, fh)
-    x0 = max(0, x1 - src_w)
-    y0 = max(0, y1 - src_h)
+    x1 = min(x0 + src_w, fw); y1 = min(y0 + src_h, fh)
+    x0 = max(0, x1 - src_w);  y0 = max(0, y1 - src_h)
 
     crop = frame[y0:y1, x0:x1]
     if crop.size == 0:
         crop = frame
-
     result = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
-
     if color_grade and color_grade != "none":
         result = apply_color_grade(result, color_grade)
     if vignette_strength > 0:
         result = apply_vignette(result, vignette_strength)
-
     return result
 
 
-class PanelSlotSmoother:
+def _wide_crop_for_group(frame, group, out_w, out_h,
+                          vignette_strength=0.0, color_grade="none"):
     """
-    ENH-5 (rewritten): Independent EMA smoothers for LEFT and RIGHT slots.
+    Wide crop that frames the entire group with context (used for 4+ speakers
+    or when persons span most of the frame).  Keeps the group centred and
+    crops to the output aspect ratio.
+    """
+    fh, fw = frame.shape[:2]
+    ratio = out_w / out_h
 
-    Smooths the union bounding-box of each group so crops don't jitter
-    frame-to-frame.  Lower alpha = more inertia.
+    if not group:
+        ucx, ucy = fw // 2, fh // 2
+        pw, ph   = fw, fh
+    else:
+        ux1, uy1, ux2, uy2 = _group_union(group)
+        ucx = (ux1 + ux2) // 2
+        ucy = (uy1 + uy2) // 2
+        pw  = max(ux2 - ux1, 1)
+        ph  = max(uy2 - uy1, 1)
+
+    # Fill the frame height, centred on group
+    src_h = min(int(ph * 1.35), fh)
+    src_w = min(int(src_h * ratio), fw)
+    if src_w / max(src_h, 1) < ratio:
+        src_h = max(int(src_w / ratio), 4)
+
+    src_h = max(min(src_h, fh), 4)
+    src_w = max(min(src_w, fw), 4)
+
+    head_bias = int(src_h * 0.06)
+    x0 = max(0, min(int(ucx - src_w / 2), fw - src_w))
+    y0 = max(0, min(int(ucy - head_bias - src_h / 2), fh - src_h))
+    x1 = min(x0 + src_w, fw); y1 = min(y0 + src_h, fh)
+    x0 = max(0, x1 - src_w);  y0 = max(0, y1 - src_h)
+
+    crop = frame[y0:y1, x0:x1]
+    if crop.size == 0:
+        crop = frame
+    result = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+    if color_grade and color_grade != "none":
+        result = apply_color_grade(result, color_grade)
+    if vignette_strength > 0:
+        result = apply_vignette(result, vignette_strength)
+    return result
+
+
+def _assemble_strips(strips, out_w, out_h):
     """
-    def __init__(self, alpha=PANEL_SLOT_EMA):
+    Stack `strips` (list of np.ndarray each already out_w wide) vertically
+    with PANEL_DIVIDER_PX black lines between them.  Total height is forced
+    to out_h by scaling the last strip if needed.
+    """
+    div = PANEL_DIVIDER_PX
+    n   = len(strips)
+    total_div = div * (n - 1)
+    avail_h   = out_h - total_div
+    # Allocate height proportionally (equal shares for now)
+    heights   = [avail_h // n] * n
+    heights[-1] += avail_h - sum(heights)          # remainder to last strip
+    heights = [(h & ~1) for h in heights]          # force even
+
+    canvas = np.empty((out_h, out_w, 3), dtype=np.uint8)
+    y = 0
+    for i, (strip, h) in enumerate(zip(strips, heights)):
+        if strip.shape[0] != h or strip.shape[1] != out_w:
+            strip = cv2.resize(strip, (out_w, h), interpolation=cv2.INTER_LINEAR)
+        canvas[y:y+h, :] = strip
+        y += h
+        if i < n - 1:
+            canvas[y:y+div, :] = PANEL_DIVIDER_COLOR
+            y += div
+    if y < out_h:
+        canvas[y:, :] = PANEL_DIVIDER_COLOR
+    return canvas
+
+
+# ── EMA slot smoother for multi-speaker layouts ───────────────────────────────
+
+class LayoutSlotSmoother:
+    """
+    Smooths bounding boxes for up to `max_slots` person slots independently
+    using EMA.  Returns smoothed synthetic single-box group lists.
+    """
+    def __init__(self, max_slots=3, alpha=PANEL_SLOT_EMA):
         self.alpha = alpha
-        self._slots = [None, None]   # [left_bbox, right_bbox]
+        self._slots = [None] * max_slots
 
     def _ema(self, prev, new_box):
         if prev is None:
             return new_box
         a = self.alpha
-        return tuple(prev[i] * (1 - a) + new_box[i] * a for i in range(4))
+        return tuple(prev[i]*(1-a) + new_box[i]*a for i in range(4))
 
-    def update(self, group_left, group_right):
+    def smooth(self, groups):
         """
-        Smooth each group's union bbox and return synthetic single-person
-        group lists that encode the smoothed bbox.
+        groups: list of lists-of-boxes, one per slot.
+        Returns list of smoothed single-box group lists.
         """
-        def _smooth(slot_idx, group):
+        out = []
+        for i, group in enumerate(groups):
+            if i >= len(self._slots):
+                out.append(group)
+                continue
             if not group:
-                return group  # Nothing to smooth; caller handles empty group
+                out.append(group)
+                continue
             u = _group_union(group)
-            s = self._ema(self._slots[slot_idx], u)
-            self._slots[slot_idx] = s
-            # Return as a single synthetic bbox (the smoothed union)
-            return [tuple(int(v) for v in s)]
-
-        return _smooth(0, group_left), _smooth(1, group_right)
+            s = self._ema(self._slots[i], u)
+            self._slots[i] = s
+            out.append([tuple(int(v) for v in s)])
+        return out
 
 
-def _detect_panel_mode(input_path, model, fps, total_frames, orig_w, orig_h,
-                       confidence=0.45, n_probe=16):
+# ── Main adaptive render function ──────────────────────────────────────────────
+
+class LayoutState:
     """
-    Probe n_probe frames. Return True only if ALL of:
-      • ≥50 % of probed frames have ≥2 distinct persons
-      • ≥30 % of probed frames have persons on BOTH sides of the frame midpoint
-      • The two groups are spatially separated enough (gap > 5 % of frame width)
-
-    Detections are done in scaled space and split tested in THAT same space
-    (not orig coords) so the midpoint is correct.
+    Tracks the current committed layout and enforces hysteresis so we don't
+    flicker between layouts on consecutive frames.
     """
-    if model is None:
-        return False
-    sw = 640; sh = max(1, int(640 * orig_h / orig_w))
-    probe_ts = np.linspace(1.0, max(1.5, total_frames / fps - 1.0), n_probe)
-    hits = 0
-    both_sides = 0
-    for t in probe_ts:
-        frame = _read_frame_at(input_path, orig_w, orig_h, t, scale_w=sw, scale_h=sh)
-        if frame is None:
-            continue
-        persons = detect_persons_all(frame, model, confidence)
-        # Filter tiny boxes (noise / partial detections)
-        persons = [(x1,y1,x2,y2) for x1,y1,x2,y2 in persons
-                   if (x2-x1) > sw*0.05 and (y2-y1) > sh*0.10]
-        if len(persons) >= PANEL_MIN_PERSONS:
-            hits += 1
-            # Split in SCALED space (frame is sw×sh here)
-            gl, gr = _split_persons_by_position(persons, sw)
-            if gl and gr:
-                # Require meaningful horizontal separation between the groups
-                gl_cx = sum((p[0]+p[2])//2 for p in gl) / len(gl)
-                gr_cx = sum((p[0]+p[2])//2 for p in gr) / len(gr)
-                if (gr_cx - gl_cx) > sw * 0.10:
-                    both_sides += 1
-    return hits > n_probe * 0.5 and both_sides > n_probe * 0.3
+    def __init__(self):
+        self.current   = LAYOUT_SINGLE
+        self._locked   = 0           # frames remaining in hysteresis lock
+        self.smoother  = LayoutSlotSmoother(max_slots=3)
+        self.prev_groups = []        # last known groups for fallback
+
+    def update(self, proposed, frame_idx):
+        if self._locked > 0:
+            self._locked -= 1
+            return self.current
+        if proposed != self.current:
+            self.current = proposed
+            self._locked = LAYOUT_HYSTERESIS_FRAMES
+        return self.current
 
 
-def _render_panel_frame(
-    frame, persons, out_w, out_h,
-    prev_slots=None,
-    vignette_strength=VIGNETTE_STRENGTH * 0.7,
-    color_grade="none",
-    slot_smoother=None,
-):
+def render_adaptive_frame(frame, persons_full, out_w, out_h,
+                           layout_state,
+                           vignette_strength=VIGNETTE_STRENGTH*0.7,
+                           color_grade="none",
+                           frame_idx=0):
     """
-    Render a panel frame:
-      • persons is a list of (x1,y1,x2,y2) in FULL-FRAME coordinates.
-      • Sort persons left→right by bbox centre-x.
-      • Split at frame midpoint into LEFT group and RIGHT group.
-      • Each group → one tightly-zoomed horizontal band (out_w × strip_h).
-      • Stack: top=left-group, bottom=right-group, with thin divider.
+    Main per-frame renderer.  Decides layout, smooths bboxes, composes strips.
 
-    Fallback rules (in order):
-      1. If a side has no person this frame, reuse that slot from prev_slots.
-      2. If BOTH sides empty (no detection at all), duplicate the single
-         fallback bbox but crop different vertical halves.
-      3. If prev_slots also empty, use a centre full-frame crop for both.
-
-    Returns (canvas, [group_left, group_right]).
+    persons_full  : list of (x1,y1,x2,y2) in FULL-FRAME coordinates
+    layout_state  : LayoutState instance (mutated in-place)
+    Returns       : (out_frame np.ndarray [out_h×out_w×3], layout_name str)
     """
     fh, fw = frame.shape[:2]
+    persons_full = _filter_persons(persons_full, fw, fh)
 
-    # ── Filter tiny/degenerate boxes ─────────────────────────────────────
-    persons = [(x1,y1,x2,y2) for x1,y1,x2,y2 in persons
-               if (x2-x1) > fw*0.04 and (y2-y1) > fh*0.08]
+    # ── Classify frame ─────────────────────────────────────────────────────
+    proposed = _classify_layout(persons_full, fw, fh)
+    layout   = layout_state.update(proposed, frame_idx)
 
-    # ── Assign to left / right by frame midpoint ──────────────────────────
-    group_left, group_right = _split_persons_by_position(persons, fw)
+    # ── Sort persons left→right for consistent slot assignment ─────────────
+    persons_s = sorted(persons_full, key=lambda p: (p[0]+p[2])//2)
 
-    # ── Fallback: fill empty slots from previous detections ───────────────
-    if not group_left and prev_slots and prev_slots[0]:
-        group_left = prev_slots[0]
-    if not group_right and prev_slots and prev_slots[1]:
-        group_right = prev_slots[1]
+    # ── Fallback: if we have no detections use last known groups ───────────
+    if not persons_s and layout_state.prev_groups:
+        persons_s = [b for g in layout_state.prev_groups for b in g]
 
-    # ── If still only one side has people, use them for both but DON'T
-    #    crop identically — use full-frame context for the missing side ────
-    # (this case means panel mode was triggered but this frame is a cut-away;
-    #  just use whatever we have and let EMA smooth it out)
+    # ── Build group list per layout ────────────────────────────────────────
+    if layout == LAYOUT_SINGLE or len(persons_s) == 0:
+        groups = [persons_s] if persons_s else [[]]
+
+    elif layout == LAYOUT_DUO:
+        # Two speakers: split at the natural gap between the two largest persons
+        # (sort by cx, split at first gap > 10 % frame width)
+        split = len(persons_s) // 2
+        for k in range(1, len(persons_s)):
+            cx_prev = (persons_s[k-1][0]+persons_s[k-1][2]) / 2
+            cx_cur  = (persons_s[k][0]+persons_s[k][2]) / 2
+            if (cx_cur - cx_prev) > fw * 0.10:
+                split = k; break
+        groups = [persons_s[:split], persons_s[split:]]
+
+    elif layout == LAYOUT_TRIO_MAIN:
+        # Three speakers:
+        # Identify the "main" speaker = one closest to frame horizontal centre
+        frame_cx = fw / 2
+        main_idx = min(range(len(persons_s)),
+                       key=lambda i: abs((persons_s[i][0]+persons_s[i][2])/2 - frame_cx))
+        main  = [persons_s[main_idx]]
+        rest  = [p for i, p in enumerate(persons_s) if i != main_idx]
+        # Sort rest left→right and split evenly
+        rest  = sorted(rest, key=lambda p: (p[0]+p[2])//2)
+        mid   = len(rest) // 2 or 1
+        groups = [main, rest[:mid], rest[mid:]]   # [main, left-side, right-side]
+
+    else:  # LAYOUT_WIDE
+        groups = [persons_s]   # render as one wide group
 
     # ── Apply EMA smoothing ────────────────────────────────────────────────
-    if slot_smoother:
-        group_left, group_right = slot_smoother.update(group_left, group_right)
+    groups = layout_state.smoother.smooth(groups)
+    layout_state.prev_groups = groups
 
-    # ── Compute strip heights (must be even, divider between them) ────────
-    div_px      = PANEL_DIVIDER_PX
-    strip_h_top = ((out_h - div_px) // 2) & ~1
-    strip_h_bot = out_h - strip_h_top - div_px
-    strip_h_bot = max(strip_h_bot & ~1, 2)
+    # ── Render strips ──────────────────────────────────────────────────────
+    kw = dict(vignette_strength=vignette_strength, color_grade=color_grade)
 
-    # ── Render each band with tight zoom on its group ─────────────────────
-    top = _crop_band_for_group(
-        frame, group_left,  out_w, strip_h_top,
-        vignette_strength=vignette_strength,
-        color_grade=color_grade,
-    )
-    bot = _crop_band_for_group(
-        frame, group_right, out_w, strip_h_bot,
-        vignette_strength=vignette_strength,
-        color_grade=color_grade,
-    )
+    if layout == LAYOUT_SINGLE:
+        # Standard single-person wide crop
+        out_frame = _wide_crop_for_group(frame, groups[0], out_w, out_h, **kw)
 
-    # ── Assemble canvas ───────────────────────────────────────────────────
-    canvas = np.empty((out_h, out_w, 3), dtype=np.uint8)
-    canvas[0:strip_h_top, :]                                        = top
-    canvas[strip_h_top:strip_h_top + div_px, :]                     = PANEL_DIVIDER_COLOR
-    canvas[strip_h_top + div_px:strip_h_top + div_px + strip_h_bot, :] = bot
-    used = strip_h_top + div_px + strip_h_bot
-    if used < out_h:
-        canvas[used:, :] = PANEL_DIVIDER_COLOR
+    elif layout == LAYOUT_DUO:
+        # Top strip = left speaker, bottom strip = right speaker
+        # Each strip is out_w × (out_h//2) then assembled
+        div       = PANEL_DIVIDER_PX
+        sh_top    = ((out_h - div) // 2) & ~1
+        sh_bot    = out_h - sh_top - div
+        top = _tight_crop_for_group(frame, groups[0], out_w, sh_top, **kw)
+        bot = _tight_crop_for_group(frame, groups[1], out_w, sh_bot, **kw)
+        out_frame = _assemble_strips([top, bot], out_w, out_h)
 
-    return canvas, [group_left, group_right]
+    elif layout == LAYOUT_TRIO_MAIN:
+        # Top 60 % = main speaker (tightly zoomed)
+        # Bottom 40 % split into two equal strips for the other two
+        div       = PANEL_DIVIDER_PX
+        sh_main   = int((out_h - 2*div) * 0.60) & ~1
+        sh_side   = ((out_h - sh_main - 2*div) // 2) & ~1
+        main_strip  = _tight_crop_for_group(frame, groups[0], out_w, sh_main, **kw)
+        side_l      = _tight_crop_for_group(frame, groups[1] if len(groups)>1 else [],
+                                             out_w, sh_side, **kw)
+        side_r      = _tight_crop_for_group(frame, groups[2] if len(groups)>2 else [],
+                                             out_w, sh_side, **kw)
+        # Side strips go side-by-side in the bottom half
+        bottom_w = out_w // 2
+        sl = cv2.resize(side_l, (bottom_w, sh_side), interpolation=cv2.INTER_LINEAR)
+        sr = cv2.resize(side_r, (out_w - bottom_w, sh_side), interpolation=cv2.INTER_LINEAR)
+        bottom_row = np.concatenate([sl, sr], axis=1)
 
+        canvas = np.empty((out_h, out_w, 3), dtype=np.uint8)
+        y = 0
+        canvas[y:y+sh_main, :] = main_strip;  y += sh_main
+        canvas[y:y+div, :]     = PANEL_DIVIDER_COLOR; y += div
+        canvas[y:y+sh_side, :] = bottom_row;  y += sh_side
+        if y < out_h:
+            canvas[y:, :] = PANEL_DIVIDER_COLOR
+        out_frame = canvas
+
+    else:  # LAYOUT_WIDE
+        out_frame = _wide_crop_for_group(frame, groups[0], out_w, out_h, **kw)
+
+    return out_frame, layout
 
 # ── Optical flow / saliency ───────────────────────────────────────────────────
 def optical_flow_center(prev,curr,w,h):
@@ -1237,110 +1388,154 @@ def process_video(
         _p(start_pct,"Loading face detector...")
         if _get_haar() is None and _load_face_net() is None: _p(start_pct,"No face detector - saliency fallback")
 
-    is_panel=False; slot_smoother=None
-    if tracking_mode=="subject" and model_obj is not None:
-        _p(start_pct+0.01,"Checking panel/group shot...")
-        is_panel=_detect_panel_mode(input_path,model_obj,fps,total_frames,orig_w,orig_h,confidence,n_probe=12)
-        if is_panel:
-            _p(start_pct+0.02,"Panel mode — left/right horizontal band split")
-            result_meta["panel_mode"]=True
-            slot_smoother=PanelSlotSmoother()
+    # ── Adaptive layout engine — probe dominant layout once up-front ─────────
+    layout_state = LayoutState()
+    dominant_layout = LAYOUT_SINGLE
+    persons_cache   = []   # most-recent full-frame person detections
 
-    extra_vf=_build_ffmpeg_vf(color_grade="none" if not is_panel else color_grade,ffmpeg_sharpen=ffmpeg_sharpen)
-    _p(0.12,f"Single-pass detect+render ({total_frames} frames)...")
-    style=SUBTITLE_STYLES.get(subtitle_style_name,SUBTITLE_STYLES["Bold White (TikTok)"])
-    proc=_open_ffmpeg_encoder(output_path,target_w,target_h,render_fps,audio_source=input_path,
-                               crf=crf,preset=encoder_preset,audio_bitrate=audio_bitrate,
-                               subtitle_path=srt_path,subtitle_style=style,
-                               extra_vf=extra_vf if extra_vf else None)
-    if vignette_strength>0: _build_vignette(target_w,target_h,vignette_strength)
-    if color_grade and color_grade!="none": _build_lut(color_grade)
-    dissolve_buf=DissolveBuffer(DISSOLVE_FRAMES) if dissolve_cuts else None
+    if tracking_mode == "subject" and model_obj is not None:
+        _p(start_pct+0.01, "Probing scene layout...")
+        dominant_layout = _probe_dominant_layout(
+            input_path, model_obj, fps, total_frames,
+            orig_w, orig_h, confidence, n_probe=18,
+        )
+        layout_state.current = dominant_layout
+        result_meta["panel_mode"] = dominant_layout != LAYOUT_SINGLE
+        _p(start_pct+0.02, f"Dominant layout: {dominant_layout}")
+
+    extra_vf = _build_ffmpeg_vf(color_grade=color_grade, ffmpeg_sharpen=ffmpeg_sharpen)
+    _p(0.12, f"Single-pass detect+render ({total_frames} frames)  layout={dominant_layout}")
+    style = SUBTITLE_STYLES.get(subtitle_style_name, SUBTITLE_STYLES["Bold White (TikTok)"])
+    proc = _open_ffmpeg_encoder(
+        output_path, target_w, target_h, render_fps, audio_source=input_path,
+        crf=crf, preset=encoder_preset, audio_bitrate=audio_bitrate,
+        subtitle_path=srt_path, subtitle_style=style,
+        extra_vf=extra_vf if extra_vf else None,
+    )
+    if vignette_strength > 0: _build_vignette(target_w, target_h, vignette_strength)
+    if color_grade and color_grade != "none": _build_lut(color_grade)
+    dissolve_buf = DissolveBuffer(DISSOLVE_FRAMES) if dissolve_cuts else None
 
     det_centers=[]; det_indices=[]; scene_cuts=[]
     prev_gray=None; prev_flow=None
     last_det=None; det_dropout=0; MAX_DROPOUT=int(fps*1.5)
     cur_cx=orig_w//2; cur_cy=orig_h//2; prev_anchor=None
-    hw,hh=crop_w//2,crop_h//2; prev_slots=None; last_out_frame=None
+    hw,hh=crop_w//2,crop_h//2; last_out_frame=None
     rpt_n=max(1,total_frames//40); fi=0
 
     try:
-        with FFmpegVideoReader(input_path,orig_w,orig_h) as reader:
+        with FFmpegVideoReader(input_path, orig_w, orig_h) as reader:
             for frame in reader:
-                if fi>=total_frames: break
-                is_sample=(fi%sample_interval==0)
+                if fi >= total_frames: break
+                is_sample = (fi % sample_interval == 0)
+
                 if is_sample:
-                    det_frame=cv2.resize(frame,(det_w,det_h),interpolation=cv2.INTER_LINEAR)
-                    cg=cv2.cvtColor(det_frame,cv2.COLOR_BGR2GRAY)
-                    cut=is_scene_change(prev_gray,cg,scene_cut_threshold)
+                    det_frame = cv2.resize(frame, (det_w,det_h), interpolation=cv2.INTER_LINEAR)
+                    cg = cv2.cvtColor(det_frame, cv2.COLOR_BGR2GRAY)
+                    cut = is_scene_change(prev_gray, cg, scene_cut_threshold)
                     if cut:
                         scene_cuts.append(fi); prev_flow=None; det_dropout=0
-                        if dissolve_buf and last_out_frame is not None: dissolve_buf.on_cut(last_out_frame)
-                    prev_gray=cg; anchor_cx=anchor_cy=None
-                    if is_panel:
-                        pass  # panel rendering handled below
-                    elif tracking_mode=="talking_head":
-                        faces=detect_faces(det_frame,confidence_thresh=0.5)
+                        if dissolve_buf and last_out_frame is not None:
+                            dissolve_buf.on_cut(last_out_frame)
+                    prev_gray = cg
+
+                    # ── Detect persons every sample ────────────────────────
+                    if tracking_mode == "subject" and model_obj is not None:
+                        raw_dets = detect_persons_all(det_frame, model_obj, confidence)
+                        persons_cache = [(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy))
+                                         for x1,y1,x2,y2 in raw_dets]
+
+                    # ── Single-subject tracking anchor ─────────────────────
+                    anchor_cx = anchor_cy = None
+                    if tracking_mode == "talking_head":
+                        faces = detect_faces(det_frame, confidence_thresh=0.5)
                         if faces:
-                            faces_orig=[(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy)) for x1,y1,x2,y2 in faces]
-                            r=talking_head_center(faces_orig,orig_w,orig_h,crop_w,crop_h,talking_head_bias)
+                            faces_orig = [(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy))
+                                          for x1,y1,x2,y2 in faces]
+                            r = talking_head_center(faces_orig, orig_w, orig_h, crop_w, crop_h, talking_head_bias)
                             if r: anchor_cx,anchor_cy=r; det_dropout=0
                         if anchor_cx is None and use_optical_flow:
-                            sm=cv2.resize(cg,(max(1,det_w//2),max(1,det_h//2)))
+                            sm = cv2.resize(cg, (max(1,det_w//2),max(1,det_h//2)))
                             if prev_flow is not None:
-                                fc=optical_flow_center(prev_flow,sm,det_w//2,det_h//2)
+                                fc = optical_flow_center(prev_flow, sm, det_w//2, det_h//2)
                                 if fc: anchor_cx,anchor_cy=int(fc[0]*2*sx),int(fc[1]*2*sy)
                             prev_flow=sm; det_dropout+=sample_interval
-                    else:
-                        if model_obj is not None:
-                            det=detect_subjects(det_frame,model_obj,confidence)
+                    elif tracking_mode == "subject":
+                        if persons_cache:
+                            # Use union of all detected persons for single-subject anchor
+                            det = detect_subjects(det_frame, model_obj, confidence)
                             if det is not None:
-                                anchor_cx,anchor_cy=frame_for_union(int(det.ux1*sx),int(det.uy1*sy),
-                                    int(det.ux2*sx),int(det.uy2*sy),orig_w,orig_h,crop_w,crop_h)
+                                anchor_cx,anchor_cy = frame_for_union(
+                                    int(det.ux1*sx),int(det.uy1*sy),
+                                    int(det.ux2*sx),int(det.uy2*sy),
+                                    orig_w, orig_h, crop_w, crop_h)
                                 last_det=(anchor_cx,anchor_cy); det_dropout=0
                         if anchor_cx is None and use_optical_flow:
-                            sm=cv2.resize(cg,(max(1,det_w//2),max(1,det_h//2)))
+                            sm = cv2.resize(cg, (max(1,det_w//2),max(1,det_h//2)))
                             if prev_flow is not None:
-                                fc=optical_flow_center(prev_flow,sm,det_w//2,det_h//2)
+                                fc = optical_flow_center(prev_flow, sm, det_w//2, det_h//2)
                                 if fc: anchor_cx,anchor_cy=int(fc[0]*2*sx),int(fc[1]*2*sy)
                             prev_flow=sm; det_dropout+=sample_interval
                         if anchor_cx is None:
                             if last_det and det_dropout<MAX_DROPOUT: anchor_cx,anchor_cy=last_det
                             else:
-                                sc_=saliency_center(det_frame); anchor_cx,anchor_cy=int(sc_[0]*sx),int(sc_[1]*sy)
-                    if anchor_cx is not None and not is_panel:
+                                sc_ = saliency_center(det_frame)
+                                anchor_cx,anchor_cy=int(sc_[0]*sx),int(sc_[1]*sy)
+
+                    if anchor_cx is not None:
                         det_centers.append((anchor_cx,anchor_cy)); det_indices.append(fi)
                         prev_anchor=(fi,anchor_cx,anchor_cy); cur_cx,cur_cy=anchor_cx,anchor_cy
 
-                if not is_panel and not is_sample and prev_anchor is not None and len(det_centers)>=2:
+                # ── Interpolate camera position between samples ─────────────
+                if not is_sample and prev_anchor is not None and len(det_centers)>=2:
                     fi_a,cx_a,cy_a=prev_anchor; alpha=min(1.0,(fi-fi_a)/sample_interval)
                     cur_cx=int(cx_a*(1-alpha)+det_centers[-1][0]*alpha)
                     cur_cy=int(cy_a*(1-alpha)+det_centers[-1][1]*alpha)
                 cur_cx=max(hw,min(cur_cx,orig_w-hw)); cur_cy=max(hh,min(cur_cy,orig_h-hh))
 
-                if is_panel:
-                    if is_sample:
-                        # Detect persons at detection resolution, scale back to full
-                        det_frame_p=cv2.resize(frame,(det_w,det_h),interpolation=cv2.INTER_LINEAR)
-                        persons_det=detect_persons_all(det_frame_p,model_obj,confidence)
-                        persons_full=[(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy))
-                                      for x1,y1,x2,y2 in persons_det]
-                    else:
-                        # Between samples: reuse last slot groups as person proxies
-                        persons_full=[b for grp in (prev_slots or []) if grp for b in grp]
-                    out_frame,prev_slots=_render_panel_frame(
-                        frame, persons_full, target_w, target_h, prev_slots,
+                # ══ Render frame using adaptive layout engine ═══════════════
+                active_layout = layout_state.current
+
+                # Multi-speaker layouts (DUO / TRIO / WIDE) — always use person cache
+                if tracking_mode == "subject" and model_obj is not None and                         active_layout != LAYOUT_SINGLE:
+                    # On non-sample frames reuse cache (cheap)
+                    pf = persons_cache if is_sample else                          [b for g in layout_state.prev_groups for b in g]
+                    out_frame, active_layout = render_adaptive_frame(
+                        frame, pf, target_w, target_h,
+                        layout_state=layout_state,
                         vignette_strength=vignette_strength*0.7,
                         color_grade=color_grade,
-                        slot_smoother=slot_smoother,
+                        frame_idx=fi,
                     )
+
+                # Single-subject (or subject mode that resolved to SINGLE)
                 else:
-                    left=max(0,min(cur_cx-crop_w//2,orig_w-crop_w))
-                    top=max(0,min(cur_cy-crop_h//2,orig_h-crop_h))
-                    crop=frame[top:top+crop_h,left:left+crop_w]
-                    if crop.shape[1]!=target_w or crop.shape[0]!=target_h:
-                        crop=cv2.resize(crop,(target_w,target_h),interpolation=cv2.INTER_LANCZOS4)
-                    out_frame=crop
+                    # Try adaptive render first (handles layout transitions)
+                    if tracking_mode == "subject" and model_obj is not None:
+                        pf = persons_cache if is_sample else                              [b for g in layout_state.prev_groups for b in g]
+                        out_frame, active_layout = render_adaptive_frame(
+                            frame, pf, target_w, target_h,
+                            layout_state=layout_state,
+                            vignette_strength=vignette_strength*0.7,
+                            color_grade=color_grade,
+                            frame_idx=fi,
+                        )
+                        # If layout stayed SINGLE, replace with smooth-tracked crop
+                        if active_layout == LAYOUT_SINGLE:
+                            left = max(0, min(cur_cx-crop_w//2, orig_w-crop_w))
+                            top_ = max(0, min(cur_cy-crop_h//2, orig_h-crop_h))
+                            crop = frame[top_:top_+crop_h, left:left+crop_w]
+                            if crop.shape[1]!=target_w or crop.shape[0]!=target_h:
+                                crop = cv2.resize(crop,(target_w,target_h),interpolation=cv2.INTER_LANCZOS4)
+                            out_frame = crop
+                    else:
+                        left = max(0, min(cur_cx-crop_w//2, orig_w-crop_w))
+                        top_ = max(0, min(cur_cy-crop_h//2, orig_h-crop_h))
+                        crop = frame[top_:top_+crop_h, left:left+crop_w]
+                        if crop.shape[1]!=target_w or crop.shape[0]!=target_h:
+                            crop = cv2.resize(crop,(target_w,target_h),interpolation=cv2.INTER_LANCZOS4)
+                        out_frame = crop
+
                     if ken_burns: out_frame=apply_ken_burns(out_frame,fi,fps)
                     if sharpen_strength>0: out_frame=apply_sharpen(out_frame,sharpen_strength)
                     if color_grade and color_grade!="none": out_frame=apply_color_grade(out_frame,color_grade)
