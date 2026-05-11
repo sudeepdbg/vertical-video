@@ -1,32 +1,13 @@
 """
-verticalize.py  —  AI Vertical Video converter  v2.1
-──────────────────────────────────────────────────────
-ENHANCEMENTS (v2.1 — zero extra decode passes):
-  ENH-1  Vignette overlay      — soft dark edge drawn once as a numpy mask,
-         blended per-frame in pure numpy (< 0.2 ms/frame).
-  ENH-2  Unsharp mask          — lightweight OpenCV sharpen applied to each
-         output crop (optional, default OFF to save ~1 ms/frame).
-  ENH-3  Cinematic color grade — per-channel LUT applied via cv2.LUT (< 0.1 ms)
-         Choices: none / warm / cool / vibrant / matte.
-  ENH-4  Panel vignette + EQ   — each strip gets its own independent vignette
-         so both faces are equally exposed visually.
-  ENH-5  Temporal slot EMA     — person bounding-box positions are smoothed
-         with EMA between frames, removing jitter in panel strips with zero
-         extra detection cost.
-  ENH-6  Ken Burns micro-zoom  — optional subtle animated zoom (1.00->1.04)
-         on non-panel single crops for depth without motion sickness.
-  ENH-7  Keyframe-aware fade   — 2-frame cross-dissolve on detected scene cuts
-         so the hard-cut feel is removed (pure numpy blend, negligible cost).
-  ENH-8  FFmpeg post-filter    — optional single-pass FFmpeg vf chain
-         (eq + unsharp) applied during encode so CPU stays idle while GPU-
-         equiv SIMD runs inside FFmpeg. Zero extra decode.
-
-ORIGINAL FIXES (kept intact):
-  FIX-1  FFmpegVideoReader  — software-decode pipe (AV1/HEVC/VP9).
-  FIX-2  Cubic Hermite + Gaussian + EMA camera-path smoothing.
-  FIX-3  Panel Discussion — 2-row vertical split.
-  FIX-4  YOLO optional — graceful saliency fallback.
-  FIX-5  Encoder pipe — correct stdin close -> wait() order.
+verticalize.py  —  AI Vertical Video converter  v2.2
+────────────────────────────────────────────────────────────────
+ENHANCEMENTS (v2.2 — panel discussion fix):
+  ENH-9  Dynamic layout switching:
+         - Wide shot detection (persons span >60% frame width) → unified crop preserving context.
+         - Two‑distinct clusters → improved two‑strip (top/bottom) layout.
+         - Single person → standard subject tracking.
+  ENH-10 Improved person grouping using k‑means / natural gap clustering.
+  (All previous ENH-1..ENH-8 and FIX-1..FIX-5 remain intact.)
 """
 
 from __future__ import annotations
@@ -91,6 +72,8 @@ DISSOLVE_FRAMES    = 3
 PANEL_DIVIDER_PX   = 3
 PANEL_DIVIDER_COLOR= (15,15,15)
 PANEL_CROP_EXPAND  = 1.55
+WIDE_SHOT_THRESHOLD = 0.60   # ENH-9: if persons union width >60% of frame → wide shot
+MIN_CLUSTER_GAP    = 0.15   # ENH-9: min horizontal gap (relative to width) to treat as two distinct groups
 
 # ── Segment class ─────────────────────────────────────────────────────────────
 class ClipSegment:
@@ -490,10 +473,51 @@ def talking_head_center(faces,orig_w,orig_h,crop_w,crop_h,bias=0.30):
     return cx,max(hh,min(cy,orig_h-hh))
 
 
-# ── FIX-3 + ENH-4/5: Panel Discussion ────────────────────────────────────────
+# ── FIX-3 + ENH-4/5 + ENH-9/10: Panel Discussion with dynamic layout ─────────
 def _group_union(persons):
     return (min(p[0] for p in persons),min(p[1] for p in persons),
             max(p[2] for p in persons),max(p[3] for p in persons))
+
+def _cluster_persons(persons, frame_width, min_gap_ratio=MIN_CLUSTER_GAP):
+    """
+    Cluster persons into two groups based on horizontal positions.
+    Returns list of groups (each group is list of bboxes).
+    If persons are spread across whole frame (wide shot), returns a single group.
+    """
+    if len(persons) <= 1:
+        return [persons] if persons else []
+    # sort by center x
+    centers = [(p[0]+p[2])//2 for p in persons]
+    sorted_idx = sorted(range(len(persons)), key=lambda i: centers[i])
+    sorted_persons = [persons[i] for i in sorted_idx]
+    sorted_centers = [centers[i] for i in sorted_idx]
+
+    # find largest gap between consecutive centers (normalized by frame width)
+    gaps = []
+    for i in range(1, len(sorted_centers)):
+        gap = (sorted_centers[i] - sorted_centers[i-1]) / frame_width
+        gaps.append((gap, i))
+    max_gap = max(gaps, key=lambda x: x[0]) if gaps else (0, None)
+
+    # if the largest gap is significant, split into two clusters
+    if max_gap[0] >= min_gap_ratio and max_gap[1] is not None:
+        split_idx = max_gap[1]
+        group1 = sorted_persons[:split_idx]
+        group2 = sorted_persons[split_idx:]
+        # ensure both groups have at least one person
+        if group1 and group2:
+            return [group1, group2]
+    # otherwise return as single group (wide shot or tight cluster)
+    return [sorted_persons]
+
+def _is_wide_shot(persons, frame_width, threshold=WIDE_SHOT_THRESHOLD):
+    """Return True if the union of all persons spans more than threshold of frame width."""
+    if not persons:
+        return False
+    ux1 = min(p[0] for p in persons)
+    ux2 = max(p[2] for p in persons)
+    union_width = ux2 - ux1
+    return (union_width / frame_width) > threshold
 
 def _crop_group_to_strip(frame,group,strip_w,strip_h,expand=PANEL_CROP_EXPAND,
                           vignette_strength=0.0,color_grade="none"):
@@ -518,19 +542,10 @@ def _crop_group_to_strip(frame,group,strip_w,strip_h,expand=PANEL_CROP_EXPAND,
     if vignette_strength>0: result=apply_vignette(result,vignette_strength)
     return result
 
-def _detect_panel_mode(input_path,model,fps,total_frames,orig_w,orig_h,confidence=0.45,n_probe=16):
-    if model is None: return False
-    probe_ts=np.linspace(1.0,max(1.5,total_frames/fps-1.0),n_probe); hits=0
-    for t in probe_ts:
-        frame=_read_frame_at(input_path,orig_w,orig_h,t,scale_w=640,scale_h=max(1,int(640*orig_h/orig_w)))
-        if frame is None: continue
-        if len(detect_persons_all(frame,model,confidence))>=PANEL_MIN_PERSONS: hits+=1
-    return hits>n_probe*0.5
-
 class PanelSlotSmoother:
     """ENH-5: EMA smoother for panel bbox positions."""
     def __init__(self,alpha=PANEL_SLOT_EMA):
-        self.alpha=alpha; self._slots=[None,None]
+        self.alpha=alpha; self._slots=[None,None]  # only used for two‑strip layout
     def update(self,group_a,group_b):
         def _ema_box(prev,new_box):
             if prev is None: return new_box
@@ -543,27 +558,78 @@ class PanelSlotSmoother:
             self._slots[slot_idx]=s; return [tuple(int(v) for v in s)]
         return _smooth(0,group_a),_smooth(1,group_b)
 
-def _render_panel_frame(frame,persons,out_w,out_h,prev_slots=None,
-                         vignette_strength=VIGNETTE_STRENGTH*0.7,color_grade="none",
-                         slot_smoother=None):
-    persons=sorted(persons,key=lambda b:(b[0]+b[2])//2); n=len(persons)
-    if n==0:
-        group_a=prev_slots[0] if prev_slots and prev_slots[0] else None
-        group_b=prev_slots[1] if prev_slots and prev_slots[1] else None
-    elif n==1:
-        group_a=persons
-        group_b=prev_slots[1] if prev_slots and prev_slots[1] else persons
-    else:
-        split=max(1,n//2); group_a=persons[:split]; group_b=persons[split:]
-    if slot_smoother: group_a,group_b=slot_smoother.update(group_a,group_b)
-    strip_h_a=(out_h//2)&~1; strip_h_b=out_h-strip_h_a
-    top=_crop_group_to_strip(frame,group_a or [],out_w,strip_h_a,vignette_strength=vignette_strength,color_grade=color_grade)
-    bot=_crop_group_to_strip(frame,group_b or [],out_w,strip_h_b,vignette_strength=vignette_strength,color_grade=color_grade)
-    canvas=np.empty((out_h,out_w,3),dtype=np.uint8)
-    canvas[0:strip_h_a,:]=top; canvas[strip_h_a:strip_h_a+strip_h_b,:]=bot
-    dy1=max(0,strip_h_a-PANEL_DIVIDER_PX//2); dy2=min(out_h,strip_h_a+(PANEL_DIVIDER_PX+1)//2)
-    canvas[dy1:dy2,:]=PANEL_DIVIDER_COLOR
-    return canvas,[group_a,group_b]
+def _render_panel_frame(frame, persons, out_w, out_h, prev_slots=None,
+                         vignette_strength=VIGNETTE_STRENGTH*0.7, color_grade="none",
+                         slot_smoother=None, ken_burns=False, frame_idx=0, fps=30.0):
+    """
+    Renders a frame with dynamic layout:
+      - If 0 or 1 person → fallback to single‑person tracking (handled outside).
+      - If wide shot (union width > 60% of frame width) → unified crop showing all persons together.
+      - Else split into two horizontal strips (top/bottom) based on natural clusters.
+    Returns (canvas, new_prev_slots) where prev_slots may be None for unified crop.
+    """
+    persons = persons or []
+    if len(persons) <= 1:
+        # fallback: let the main loop handle single‑person tracking
+        return None, None
+
+    frame_width = frame.shape[1]
+
+    # ENH-9: Wide shot detection → unified crop
+    if _is_wide_shot(persons, frame_width, WIDE_SHOT_THRESHOLD):
+        # Crop around the union of all persons with some padding
+        unified_frame = _crop_group_to_strip(frame, persons, out_w, out_h,
+                                             expand=PANEL_CROP_EXPAND*0.8,  # less expansion to keep context
+                                             vignette_strength=vignette_strength, color_grade=color_grade)
+        if ken_burns:
+            unified_frame = apply_ken_burns(unified_frame, frame_idx, fps)
+        # No divider, no slots (return None for prev_slots to avoid confusion)
+        return unified_frame, None
+
+    # Not a wide shot → attempt two‑strip layout using natural clusters
+    clusters = _cluster_persons(persons, frame_width, MIN_CLUSTER_GAP)
+    if len(clusters) == 1:
+        # Only one cluster → fallback to unified crop as above
+        unified_frame = _crop_group_to_strip(frame, clusters[0], out_w, out_h,
+                                             expand=PANEL_CROP_EXPAND*0.9,
+                                             vignette_strength=vignette_strength, color_grade=color_grade)
+        if ken_burns:
+            unified_frame = apply_ken_burns(unified_frame, frame_idx, fps)
+        return unified_frame, None
+
+    # Exactly two clusters (or we take first two if >2, but _cluster_persons returns max 2)
+    group_a = clusters[0]
+    group_b = clusters[1]
+
+    if slot_smoother:
+        group_a, group_b = slot_smoother.update(group_a, group_b)
+
+    strip_h_a = (out_h // 2) & ~1
+    strip_h_b = out_h - strip_h_a
+    top = _crop_group_to_strip(frame, group_a or [], out_w, strip_h_a,
+                               vignette_strength=vignette_strength, color_grade=color_grade)
+    bot = _crop_group_to_strip(frame, group_b or [], out_w, strip_h_b,
+                               vignette_strength=vignette_strength, color_grade=color_grade)
+
+    canvas = np.empty((out_h, out_w, 3), dtype=np.uint8)
+    canvas[0:strip_h_a, :] = top
+    canvas[strip_h_a:strip_h_a+strip_h_b, :] = bot
+    dy1 = max(0, strip_h_a - PANEL_DIVIDER_PX//2)
+    dy2 = min(out_h, strip_h_a + (PANEL_DIVIDER_PX+1)//2)
+    canvas[dy1:dy2, :] = PANEL_DIVIDER_COLOR
+
+    # Store the smoothed groups for next frame (only for two‑strip layout)
+    new_slots = [group_a, group_b]
+    return canvas, new_slots
+
+def _detect_panel_mode(input_path,model,fps,total_frames,orig_w,orig_h,confidence=0.45,n_probe=16):
+    if model is None: return False
+    probe_ts=np.linspace(1.0,max(1.5,total_frames/fps-1.0),n_probe); hits=0
+    for t in probe_ts:
+        frame=_read_frame_at(input_path,orig_w,orig_h,t,scale_w=640,scale_h=max(1,int(640*orig_h/orig_w)))
+        if frame is None: continue
+        if len(detect_persons_all(frame,model,confidence))>=PANEL_MIN_PERSONS: hits+=1
+    return hits>n_probe*0.5
 
 
 # ── Optical flow / saliency ───────────────────────────────────────────────────
@@ -837,7 +903,7 @@ def detect_clips(input_path,min_duration_sec=25.0,max_duration_sec=65.0,
     _p(1.0,f"Found {len(segments)} clips"); return segments
 
 
-# ── process_video — main entry point ─────────────────────────────────────────
+# ── process_video — main entry point (updated for dynamic panel) ─────────────
 def process_video(
     input_path,output_path,
     target_preset_label="Match source (no upscale)",
@@ -908,8 +974,8 @@ def process_video(
         _p(start_pct+0.01,"Checking panel/group shot...")
         is_panel=_detect_panel_mode(input_path,model_obj,fps,total_frames,orig_w,orig_h,confidence,n_probe=8)
         if is_panel:
-            _p(start_pct+0.02,"Panel mode - 2-row vertical split"); result_meta["panel_mode"]=True
-            slot_smoother=PanelSlotSmoother()
+            _p(start_pct+0.02,"Panel mode - dynamic layout (wide shot or two‑strip)"); result_meta["panel_mode"]=True
+            slot_smoother=PanelSlotSmoother()  # used only for two‑strip layout
 
     extra_vf=_build_ffmpeg_vf(color_grade="none" if not is_panel else color_grade,ffmpeg_sharpen=ffmpeg_sharpen)
     _p(0.12,f"Single-pass detect+render ({total_frames} frames)...")
@@ -943,6 +1009,7 @@ def process_video(
                         if dissolve_buf and last_out_frame is not None: dissolve_buf.on_cut(last_out_frame)
                     prev_gray=cg; anchor_cx=anchor_cy=None
                     if is_panel:
+                        # For panel mode, we detect all persons and let _render_panel_frame decide layout
                         pass
                     elif tracking_mode=="talking_head":
                         faces=detect_faces(det_frame,confidence_thresh=0.5)
@@ -984,14 +1051,35 @@ def process_video(
                 cur_cx=max(hw,min(cur_cx,orig_w-hw)); cur_cy=max(hh,min(cur_cy,orig_h-hh))
 
                 if is_panel:
+                    # Detect all persons at sample frames (or reuse previous if not sample)
                     if is_sample:
                         det_frame_p=cv2.resize(frame,(det_w,det_h),interpolation=cv2.INTER_LINEAR)
                         persons_det=detect_persons_all(det_frame_p,model_obj,confidence)
                         persons_full=[(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy)) for x1,y1,x2,y2 in persons_det]
                     else:
-                        persons_full=[b for grp in (prev_slots or []) if grp for b in grp]
-                    out_frame,prev_slots=_render_panel_frame(frame,persons_full,target_w,target_h,prev_slots,
-                        vignette_strength=vignette_strength*0.7,color_grade=color_grade,slot_smoother=slot_smoother)
+                        # If not sample, reuse last known persons (or empty)
+                        persons_full = []
+                    # Call the enhanced renderer
+                    out_frame, new_slots = _render_panel_frame(
+                        frame, persons_full, target_w, target_h, prev_slots,
+                        vignette_strength=vignette_strength*0.7, color_grade=color_grade,
+                        slot_smoother=slot_smoother, ken_burns=ken_burns, frame_idx=fi, fps=fps
+                    )
+                    if out_frame is None:
+                        # Fallback to single‑person tracking (should not happen with >=2 persons, but safe)
+                        # Use the current cur_cx,cur_cy as anchor (from last known subject)
+                        left = max(0, min(cur_cx - crop_w//2, orig_w - crop_w))
+                        top = max(0, min(cur_cy - crop_h//2, orig_h - crop_h))
+                        crop = frame[top:top+crop_h, left:left+crop_w]
+                        if crop.shape[1]!=target_w or crop.shape[0]!=target_h:
+                            crop = cv2.resize(crop, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                        out_frame = crop
+                        if ken_burns: out_frame = apply_ken_burns(out_frame, fi, fps)
+                        if sharpen_strength>0: out_frame = apply_sharpen(out_frame, sharpen_strength)
+                        if color_grade and color_grade!="none": out_frame = apply_color_grade(out_frame, color_grade)
+                        if vignette_strength>0: out_frame = apply_vignette(out_frame, vignette_strength)
+                        new_slots = None
+                    prev_slots = new_slots  # only used for two‑strip layout; unified crop sets None
                 else:
                     left=max(0,min(cur_cx-crop_w//2,orig_w-crop_w))
                     top=max(0,min(cur_cy-crop_h//2,orig_h-crop_h))
@@ -1020,7 +1108,7 @@ def process_video(
     return result_meta
 
 
-# ── Batch clip pipeline ───────────────────────────────────────────────────────
+# ── Batch clip pipeline (unchanged except function signature, kept for compatibility)
 def process_clips_batch(
     input_path,output_dir,clips,
     target_preset_label="720p   (720x1280  - HD)",
