@@ -1,48 +1,47 @@
 """
-verticalize.py  —  AI Vertical Video converter  v2.5
+verticalize.py  —  AI Vertical Video converter  v2.6
 ──────────────────────────────────────────────────────
-FIXES in v2.5 (Panel Stability + Render Pipeline):
+FIXES in v2.6 (Panel Close-up Correctness):
 
-  FIX-B1  Deduplicated Render Path (was: dual render_adaptive_frame call):
-           • render_adaptive_frame is now called EXACTLY ONCE per frame.
-           • Previously the "else" branch called it again, updating the
-             EMA smoother twice per frame — primary cause of multi-person jitter.
+  FIX-C1  Probe Supermajority Threshold:
+           • _probe_dominant_layout now requires ≥60% of sampled frames showing
+             a multi-person layout before locking it as dominant.
+           • Previously 40% was enough — a handful of wide shots locked the whole
+             video into DUO_SPLIT even for single-person close-up content.
+           • Probe samples increased from 18 → 24 frames, skipping title-card edges.
 
-  FIX-B2  Stale persons_cache on Inter-frames:
-           • Non-sample frames now pass smoothed prev_groups (not persons_cache)
-             so the layout smoother does not re-evaluate a stale detection set.
+  FIX-C2  Layout/Detection Mismatch Guard in render_adaptive_frame:
+           • If locked layout is DUO_SPLIT or TRIO but fewer persons are detected
+             than required, layout immediately downgrades to SINGLE.
+           • Prevents the "same person duplicated top-and-bottom" artifact.
 
-  FIX-B3  Split Threshold Tuned for Panel Shows:
-           • dist_ratio raised to 0.65 (was 0.55); overlap cap lowered to 0.10.
-           • Prevents false DUO_SPLIT triggers on normally-seated panel members.
+  FIX-C3  LayoutState Person-Count Override:
+           • layout_state.update() now accepts n_persons.
+           • If n_persons ≤ 1 while locked in a multi-person layout, instantly
+             resets to SINGLE (lock cleared), bypassing the hysteresis counter.
 
-  FIX-B4  LayoutState Hysteresis Applied Before Commit:
-           • Lock is set BEFORE the new layout is written, eliminating the
-             1-frame flash that preceded every layout transition.
+  FIX-C4  Empty-Group Placeholder in _tight_crop_for_group:
+           • Empty group no longer returns a center crop identical to the filled
+             strip — returns a dark blurred placeholder instead, making a
+             mismatch visually obvious rather than silently wrong.
 
-  FIX-B5  StablePanelSmoother Slot Cleanup on Count Decrease:
-           • Slots beyond the current count are now cleared (set to None) when
-             a person drops, preventing stale-position spikes on re-entry.
+  FIX-C5  Hysteresis Reduced 60 → 20 Frames:
+           • 60 frames = 2 full seconds of layout lock, far too long for news
+             panels that cut every 1-3 seconds. 20 frames (~0.67s) debounces
+             detection noise without freezing through an entire close-up shot.
 
-  FIX-B6  Inter-frame Interpolation Alpha Fixed:
-           • Alpha now uses det_indices[-2] as reference rather than the
-             EMA-shifted prev_anchor frame index, eliminating overshoot > 1.0.
-
-  FIX-B7  TRIO Active-Speaker Selection:
-           • Main strip now shows the largest-bbox person (most prominent /
-             likely speaker), not the geometric-center person.
-
-  FIX-B8  Post-effects Applied to All Render Paths:
-           • ken_burns, sharpen, color_grade, vignette now run after EVERY
-             render path including multi-layout (was missing for DUO/TRIO/WIDE).
+Inherited from v2.5 (Render Pipeline):
+  FIX-B1  Deduplicated render path (single render_adaptive_frame call)
+  FIX-B2  Stale persons_cache fix on inter-frames
+  FIX-B3  Split threshold tuned (dist_ratio 0.65, overlap 0.10)
+  FIX-B4  Hysteresis lock applied before layout commit
+  FIX-B5  StablePanelSmoother slot cleanup on count decrease
+  FIX-B6  Inter-frame interpolation alpha overshoot fix
+  FIX-B7  TRIO active-speaker = largest bbox, not geometric center
+  FIX-B8  Post-effects applied to all render paths
 
 Inherited from v2.4 (Stability Engine):
-  FIX-S1  Robust Split Detection (overlap ratio + center distance)
-  FIX-S2  Active Speaker Hysteresis (holds if score > 85% of new max)
-  FIX-S3  Double Smoothing Pipeline (TargetSmoother → CropAnchor EMA)
-  FIX-S4  Velocity Clamp (hard 8 px/frame limit in CropAnchor)
-  FIX-S5  Persistent Slot History (no reset on detection drop)
-  FIX-S6  Stable Duo Framing (conservative bias for wide shots)
+  FIX-S1..S6  Double smoother, velocity clamp, persistent slots, duo framing
 """
 
 from __future__ import annotations
@@ -115,7 +114,7 @@ LAYOUT_DUO_WIDE  = "duo_wide"
 LAYOUT_TRIO      = "trio"
 LAYOUT_WIDE      = "wide"
 
-LAYOUT_HYSTERESIS_FRAMES = 60   
+LAYOUT_HYSTERESIS_FRAMES = 20   # FIX-C5: was 60 (2s). 20 frames (~0.67s) is enough debounce without locking through a full close-up shot
 LAYOUT_PROBE_MIN_FRAC    = 0.40
 
 CLIP_BOUNDARY_SEARCH_SEC = 3.0
@@ -588,13 +587,20 @@ def _classify_layout(persons, fw, fh):
 
 
 def _probe_dominant_layout(input_path, model, fps, total_frames,
-                            orig_w, orig_h, confidence=0.45, n_probe=18):
+                            orig_w, orig_h, confidence=0.45, n_probe=24):
+    """
+    FIX-C1: Requires a strong supermajority (60%) of probed frames showing
+    a multi-person layout before committing.  News panels intercut close-ups
+    constantly; unless >=60% of sampled frames show 2+ people, we stay SINGLE
+    and let per-frame hysteresis handle individual wide shots.
+    """
     if model is None: return LAYOUT_SINGLE
     sw = 640; sh = max(1, int(640 * orig_h / orig_w))
     sx = orig_w / sw; sy = orig_h / sh
-    probe_ts = np.linspace(1.0, max(1.5, total_frames / fps - 1.0), n_probe)
+    dur = total_frames / max(fps, 1)
+    probe_ts = np.linspace(max(2.0, dur * 0.05), max(3.0, dur * 0.95), n_probe)
     counts = {LAYOUT_SINGLE: 0, LAYOUT_DUO_SPLIT: 0, LAYOUT_DUO_WIDE: 0, LAYOUT_TRIO: 0, LAYOUT_WIDE: 0}
-    
+
     for t in probe_ts:
         frame = _read_frame_at(input_path, orig_w, orig_h, t, scale_w=sw, scale_h=sh)
         if frame is None: continue
@@ -603,10 +609,13 @@ def _probe_dominant_layout(input_path, model, fps, total_frames,
         persons_full = [(int(x1*sx), int(y1*sy), int(x2*sx), int(y2*sy)) for x1, y1, x2, y2 in raw]
         layout = _classify_layout(persons_full, orig_w, orig_h)
         counts[layout] += 1
-        
-    best = max(counts, key=counts.get)
-    if best == LAYOUT_SINGLE or counts[best] >= n_probe * LAYOUT_PROBE_MIN_FRAC:
-        return best
+
+    total_probed = max(sum(counts.values()), 1)
+    best_multi = max((l for l in counts if l != LAYOUT_SINGLE), key=counts.get)
+
+    # Only commit to multi-layout if it appears in >=60% of probed frames
+    if counts[best_multi] / total_probed >= 0.60:
+        return best_multi
     return LAYOUT_SINGLE
 
 
@@ -615,12 +624,15 @@ def _tight_crop_for_group(frame, group, out_w, out_h,
                            expand=PANEL_CROP_EXPAND,
                            vignette_strength=0.0, color_grade="none"):
     fh, fw = frame.shape[:2]
-    ratio = out_w / out_h          
+    ratio = out_w / out_h
 
+    # FIX-C4: Empty group → return a dark blurred placeholder instead of a
+    # center crop that would look identical to the other strip (duplicate-face bug).
     if not group:
-        src_h = fh
-        src_w = min(fw, int(src_h * ratio))
-        x0, y0 = (fw - src_w) // 2, 0
+        placeholder = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+        placeholder = cv2.GaussianBlur(placeholder, (31, 31), 0)
+        placeholder = (placeholder * 0.25).astype(np.uint8)
+        return placeholder
     else:
         ux1, uy1, ux2, uy2 = _group_union(group)
         ph = max(uy2 - uy1, 1)
@@ -849,11 +861,20 @@ class StablePanelSmoother:
 class LayoutState:
     def __init__(self):
         self.current   = LAYOUT_SINGLE
-        self._locked   = 0           
+        self._locked   = 0
         self.smoother  = StablePanelSmoother(max_slots=3)
-        self.prev_groups = []        
+        self.prev_groups = []
 
-    def update(self, proposed, frame_idx):
+    def update(self, proposed, frame_idx, n_persons=None):
+        # FIX-C3: If we're locked in a multi-person layout but the detector
+        # can only see 1 person right now, override immediately to SINGLE so we
+        # don't render a DUO_SPLIT with duplicated crops.
+        if n_persons is not None and n_persons <= 1:
+            if self.current in (LAYOUT_DUO_SPLIT, LAYOUT_TRIO, LAYOUT_WIDE, LAYOUT_DUO_WIDE):
+                self.current = LAYOUT_SINGLE
+                self._locked = 0
+                return LAYOUT_SINGLE
+
         # FIX-B4: Decrement lock first; only consider change when fully unlocked
         if self._locked > 0:
             self._locked -= 1
@@ -889,12 +910,20 @@ def render_adaptive_frame(frame, persons_full, out_w, out_h,
     persons_full = _filter_persons(persons_full, fw, fh)
 
     proposed = _classify_layout(persons_full, fw, fh)
-    layout   = layout_state.update(proposed, frame_idx)
+    layout   = layout_state.update(proposed, frame_idx, n_persons=len(persons_full))
 
     persons_s = sorted(persons_full, key=lambda p: (p[0]+p[2])//2)
 
     if not persons_s and layout_state.prev_groups:
         persons_s = [b for g in layout_state.prev_groups for b in g]
+
+    # FIX-C2: Guard against layout/detection mismatch.
+    # If the locked layout requires N groups but we only have M < N persons,
+    # downgrade gracefully rather than duplicating crops or showing empty strips.
+    if layout == LAYOUT_DUO_SPLIT and len(persons_s) < 2:
+        layout = LAYOUT_SINGLE
+    if layout == LAYOUT_TRIO and len(persons_s) < 2:
+        layout = LAYOUT_SINGLE
 
     # Group Assignment Logic
     if layout == LAYOUT_SINGLE or len(persons_s) == 0:
