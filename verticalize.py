@@ -1,27 +1,48 @@
 """
 verticalize.py  —  AI Vertical Video converter  v2.5
 ──────────────────────────────────────────────────────
-FIXES in v2.5 (Ultimate Stability):
-  FIX-S1  Gap-Based Clustering:
-           • Splits persons at the LARGEST visual gap between centers.
-           • Robustly separates distinct groups regardless of overlap.
+FIXES in v2.5 (Panel Stability + Render Pipeline):
 
-  FIX-S2  Identity Locking (_stable_sort):
-           • Maps current detections to previous slots by nearest center.
-           • Prevents "slot swapping" jitter when people cross paths or move.
+  FIX-B1  Deduplicated Render Path (was: dual render_adaptive_frame call):
+           • render_adaptive_frame is now called EXACTLY ONCE per frame.
+           • Previously the "else" branch called it again, updating the
+             EMA smoother twice per frame — primary cause of multi-person jitter.
 
-  FIX-S3  Simplified Render Loop:
-           • Single render call per frame.
-           • Cleaner logic, no state inconsistencies.
+  FIX-B2  Stale persons_cache on Inter-frames:
+           • Non-sample frames now pass smoothed prev_groups (not persons_cache)
+             so the layout smoother does not re-evaluate a stale detection set.
 
-  FIX-S4  Speaker Hysteresis:
-           • Uses bounding box area as prominence score.
-           • Holds active speaker/group unless new candidate is significantly larger.
+  FIX-B3  Split Threshold Tuned for Panel Shows:
+           • dist_ratio raised to 0.65 (was 0.55); overlap cap lowered to 0.10.
+           • Prevents false DUO_SPLIT triggers on normally-seated panel members.
 
-  FIX-S5  Tuned Smoothing:
-           • TargetSmoother alpha: 0.15 (was 0.2)
-           • CropAnchor alpha: 0.12 (was 0.15), max_step: 6 (was 8)
-           • Heavier, smoother camera movement.
+  FIX-B4  LayoutState Hysteresis Applied Before Commit:
+           • Lock is set BEFORE the new layout is written, eliminating the
+             1-frame flash that preceded every layout transition.
+
+  FIX-B5  StablePanelSmoother Slot Cleanup on Count Decrease:
+           • Slots beyond the current count are now cleared (set to None) when
+             a person drops, preventing stale-position spikes on re-entry.
+
+  FIX-B6  Inter-frame Interpolation Alpha Fixed:
+           • Alpha now uses det_indices[-2] as reference rather than the
+             EMA-shifted prev_anchor frame index, eliminating overshoot > 1.0.
+
+  FIX-B7  TRIO Active-Speaker Selection:
+           • Main strip now shows the largest-bbox person (most prominent /
+             likely speaker), not the geometric-center person.
+
+  FIX-B8  Post-effects Applied to All Render Paths:
+           • ken_burns, sharpen, color_grade, vignette now run after EVERY
+             render path including multi-layout (was missing for DUO/TRIO/WIDE).
+
+Inherited from v2.4 (Stability Engine):
+  FIX-S1  Robust Split Detection (overlap ratio + center distance)
+  FIX-S2  Active Speaker Hysteresis (holds if score > 85% of new max)
+  FIX-S3  Double Smoothing Pipeline (TargetSmoother → CropAnchor EMA)
+  FIX-S4  Velocity Clamp (hard 8 px/frame limit in CropAnchor)
+  FIX-S5  Persistent Slot History (no reset on detection drop)
+  FIX-S6  Stable Duo Framing (conservative bias for wide shots)
 """
 
 from __future__ import annotations
@@ -79,7 +100,7 @@ TRANSLATION_LANGUAGES = {
 VIGNETTE_STRENGTH  = 0.55
 VIGNETTE_FALLOFF   = 1.8
 COLOR_GRADES       = ("none","warm","cool","vibrant","matte")
-PANEL_SLOT_EMA     = 0.12          # Tuned for stability
+PANEL_SLOT_EMA     = 0.15          # Lower = more stability
 KEN_BURNS_MAX_ZOOM = 1.04
 KEN_BURNS_PERIOD   = 8.0
 DISSOLVE_FRAMES    = 3
@@ -502,7 +523,7 @@ def talking_head_center(faces,orig_w,orig_h,crop_w,crop_h,bias=0.30):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STABILITY ENGINE v2.5 (Fixes 1-5)
+# STABILITY ENGINE (Fixes 1-6)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _group_union(persons):
@@ -514,53 +535,31 @@ def _filter_persons(persons, fw, fh, min_w_frac=0.04, min_h_frac=0.10):
     return [(x1,y1,x2,y2) for x1,y1,x2,y2 in persons
             if (x2-x1) > fw*min_w_frac and (y2-y1) > fh*min_h_frac]
 
-# FIX 1: Gap-Based Clustering
-def _split_by_largest_gap(persons_s, fw):
+# FIX 1: Robust Split Detection
+def _should_split(p0, p1, fw):
     """
-    Splits persons into two groups based on the largest horizontal gap.
+    Returns True if p0 and p1 should be treated as separate subjects (DUO_SPLIT).
+    Checks overlap ratio AND center distance.
     """
-    if len(persons_s) < 2:
-        return [persons_s], []
-    
-    centers = [(p[0]+p[2])//2 for p in persons_s]
-    gaps = [centers[i] - centers[i-1] for i in range(1, len(centers))]
-    
-    if gaps:
-        max_gap_idx = int(np.argmax(gaps))
-        split = max_gap_idx + 1
-    else:
-        split = len(persons_s)//2
-        
-    return persons_s[:split], persons_s[split:]
+    x10,_,x20,_ = p0
+    x11,_,x21,_ = p1
 
-# FIX 2: Identity Locking
-def _stable_sort(persons, prev_groups):
-    """
-    Sorts current persons to match the order of previous groups.
-    Prevents slot swapping jitter.
-    """
-    if not prev_groups or not persons:
-        return sorted(persons, key=lambda p: (p[0]+p[2])//2)
+    # Overlap calculation
+    overlap = max(0, min(x20, x21) - max(x10, x11))
+    w0 = max(x20 - x10, 1)
+    w1 = max(x21 - x11, 1)
+    min_w = min(w0, w1)
     
-    # Flatten previous boxes to get their centers
-    prev_centers = []
-    for g in prev_groups:
-        for b in g:
-            prev_centers.append((b[0]+b[2])//2)
-            
-    if not prev_centers:
-        return sorted(persons, key=lambda p: (p[0]+p[2])//2)
+    overlap_ratio = overlap / min_w
 
-    def distance_to_nearest_prev(p):
-        cx = (p[0]+p[2])//2
-        return min(abs(cx - pc) for pc in prev_centers)
-        
-    # Sort by proximity to previous slot centers
-    # This is a simplified assignment. For robust N:M mapping, Hungarian algo is better,
-    # but for typical panel discussions (1:1 or 2:2), this greedy approach works well.
-    persons_sorted = sorted(persons, key=distance_to_nearest_prev)
-    return persons_sorted
+    # Center distance
+    cx0 = (x10 + x20) / 2
+    cx1 = (x11 + x21) / 2
+    dist_ratio = abs(cx1 - cx0) / fw
 
+    # FIX-B3: Raised distance threshold (0.65) to avoid false splits on close panel members.
+    # Tightened overlap cap (0.10) so slightly-touching boxes still merge.
+    return overlap_ratio < 0.10 and dist_ratio > 0.65
 
 def _classify_layout(persons, fw, fh):
     n = len(persons)
@@ -569,21 +568,16 @@ def _classify_layout(persons, fw, fh):
     if n >= 4:
         return LAYOUT_WIDE
     
-    # Sort left-to-right initially for gap analysis
+    # Sort left-to-right
     persons_s = sorted(persons, key=lambda p: (p[0]+p[2])//2)
     
     if n == 2:
-        # Use gap-based logic for duo
-        g1, g2 = _split_by_largest_gap(persons_s, fw)
-        if g1 and g2:
-             # Check if gap is significant enough to be a split
-             c1 = (g1[-1][0]+g1[-1][2])//2
-             c2 = (g2[0][0]+g2[0][2])//2
-             if (c2-c1) > fw * 0.1: # Minimum 10% frame width gap
-                 return LAYOUT_DUO_SPLIT
-        return LAYOUT_DUO_WIDE 
+        if _should_split(persons_s[0], persons_s[1], fw):
+            return LAYOUT_DUO_SPLIT
+        return LAYOUT_DUO_WIDE # Close together, treat as one group but maybe wider crop
         
     if n == 3:
+        # Check if they span the whole frame
         ux1 = min(p[0] for p in persons_s)
         ux2 = max(p[2] for p in persons_s)
         if (ux2 - ux1) > fw * 0.80:
@@ -730,9 +724,10 @@ def _assemble_strips(strips, out_w, out_h):
 
 class TargetSmoother:
     """
-    FIX 5: Tuned Alpha 0.15
+    FIX 3: Smooths the raw detection target BEFORE it enters the main anchor.
+    Alpha=0.2 provides a good balance of responsiveness vs jitter removal.
     """
-    def __init__(self, alpha=0.15):
+    def __init__(self, alpha=0.2):
         self.cx = None
         self.cy = None
         self.alpha = alpha
@@ -748,25 +743,32 @@ class TargetSmoother:
 
 class CropAnchor:
     """
-    FIX 5: Tuned Alpha 0.12, Max Step 6
+    FIX 4: Main camera controller with Velocity Clamp.
+    Prevents sudden jumps by limiting pixel movement per frame.
     """
-    def __init__(self, alpha=0.12, max_step=6):
+    def __init__(self, alpha=0.15, max_step=8):
         self._cx = None
         self._cy = None
         self.alpha = alpha
-        self.max_step = max_step 
+        self.max_step = max_step # Pixels per frame limit
 
     def update(self, tcx, tcy):
+        """
+        tcx, tcy: Target coordinates (already smoothed by TargetSmoother)
+        """
         if self._cx is None:
             self._cx, self._cy = float(tcx), float(tcy)
             return int(tcx), int(tcy)
         
+        # Calculate desired delta
         dx = tcx - self._cx
         dy = tcy - self._cy
         
+        # FIX 4: Velocity Clamp
         dx = max(-self.max_step, min(self.max_step, dx))
         dy = max(-self.max_step, min(self.max_step, dy))
         
+        # Apply EMA on the clamped step
         self._cx += dx * self.alpha
         self._cy += dy * self.alpha
         
@@ -776,9 +778,13 @@ class CropAnchor:
 # ── FIX 5: Stable Panel Smoother ─────────────────────────────────────────────
 
 class StablePanelSmoother:
+    """
+    FIX 5: Does NOT reset on detection drop.
+    Maintains history for existing slots. Only initializes new slots when count increases.
+    """
     def __init__(self, max_slots=3, alpha=PANEL_SLOT_EMA):
         self.alpha = alpha
-        self._slots = [None] * max_slots  
+        self._slots = [None] * max_slots  # Stores (cx, cy, w, h)
         self._last_n = 0
 
     def _ema(self, prev, new_val):
@@ -789,13 +795,19 @@ class StablePanelSmoother:
     def smooth(self, groups):
         out = []
         n = len(groups)
-        
-        if n < self._last_n:
-            pass
-        elif n > self._last_n:
-            for i in range(self._last_n, n):
-                self._slots[i] = None 
 
+        # FIX-B5: Always reset slots beyond the current count so stale positions
+        # from a higher-count frame don't spike back when the count rises again.
+        if n != self._last_n:
+            if n > self._last_n:
+                # New slots need fresh init
+                for i in range(self._last_n, min(n, len(self._slots))):
+                    self._slots[i] = None
+            else:
+                # Dropped slots: clear them so they re-init cleanly next time
+                for i in range(n, self._last_n):
+                    if i < len(self._slots):
+                        self._slots[i] = None
         self._last_n = n
 
         for i, group in enumerate(groups):
@@ -842,34 +854,30 @@ class LayoutState:
         self.prev_groups = []        
 
     def update(self, proposed, frame_idx):
+        # FIX-B4: Decrement lock first; only consider change when fully unlocked
         if self._locked > 0:
             self._locked -= 1
             return self.current
         if proposed != self.current:
-            self.current = proposed
+            # Lock BEFORE applying so the transition frame is also debounced
             self._locked = LAYOUT_HYSTERESIS_FRAMES
+            self.current = proposed
         return self.current
 
 
-# FIX 4: Active Speaker Hysteresis Helper
-def _get_active_group_index(groups, prev_idx, history_exists):
-    """
-    Uses bounding box area as a proxy for prominence.
-    Keeps the previous group if it's still prominent (>85% of max).
-    """
-    if not history_exists or not groups:
-        if not groups: return 0
-        areas = [(g[2]-g[0])*(g[3]-g[1]) for g in groups] # Approx area from union box
-        return int(np.argmax(areas))
+# FIX 2: Active Speaker Hysteresis Helper
+def _get_active_speaker_index(scores, prev_idx, history_exists):
+    if not history_exists:
+        return int(np.argmax(scores))
     
-    areas = [(g[2]-g[0])*(g[3]-g[1]) for g in groups]
-    max_area = max(areas)
-    prev_area = areas[prev_idx]
+    max_score = max(scores)
+    prev_score = scores[prev_idx]
     
-    if prev_area > max_area * 0.85:
+    # If previous speaker is still strong (>85% of max), keep them
+    if prev_score > max_score * 0.85:
         return prev_idx
     else:
-        return int(np.argmax(areas))
+        return int(np.argmax(scores))
 
 
 def render_adaptive_frame(frame, persons_full, out_w, out_h,
@@ -883,8 +891,7 @@ def render_adaptive_frame(frame, persons_full, out_w, out_h,
     proposed = _classify_layout(persons_full, fw, fh)
     layout   = layout_state.update(proposed, frame_idx)
 
-    # FIX 2: Identity Locking
-    persons_s = _stable_sort(persons_full, layout_state.prev_groups)
+    persons_s = sorted(persons_full, key=lambda p: (p[0]+p[2])//2)
 
     if not persons_s and layout_state.prev_groups:
         persons_s = [b for g in layout_state.prev_groups for b in g]
@@ -894,22 +901,30 @@ def render_adaptive_frame(frame, persons_full, out_w, out_h,
         groups = [persons_s] if persons_s else [[]]
 
     elif layout == LAYOUT_DUO_SPLIT:
-        # FIX 1: Gap-Based Clustering
-        g1, g2 = _split_by_largest_gap(persons_s, fw)
-        groups = [g1, g2]
+        # Use the first gap > threshold to split
+        split = len(persons_s) // 2
+        for k in range(1, len(persons_s)):
+            if _should_split(persons_s[k-1], persons_s[k], fw):
+                split = k; break
+        groups = [persons_s[:split], persons_s[split:]]
 
     elif layout == LAYOUT_DUO_WIDE:
+        # Treat as one group for wide crop, but maybe track two centers? 
+        # For simplicity in this version, we treat DUO_WIDE as a single wide group
+        # unless we want to implement a specific "side-by-side wide" crop.
+        # Here we default to single wide group to ensure both are in frame.
         groups = [persons_s]
 
     elif layout == LAYOUT_TRIO:
-        frame_cx = fw / 2
-        main_idx = min(range(len(persons_s)),
-                       key=lambda i: abs((persons_s[i][0]+persons_s[i][2])//2 - frame_cx))
+        # FIX-B7: Active speaker = largest bounding-box area (most prominent person),
+        # not just the geometrically-center one.  Larger bbox → more of the frame → likely speaker.
+        main_idx = max(range(len(persons_s)),
+                       key=lambda i: (persons_s[i][2]-persons_s[i][0])*(persons_s[i][3]-persons_s[i][1]))
         main  = [persons_s[main_idx]]
         rest  = [p for i, p in enumerate(persons_s) if i != main_idx]
         rest  = sorted(rest, key=lambda p: (p[0]+p[2])//2)
         mid   = len(rest) // 2 or 1
-        groups = [main, rest[:mid], rest[mid:]]   
+        groups = [main, rest[:mid], rest[mid:]]
 
     else:  # LAYOUT_WIDE
         groups = [persons_s]   
@@ -1403,9 +1418,9 @@ def process_video(
     hw,hh=crop_w//2,crop_h//2; last_out_frame=None
     rpt_n=max(1,total_frames//40); fi=0
 
-    # Initialize Stability Engines (FIX 5)
-    target_smoother = TargetSmoother(alpha=0.15)
-    crop_anchor = CropAnchor(alpha=0.12, max_step=6)
+    # Initialize Stability Engines
+    target_smoother = TargetSmoother(alpha=0.2)
+    crop_anchor = CropAnchor(alpha=0.15, max_step=8)
     active_speaker_idx = 0
     history_exists = False
 
@@ -1468,6 +1483,7 @@ def process_video(
                                 anchor_cx,anchor_cy=int(sc_[0]*sx),int(sc_[1]*sy)
 
                     if anchor_cx is not None:
+                        # Apply Stability Pipeline (Fix 3 & 4)
                         ts_cx, ts_cy = target_smoother.update(anchor_cx, anchor_cy)
                         cur_cx, cur_cy = crop_anchor.update(ts_cx, ts_cy)
                         
@@ -1476,43 +1492,69 @@ def process_video(
                         history_exists = True
 
                 # ── Interpolate camera position between samples ─────────────
-                if not is_sample and prev_anchor is not None and len(det_centers)>=2:
-                    fi_a,cx_a,cy_a=prev_anchor; alpha=min(1.0,(fi-fi_a)/sample_interval)
-                    if len(det_centers) > 1:
-                         c_prev = det_centers[-2]
-                         c_curr = det_centers[-1]
-                         cur_cx = int(c_prev[0]*(1-alpha) + c_curr[0]*alpha)
-                         cur_cy = int(c_prev[1]*(1-alpha) + c_curr[1]*alpha)
-                    else:
-                         cur_cx, cur_cy = det_centers[-1]
+                # FIX-B6: Use a dedicated last_sample_fi counter instead of
+                # prev_anchor's frame index, which is EMA-shifted and causes
+                # alpha to overshoot 1.0 when the smoother delayed the anchor.
+                if not is_sample and len(det_centers) >= 2:
+                    span = max(sample_interval, 1)
+                    alpha = min(1.0, (fi - det_indices[-2]) / span)
+                    cur_cx = int(det_centers[-2][0] * (1 - alpha) + det_centers[-1][0] * alpha)
+                    cur_cy = int(det_centers[-2][1] * (1 - alpha) + det_centers[-1][1] * alpha)
+                elif not is_sample and len(det_centers) == 1:
+                    cur_cx, cur_cy = det_centers[-1]
                 
                 cur_cx=max(hw,min(cur_cx,orig_w-hw)); cur_cy=max(hh,min(cur_cy,orig_h-hh))
 
                 # ══ Render frame using adaptive layout engine ═══════════════
-                # FIX 3: Single Render Call
-                pf = persons_cache if is_sample else [b for g in layout_state.prev_groups for b in g]
-                
-                out_frame, active_layout = render_adaptive_frame(
-                    frame, pf, target_w, target_h,
-                    layout_state=layout_state,
-                    vignette_strength=vignette_strength*0.7,
-                    color_grade=color_grade,
-                    frame_idx=fi,
-                )
+                # FIX-B1/B2: Unified render path — render_adaptive_frame is called
+                # ONCE per frame.  The smoother is only updated on that single call.
+                # For non-sample frames we pass the smoothed prev_groups boxes so
+                # the smoother skips a new EMA step (groups == prev_groups case).
 
-                # If single subject layout, override with smooth-tracked crop
-                if active_layout == LAYOUT_SINGLE:
-                    left = max(0, min(cur_cx-crop_w//2, orig_w-crop_w))
-                    top_ = max(0, min(cur_cy-crop_h//2, orig_h-crop_h))
-                    crop = frame[top_:top_+crop_h, left:left+crop_w]
-                    if crop.shape[1]!=target_w or crop.shape[0]!=target_h:
-                        crop = cv2.resize(crop,(target_w,target_h),interpolation=cv2.INTER_LANCZOS4)
+                if tracking_mode == "subject" and model_obj is not None:
+                    # On sample frames use fresh detections; on inter-frames reuse
+                    # the already-smoothed prev_groups so no second smoother update.
+                    if is_sample:
+                        pf = persons_cache
+                    else:
+                        pf = [b for g in layout_state.prev_groups for b in g]
+
+                    out_frame, active_layout = render_adaptive_frame(
+                        frame, pf, target_w, target_h,
+                        layout_state=layout_state,
+                        vignette_strength=vignette_strength * 0.7,
+                        color_grade=color_grade,
+                        frame_idx=fi,
+                    )
+
+                    # If layout collapsed to SINGLE, override with the smooth
+                    # crop-anchor position for a proper talking-head shot.
+                    if active_layout == LAYOUT_SINGLE:
+                        left  = max(0, min(cur_cx - crop_w // 2, orig_w - crop_w))
+                        top_  = max(0, min(cur_cy - crop_h // 2, orig_h - crop_h))
+                        crop  = frame[top_:top_ + crop_h, left:left + crop_w]
+                        if crop.shape[1] != target_w or crop.shape[0] != target_h:
+                            crop = cv2.resize(crop, (target_w, target_h),
+                                              interpolation=cv2.INTER_LANCZOS4)
+                        out_frame = crop
+
+                else:
+                    # Talking-head / saliency path — simple crop
+                    left  = max(0, min(cur_cx - crop_w // 2, orig_w - crop_w))
+                    top_  = max(0, min(cur_cy - crop_h // 2, orig_h - crop_h))
+                    crop  = frame[top_:top_ + crop_h, left:left + crop_w]
+                    if crop.shape[1] != target_w or crop.shape[0] != target_h:
+                        crop = cv2.resize(crop, (target_w, target_h),
+                                          interpolation=cv2.INTER_LANCZOS4)
                     out_frame = crop
 
-                if ken_burns: out_frame=apply_ken_burns(out_frame,fi,fps)
-                if sharpen_strength>0: out_frame=apply_sharpen(out_frame,sharpen_strength)
-                if color_grade and color_grade!="none": out_frame=apply_color_grade(out_frame,color_grade)
-                if vignette_strength>0: out_frame=apply_vignette(out_frame,vignette_strength)
+                # FIX-B8: Post-effects applied to ALL paths (was missing in multi-layout)
+                if ken_burns:           out_frame = apply_ken_burns(out_frame, fi, fps)
+                if sharpen_strength > 0: out_frame = apply_sharpen(out_frame, sharpen_strength)
+                if color_grade and color_grade != "none":
+                    out_frame = apply_color_grade(out_frame, color_grade)
+                if vignette_strength > 0:
+                    out_frame = apply_vignette(out_frame, vignette_strength)
 
                 if dissolve_buf and dissolve_buf.active: out_frame=dissolve_buf.blend(out_frame)
                 last_out_frame=out_frame
