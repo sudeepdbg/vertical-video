@@ -1,34 +1,44 @@
 """
-verticalize.py  —  AI Vertical Video converter  v2.7
+verticalize.py  —  AI Vertical Video converter  v2.6
 ──────────────────────────────────────────────────────
-FIXES in v2.7 (Source-Aware Detection):
+FIXES in v2.6 (Panel Close-up Correctness):
 
-  FIX-D1  Stricter _filter_persons (min_w:0.06, min_h:0.18 + spatial guards):
-           • Edge guard rejects detections centred in outer 8% of frame width
-             (blurred ghost-copies in pillarboxed CNN/network clips).
-           • Lower-third guard rejects detections starting below 80% frame height
-             (partial bodies/hands cut off by chyron bars like "WORN OUT BY NEWS?").
+  FIX-C1  Probe Supermajority Threshold:
+           • _probe_dominant_layout now requires ≥60% of sampled frames showing
+             a multi-person layout before locking it as dominant.
+           • Previously 40% was enough — a handful of wide shots locked the whole
+             video into DUO_SPLIT even for single-person close-up content.
+           • Probe samples increased from 18 → 24 frames, skipping title-card edges.
 
-  FIX-D2  _should_split minimum bbox width requirement:
-           • Each person must be ≥10% of frame width to be split-eligible.
-           • dist_ratio raised to 0.70 (896px on 1280-wide) — true panel-end separation.
+  FIX-C2  Layout/Detection Mismatch Guard in render_adaptive_frame:
+           • If locked layout is DUO_SPLIT or TRIO but fewer persons are detected
+             than required, layout immediately downgrades to SINGLE.
+           • Prevents the "same person duplicated top-and-bottom" artifact.
 
-  FIX-D3  Pillarbox-Aware detect_persons_all:
-           • Detects blurred/darkened letterbox/pillarbox padding via Laplacian
-             sharpness comparison of edge strips vs centre.
-           • Crops the inner active region before YOLO inference, then offsets
-             bboxes back to full-frame coordinates.
-           • Eliminates the ghost-person detections that caused false DUO_SPLIT
-             on news clips displayed inside a windowed-format broadcast.
+  FIX-C3  LayoutState Person-Count Override:
+           • layout_state.update() now accepts n_persons.
+           • If n_persons ≤ 1 while locked in a multi-person layout, instantly
+             resets to SINGLE (lock cleared), bypassing the hysteresis counter.
 
-Inherited from v2.6 (Panel Close-up Correctness):
-  FIX-C1..C5  Probe supermajority, mismatch guard, person-count override,
-              empty-group placeholder, hysteresis 60→20 frames
+  FIX-C4  Empty-Group Placeholder in _tight_crop_for_group:
+           • Empty group no longer returns a center crop identical to the filled
+             strip — returns a dark blurred placeholder instead, making a
+             mismatch visually obvious rather than silently wrong.
+
+  FIX-C5  Hysteresis Reduced 60 → 20 Frames:
+           • 60 frames = 2 full seconds of layout lock, far too long for news
+             panels that cut every 1-3 seconds. 20 frames (~0.67s) debounces
+             detection noise without freezing through an entire close-up shot.
 
 Inherited from v2.5 (Render Pipeline):
-  FIX-B1..B8  Deduplicated render, stale cache fix, split threshold,
-              hysteresis timing, slot cleanup, alpha overshoot, trio speaker,
-              post-effects on all paths
+  FIX-B1  Deduplicated render path (single render_adaptive_frame call)
+  FIX-B2  Stale persons_cache fix on inter-frames
+  FIX-B3  Split threshold tuned (dist_ratio 0.65, overlap 0.10)
+  FIX-B4  Hysteresis lock applied before layout commit
+  FIX-B5  StablePanelSmoother slot cleanup on count decrease
+  FIX-B6  Inter-frame interpolation alpha overshoot fix
+  FIX-B7  TRIO active-speaker = largest bbox, not geometric center
+  FIX-B8  Post-effects applied to all render paths
 
 Inherited from v2.4 (Stability Engine):
   FIX-S1..S6  Double smoother, velocity clamp, persistent slots, duo framing
@@ -466,83 +476,16 @@ def detect_subjects(frame,model,confidence=0.45):
     return DetectionResult(cx,cy,min(e[1] for e in pool),min(e[2] for e in pool),
                             max(e[3] for e in pool),max(e[4] for e in pool),len(pool))
 
-def _detect_pillarbox(frame, blur_thresh=8.0, min_pad_frac=0.08):
-    """
-    FIX-D3: Detect if the frame has blurred/darkened pillarbox padding.
-    Returns (x1, y1, x2, y2) inner active region, or None if no pillarbox found.
-    Strategy: compare Laplacian sharpness of outer edge strips vs centre.
-    If edges are much blurrier than centre, they are padding.
-    """
-    h, w = frame.shape[:2]
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-    def sharpness(region):
-        if region.size == 0: return 0.0
-        return float(cv2.Laplacian(region, cv2.CV_64F).var())
-
-    pad = max(int(w * min_pad_frac), 8)
-    centre_sharp = sharpness(gray[h//4:3*h//4, w//4:3*w//4])
-    left_sharp   = sharpness(gray[h//4:3*h//4, :pad])
-    right_sharp  = sharpness(gray[h//4:3*h//4, w-pad:])
-
-    if centre_sharp < 1.0: return None  # blank/dark frame
-    left_ratio  = left_sharp  / centre_sharp
-    right_ratio = right_sharp / centre_sharp
-
-    # Pillarbox: both sides significantly blurrier than centre
-    if left_ratio < 0.15 and right_ratio < 0.15:
-        # Scan inward from left and right to find the edge of active content
-        # Use column-wise sharpness gradient
-        col_sharp = np.array([float(cv2.Laplacian(gray[:, c:c+4], cv2.CV_64F).var())
-                               for c in range(0, w, 4)])
-        threshold = centre_sharp * 0.25
-        active_cols = np.where(col_sharp > threshold)[0] * 4
-        if len(active_cols) < 2: return None
-        x1 = max(0, int(active_cols[0]) - 4)
-        x2 = min(w, int(active_cols[-1]) + 8)
-        if (x2 - x1) < w * 0.4: return None  # sanity: inner region must be >40% width
-        if x1 <= 4 and x2 >= w - 4: return None  # full frame = no real pillarbox
-        return (x1, 0, x2, h)
-    return None
-
-
-_pillarbox_cache: Dict[Tuple, Optional[Tuple]] = {}
-
-def _get_active_region(frame):
-    """Return (x1,y1,x2,y2) of active content area, caching per frame shape+edge-hash."""
-    h, w = frame.shape[:2]
-    # Hash just the edges to avoid hashing the whole frame
-    edge_hash = hash(frame[:4, :20].tobytes() + frame[:4, -20:].tobytes())
-    key = (w, h, edge_hash)
-    if key not in _pillarbox_cache:
-        _pillarbox_cache[key] = _detect_pillarbox(frame)
-        if len(_pillarbox_cache) > 64:  # bounded cache
-            _pillarbox_cache.pop(next(iter(_pillarbox_cache)))
-    return _pillarbox_cache[key]
-
-
-def detect_persons_all(frame, model, confidence=0.45):
-    """FIX-D3: Crops to inner active region before detection to avoid ghost-person
-    detections in pillarboxed padding. Offsets bboxes back to full-frame coords."""
+def detect_persons_all(frame,model,confidence=0.45):
     if model is None: return []
-    region = _get_active_region(frame)
-    if region is not None:
-        rx1, ry1, rx2, ry2 = region
-        det_frame = frame[ry1:ry2, rx1:rx2]
-        ox, oy = rx1, ry1
-    else:
-        det_frame = frame
-        ox, oy = 0, 0
-    try: results = model(det_frame, verbose=False, conf=confidence)[0]
+    try: results=model(frame,verbose=False,conf=confidence)[0]
     except Exception: return []
-    if results.boxes is None or len(results.boxes) == 0: return []
-    p = []
+    if results.boxes is None or len(results.boxes)==0: return []
+    p=[]
     for box in results.boxes:
-        if int(box.cls[0]) == PERSON_CLASS_ID:
-            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-            p.append((x1 + ox, y1 + oy, x2 + ox, y2 + oy))
-    p.sort(key=lambda b: b[0])
-    return p
+        if int(box.cls[0])==PERSON_CLASS_ID:
+            x1,y1,x2,y2=map(int,box.xyxy[0].tolist()); p.append((x1,y1,x2,y2))
+    p.sort(key=lambda b:b[0]); return p
 
 
 # ── Framing helpers ───────────────────────────────────────────────────────────
@@ -587,23 +530,9 @@ def _group_union(persons):
     return (min(p[0] for p in persons), min(p[1] for p in persons),
             max(p[2] for p in persons), max(p[3] for p in persons))
 
-def _filter_persons(persons, fw, fh, min_w_frac=0.06, min_h_frac=0.18):
-    """
-    FIX-D1: Stricter thresholds + two spatial guards:
-    - Edge guard (8% of width): rejects blurred ghost-copies in pillarboxed clips
-    - Lower-third guard (below 80% height): rejects torsos/hands cut off by chyron bars
-    """
-    edge_guard  = fw * 0.08
-    lower_guard = fh * 0.80
-    out = []
-    for x1, y1, x2, y2 in persons:
-        if (x2 - x1) < fw * min_w_frac: continue
-        if (y2 - y1) < fh * min_h_frac: continue
-        cx = (x1 + x2) / 2
-        if cx < edge_guard or cx > fw - edge_guard: continue  # pillarbox ghost
-        if y1 > lower_guard: continue                          # below chyron bar
-        out.append((x1, y1, x2, y2))
-    return out
+def _filter_persons(persons, fw, fh, min_w_frac=0.04, min_h_frac=0.10):
+    return [(x1,y1,x2,y2) for x1,y1,x2,y2 in persons
+            if (x2-x1) > fw*min_w_frac and (y2-y1) > fh*min_h_frac]
 
 # FIX 1: Robust Split Detection
 def _should_split(p0, p1, fw):
@@ -627,13 +556,9 @@ def _should_split(p0, p1, fw):
     cx1 = (x11 + x21) / 2
     dist_ratio = abs(cx1 - cx0) / fw
 
-    # FIX-D2: Both persons must have reasonable width AND centers must be far apart.
-    # Raised dist_ratio to 0.70 — on a 1280px frame that's 896px separation,
-    # which is genuinely two people at opposite ends, not two panel members side-by-side.
-    # Also require each person to be at least 10% of frame width (rejects slivers).
-    if (x20 - x10) < fw * 0.10 or (x21 - x11) < fw * 0.10:
-        return False
-    return overlap_ratio < 0.10 and dist_ratio > 0.70
+    # FIX-B3: Raised distance threshold (0.65) to avoid false splits on close panel members.
+    # Tightened overlap cap (0.10) so slightly-touching boxes still merge.
+    return overlap_ratio < 0.10 and dist_ratio > 0.65
 
 def _classify_layout(persons, fw, fh):
     n = len(persons)
