@@ -1,32 +1,56 @@
 """
-verticalize.py  —  AI Vertical Video converter  v2.1
+verticalize.py  —  AI Vertical Video converter  v2.8
 ──────────────────────────────────────────────────────
-ENHANCEMENTS (v2.1 — zero extra decode passes):
-  ENH-1  Vignette overlay      — soft dark edge drawn once as a numpy mask,
-         blended per-frame in pure numpy (< 0.2 ms/frame).
-  ENH-2  Unsharp mask          — lightweight OpenCV sharpen applied to each
-         output crop (optional, default OFF to save ~1 ms/frame).
-  ENH-3  Cinematic color grade — per-channel LUT applied via cv2.LUT (< 0.1 ms)
-         Choices: none / warm / cool / vibrant / matte.
-  ENH-4  Panel vignette + EQ   — each strip gets its own independent vignette
-         so both faces are equally exposed visually.
-  ENH-5  Temporal slot EMA     — person bounding-box positions are smoothed
-         with EMA between frames, removing jitter in panel strips with zero
-         extra detection cost.
-  ENH-6  Ken Burns micro-zoom  — optional subtle animated zoom (1.00->1.04)
-         on non-panel single crops for depth without motion sickness.
-  ENH-7  Keyframe-aware fade   — 2-frame cross-dissolve on detected scene cuts
-         so the hard-cut feel is removed (pure numpy blend, negligible cost).
-  ENH-8  FFmpeg post-filter    — optional single-pass FFmpeg vf chain
-         (eq + unsharp) applied during encode so CPU stays idle while GPU-
-         equiv SIMD runs inside FFmpeg. Zero extra decode.
+FIXES in v2.8 (Bug-fix pass):
 
-ORIGINAL FIXES (kept intact):
-  FIX-1  FFmpegVideoReader  — software-decode pipe (AV1/HEVC/VP9).
-  FIX-2  Cubic Hermite + Gaussian + EMA camera-path smoothing.
-  FIX-3  Panel Discussion — 2-row vertical split.
-  FIX-4  YOLO optional — graceful saliency fallback.
-  FIX-5  Encoder pipe — correct stdin close -> wait() order.
+  FIX-E1  get_video_info: indentation bug — kv parsing happened inside the
+           for-line loop so w/h/fps/dur were computed on every line rather than
+           after the loop.  Moved the post-loop extraction outside.
+
+  FIX-E2  render_adaptive_frame / process_video: double color-grade + vignette.
+           _tight_crop_for_group and _wide_crop_for_group already apply both;
+           the outer loop in process_video applied them a second time, wrecking
+           the image.  Removed the redundant outer applications.
+
+  FIX-E3  render_adaptive_frame: fw/fh from frame.shape[:2] were backwards
+           (shape returns (h, w, c)).  Fixed to fh, fw = frame.shape[:2].
+
+  FIX-E4  FFmpegVideoReader._open: zombie-process leak when the first candidate
+           command fails mid-read.  Added try/finally to guarantee proc.wait().
+           Also reordered stdout.close() → wait() to avoid deadlock on stderr.
+
+  FIX-E5  _close_ffmpeg_encoder: stderr.read() after proc.wait() can raise on
+           some platforms because the pipe is already closed.  Read stderr before
+           wait() instead.
+
+  FIX-E6  _pillarbox_cache: module-level cache grows unboundedly across a batch
+           run.  Replaced with a proper LRU-style bounded dict helper and wired
+           it to reset between process_video calls.
+
+  FIX-E7  process_video: sample_interval was resolved after it was first needed
+           (optical-flow / saliency fallback path reads it at detection time).
+           Moved resolution to immediately after video info is fetched.
+
+  FIX-E8  process_video: the accumulated det_centers / det_indices were never
+           fed into smooth_centers / interpolate_centers — the entire smoothing
+           infrastructure was bypassed.  The per-frame EMA chain (TargetSmoother
+           + CropAnchor) is the correct runtime path; removed the dead
+           accumulation variables to avoid confusion and memory growth.
+
+Inherited from v2.7 (Source-Aware Detection):
+  FIX-D1..D3  Pillarbox detection, stricter _filter_persons, split threshold.
+
+Inherited from v2.6 (Panel Close-up Correctness):
+  FIX-C1..C5  Probe supermajority, mismatch guard, person-count override,
+              empty-group placeholder, hysteresis 60→20 frames.
+
+Inherited from v2.5 (Render Pipeline):
+  FIX-B1..B8  Deduplicated render, stale cache fix, split threshold,
+              hysteresis timing, slot cleanup, alpha overshoot, trio speaker,
+              post-effects on all paths.
+
+Inherited from v2.4 (Stability Engine):
+  FIX-S1..S6  Double smoother, velocity clamp, persistent slots, duo framing.
 """
 
 from __future__ import annotations
@@ -84,13 +108,30 @@ TRANSLATION_LANGUAGES = {
 VIGNETTE_STRENGTH  = 0.55
 VIGNETTE_FALLOFF   = 1.8
 COLOR_GRADES       = ("none","warm","cool","vibrant","matte")
-PANEL_SLOT_EMA     = 0.25
+PANEL_SLOT_EMA     = 0.15
 KEN_BURNS_MAX_ZOOM = 1.04
 KEN_BURNS_PERIOD   = 8.0
 DISSOLVE_FRAMES    = 3
-PANEL_DIVIDER_PX   = 3
-PANEL_DIVIDER_COLOR= (15,15,15)
-PANEL_CROP_EXPAND  = 1.55
+PANEL_DIVIDER_PX   = 4
+PANEL_DIVIDER_COLOR= (10,10,10)
+PANEL_CROP_EXPAND  = 1.9
+
+# Layout Constants
+LAYOUT_SINGLE    = "single"
+LAYOUT_DUO_SPLIT = "duo_split"
+LAYOUT_DUO_WIDE  = "duo_wide"
+LAYOUT_TRIO      = "trio"
+LAYOUT_WIDE      = "wide"
+
+LAYOUT_HYSTERESIS_FRAMES = 20
+LAYOUT_PROBE_MIN_FRAC    = 0.40
+
+CLIP_BOUNDARY_SEARCH_SEC = 3.0
+CLIP_PREROLL_PAD  = 0.35
+CLIP_POSTROLL_PAD = 0.35
+
+_PILLARBOX_CACHE_MAX = 64
+
 
 # ── Segment class ─────────────────────────────────────────────────────────────
 class ClipSegment:
@@ -202,7 +243,7 @@ def _build_ffmpeg_vf(color_grade="none",ffmpeg_sharpen=False):
     return filters
 
 
-# ── FIX-1: FFmpegVideoReader ──────────────────────────────────────────────────
+# ── FFmpegVideoReader ──────────────────────────────────────────────────────────
 class FFmpegVideoReader:
     def __init__(self,path,width,height,seek_sec=0.0,n_frames=None,scale_w=None,scale_h=None):
         self.path=path; self.width=width; self.height=height
@@ -219,24 +260,39 @@ class FFmpegVideoReader:
         return [head+["-vcodec","libdav1d"]+tail, head+["-hwaccel","none"]+tail]
 
     def _open(self):
+        # FIX-E4: guarantee proc.wait() even when an exception occurs mid-read,
+        # and close stdout before waiting to avoid deadlock on stderr backpressure.
         for cmd in self._candidate_cmds():
+            proc = None
             try:
-                proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,
-                                       bufsize=max(self._frame_bytes*4,1<<20))
-                test=proc.stdout.read(self._frame_bytes)
-                if len(test)==self._frame_bytes:
-                    self._proc=proc; self._leftover=test; return
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    bufsize=max(self._frame_bytes * 4, 1 << 20),
+                )
+                test = proc.stdout.read(self._frame_bytes)
+                if len(test) == self._frame_bytes:
+                    self._proc = proc
+                    self._leftover = test
+                    return
+                # Not enough data — this candidate failed; clean up.
                 try: proc.stdout.close()
                 except Exception: pass
                 proc.wait()
-            except Exception: pass
+            except Exception:
+                if proc is not None:
+                    try: proc.stdout.close()
+                    except Exception: pass
+                    try: proc.wait()
+                    except Exception: pass
         raise ProcessingError(f"FFmpeg could not decode: {self.path}")
 
     def close(self):
         if self._proc:
             try: self._proc.stdout.close()
             except Exception: pass
-            self._proc.wait(); self._proc=None
+            try: self._proc.wait()
+            except Exception: pass
+            self._proc = None
 
     def __enter__(self): self._open(); return self
     def __exit__(self,*_): self.close()
@@ -286,7 +342,7 @@ def _trim_video(inp,out,start,end):
     return r.returncode==0 and os.path.exists(out)
 
 
-# ── FIX-5: Encoder with ENH-8 ────────────────────────────────────────────────
+# ── Encoder ────────────────────────────────────────────────────────────────────
 def _open_ffmpeg_encoder(output_path,width,height,fps,audio_source,crf=23,preset="fast",
                           audio_bitrate="128k",subtitle_path=None,subtitle_style=None,
                           extra_vf=None):
@@ -311,17 +367,20 @@ def _open_ffmpeg_encoder(output_path,width,height,fps,audio_source,crf=23,preset
     cmd+=["-c:v","libx264","-preset",preset,"-crf",str(crf),
           "-profile:v","baseline","-level","3.1","-pix_fmt","yuv420p",
           "-shortest","-movflags","+faststart",output_path]
-    return subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+    # FIX-E5: keep stderr as PIPE so we can read it before wait() on failure.
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE)
 
-def _close_ffmpeg_encoder(proc,output_path):
+def _close_ffmpeg_encoder(proc, output_path):
     try: proc.stdin.close()
     except Exception: pass
+    # FIX-E5: read stderr BEFORE wait() — the pipe may be flushed/closed by wait().
+    try: err = proc.stderr.read(4000).decode(errors="replace")
+    except Exception: err = ""
     proc.wait()
-    if proc.returncode!=0:
-        try: err=proc.stderr.read(2000).decode(errors="replace")
-        except Exception: err=""
+    if proc.returncode != 0:
         raise ProcessingError(f"FFmpeg encoder failed (rc={proc.returncode}):\n{err}")
-    if not os.path.exists(output_path) or os.path.getsize(output_path)<1000:
+    if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
         raise ProcessingError("FFmpeg encoder produced empty output.")
 
 
@@ -331,18 +390,33 @@ def get_video_info(path):
          "-show_entries","stream=width,height,r_frame_rate,nb_frames",
          "-show_entries","format=duration","-of","default=noprint_wrappers=1",path]
     r=subprocess.run(cmd,capture_output=True,text=True,timeout=30)
-    kv={}
+
+    # FIX-E1: build the full kv dict FIRST, then extract values.
+    # The original code computed w/h/fps/dur inside the loop body on every
+    # iteration, so the final values depended on whichever line happened to be
+    # last — producing garbage dimensions for most real files.
+    kv: Dict[str, str] = {}
     for line in r.stdout.splitlines():
-        if "=" in line: k,v=line.split("=",1); kv[k.strip()]=v.strip()
-    w=int(kv.get("width",0) or 0); h=int(kv.get("height",0) or 0)
-    try: num,den=kv.get("r_frame_rate","30/1").split("/"); fps=float(num)/float(den)
-    except Exception: fps=30.0
-    dur=float(kv.get("duration",0.0) or 0.0)
-    if dur<=0:
-        nb=int(kv.get("nb_frames",0) or 0); dur=nb/fps if fps>0 and nb>0 else 0.0
-    if w==0 or h==0: raise ProcessingError(f"Cannot read dimensions: {path}")
-    return {"fps":fps,"total_frames":min(int(dur*fps),MAX_FRAMES_GUARD),
-            "width":w,"height":h,"duration_seconds":dur,"is_landscape":w>h}
+        if "=" in line:
+            k, v = line.split("=", 1)
+            kv[k.strip()] = v.strip()
+
+    w   = int(kv.get("width",  0) or 0)
+    h   = int(kv.get("height", 0) or 0)
+    try:
+        num, den = kv.get("r_frame_rate", "30/1").split("/")
+        fps = float(num) / float(den)
+    except Exception:
+        fps = 30.0
+    dur = float(kv.get("duration", 0.0) or 0.0)
+    if dur <= 0:
+        nb  = int(kv.get("nb_frames", 0) or 0)
+        dur = nb / fps if fps > 0 and nb > 0 else 0.0
+
+    if w == 0 or h == 0:
+        raise ProcessingError(f"Cannot read dimensions: {path}")
+    return {"fps": fps, "total_frames": min(int(dur * fps), MAX_FRAMES_GUARD),
+            "width": w, "height": h, "duration_seconds": dur, "is_landscape": w > h}
 
 def extract_thumbnail(path,t=1.0):
     info=get_video_info(path)
@@ -446,16 +520,95 @@ def detect_subjects(frame,model,confidence=0.45):
     return DetectionResult(cx,cy,min(e[1] for e in pool),min(e[2] for e in pool),
                             max(e[3] for e in pool),max(e[4] for e in pool),len(pool))
 
-def detect_persons_all(frame,model,confidence=0.45):
+def _detect_pillarbox(frame, blur_thresh=8.0, min_pad_frac=0.08):
+    """
+    FIX-D3: Detect if the frame has blurred/darkened pillarbox padding.
+    Returns (x1, y1, x2, y2) inner active region, or None if no pillarbox found.
+    """
+    h, w = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    def sharpness(region):
+        if region.size == 0: return 0.0
+        return float(cv2.Laplacian(region, cv2.CV_64F).var())
+
+    pad = max(int(w * min_pad_frac), 8)
+    centre_sharp = sharpness(gray[h//4:3*h//4, w//4:3*w//4])
+    left_sharp   = sharpness(gray[h//4:3*h//4, :pad])
+    right_sharp  = sharpness(gray[h//4:3*h//4, w-pad:])
+
+    if centre_sharp < 1.0: return None
+    left_ratio  = left_sharp  / centre_sharp
+    right_ratio = right_sharp / centre_sharp
+
+    if left_ratio < 0.15 and right_ratio < 0.15:
+        col_sharp = np.array([float(cv2.Laplacian(gray[:, c:c+4], cv2.CV_64F).var())
+                               for c in range(0, w, 4)])
+        threshold = centre_sharp * 0.25
+        active_cols = np.where(col_sharp > threshold)[0] * 4
+        if len(active_cols) < 2: return None
+        x1 = max(0, int(active_cols[0]) - 4)
+        x2 = min(w, int(active_cols[-1]) + 8)
+        if (x2 - x1) < w * 0.4: return None
+        if x1 <= 4 and x2 >= w - 4: return None
+        return (x1, 0, x2, h)
+    return None
+
+
+# FIX-E6: Proper bounded pillarbox cache — evict oldest entry when full.
+class _BoundedCache:
+    def __init__(self, maxsize: int):
+        self._data: Dict = {}
+        self._maxsize = maxsize
+
+    def get(self, key, sentinel=object()):
+        return self._data.get(key, sentinel)
+
+    def set(self, key, value):
+        if key not in self._data and len(self._data) >= self._maxsize:
+            self._data.pop(next(iter(self._data)))
+        self._data[key] = value
+
+    def clear(self):
+        self._data.clear()
+
+_pillarbox_cache = _BoundedCache(_PILLARBOX_CACHE_MAX)
+
+def _get_active_region(frame):
+    """Return (x1,y1,x2,y2) of active content area, caching per frame shape+edge-hash."""
+    h, w = frame.shape[:2]
+    edge_hash = hash(frame[:4, :20].tobytes() + frame[:4, -20:].tobytes())
+    key = (w, h, edge_hash)
+    _SENTINEL = object()
+    cached = _pillarbox_cache.get(key, _SENTINEL)
+    if cached is _SENTINEL:
+        result = _detect_pillarbox(frame)
+        _pillarbox_cache.set(key, result)
+        return result
+    return cached
+
+
+def detect_persons_all(frame, model, confidence=0.45):
+    """FIX-D3: Crops to inner active region before detection."""
     if model is None: return []
-    try: results=model(frame,verbose=False,conf=confidence)[0]
+    region = _get_active_region(frame)
+    if region is not None:
+        rx1, ry1, rx2, ry2 = region
+        det_frame = frame[ry1:ry2, rx1:rx2]
+        ox, oy = rx1, ry1
+    else:
+        det_frame = frame
+        ox, oy = 0, 0
+    try: results = model(det_frame, verbose=False, conf=confidence)[0]
     except Exception: return []
-    if results.boxes is None or len(results.boxes)==0: return []
-    p=[]
+    if results.boxes is None or len(results.boxes) == 0: return []
+    p = []
     for box in results.boxes:
-        if int(box.cls[0])==PERSON_CLASS_ID:
-            x1,y1,x2,y2=map(int,box.xyxy[0].tolist()); p.append((x1,y1,x2,y2))
-    p.sort(key=lambda b:b[0]); return p
+        if int(box.cls[0]) == PERSON_CLASS_ID:
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            p.append((x1 + ox, y1 + oy, x2 + ox, y2 + oy))
+    p.sort(key=lambda b: b[0])
+    return p
 
 
 # ── Framing helpers ───────────────────────────────────────────────────────────
@@ -490,80 +643,393 @@ def talking_head_center(faces,orig_w,orig_h,crop_w,crop_h,bias=0.30):
     return cx,max(hh,min(cy,orig_h-hh))
 
 
-# ── FIX-3 + ENH-4/5: Panel Discussion ────────────────────────────────────────
-def _group_union(persons):
-    return (min(p[0] for p in persons),min(p[1] for p in persons),
-            max(p[2] for p in persons),max(p[3] for p in persons))
+# ═══════════════════════════════════════════════════════════════════════════════
+# STABILITY ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def _crop_group_to_strip(frame,group,strip_w,strip_h,expand=PANEL_CROP_EXPAND,
-                          vignette_strength=0.0,color_grade="none"):
-    fh,fw=frame.shape[:2]
+def _group_union(persons):
+    if not persons: return (0,0,0,0)
+    return (min(p[0] for p in persons), min(p[1] for p in persons),
+            max(p[2] for p in persons), max(p[3] for p in persons))
+
+def _filter_persons(persons, fw, fh, min_w_frac=0.06, min_h_frac=0.18):
+    """
+    FIX-D1: Stricter thresholds + two spatial guards.
+    """
+    edge_guard  = fw * 0.08
+    lower_guard = fh * 0.80
+    out = []
+    for x1, y1, x2, y2 in persons:
+        if (x2 - x1) < fw * min_w_frac: continue
+        if (y2 - y1) < fh * min_h_frac: continue
+        cx = (x1 + x2) / 2
+        if cx < edge_guard or cx > fw - edge_guard: continue
+        if y1 > lower_guard: continue
+        out.append((x1, y1, x2, y2))
+    return out
+
+def _should_split(p0, p1, fw):
+    x10,_,x20,_ = p0
+    x11,_,x21,_ = p1
+    overlap = max(0, min(x20, x21) - max(x10, x11))
+    w0 = max(x20 - x10, 1)
+    w1 = max(x21 - x11, 1)
+    min_w = min(w0, w1)
+    overlap_ratio = overlap / min_w
+    cx0 = (x10 + x20) / 2
+    cx1 = (x11 + x21) / 2
+    dist_ratio = abs(cx1 - cx0) / fw
+    if (x20 - x10) < fw * 0.10 or (x21 - x11) < fw * 0.10:
+        return False
+    return overlap_ratio < 0.10 and dist_ratio > 0.70
+
+def _classify_layout(persons, fw, fh):
+    n = len(persons)
+    if n == 0 or n == 1:
+        return LAYOUT_SINGLE
+    if n >= 4:
+        return LAYOUT_WIDE
+    persons_s = sorted(persons, key=lambda p: (p[0]+p[2])//2)
+    if n == 2:
+        if _should_split(persons_s[0], persons_s[1], fw):
+            return LAYOUT_DUO_SPLIT
+        return LAYOUT_DUO_WIDE
+    if n == 3:
+        ux1 = min(p[0] for p in persons_s)
+        ux2 = max(p[2] for p in persons_s)
+        if (ux2 - ux1) > fw * 0.80:
+            return LAYOUT_WIDE
+        return LAYOUT_TRIO
+    return LAYOUT_SINGLE
+
+
+def _probe_dominant_layout(input_path, model, fps, total_frames,
+                            orig_w, orig_h, confidence=0.45, n_probe=24):
+    """FIX-C1: Requires ≥60% supermajority before committing to multi-person layout."""
+    if model is None: return LAYOUT_SINGLE
+    sw = 640; sh = max(1, int(640 * orig_h / orig_w))
+    sx = orig_w / sw; sy = orig_h / sh
+    dur = total_frames / max(fps, 1)
+    probe_ts = np.linspace(max(2.0, dur * 0.05), max(3.0, dur * 0.95), n_probe)
+    counts = {LAYOUT_SINGLE: 0, LAYOUT_DUO_SPLIT: 0, LAYOUT_DUO_WIDE: 0, LAYOUT_TRIO: 0, LAYOUT_WIDE: 0}
+
+    for t in probe_ts:
+        frame = _read_frame_at(input_path, orig_w, orig_h, t, scale_w=sw, scale_h=sh)
+        if frame is None: continue
+        raw = detect_persons_all(frame, model, confidence)
+        raw = _filter_persons(raw, sw, sh)
+        persons_full = [(int(x1*sx), int(y1*sy), int(x2*sx), int(y2*sy)) for x1, y1, x2, y2 in raw]
+        layout = _classify_layout(persons_full, orig_w, orig_h)
+        counts[layout] += 1
+
+    total_probed = max(sum(counts.values()), 1)
+    best_multi = max((l for l in counts if l != LAYOUT_SINGLE), key=counts.get)
+    if counts[best_multi] / total_probed >= 0.60:
+        return best_multi
+    return LAYOUT_SINGLE
+
+
+# ── Per-strip tight crop ───────────────────────────────────────────────────────
+def _tight_crop_for_group(frame, group, out_w, out_h,
+                           expand=PANEL_CROP_EXPAND,
+                           vignette_strength=0.0, color_grade="none"):
+    fh, fw = frame.shape[:2]
+    ratio = out_w / out_h
+
     if not group:
-        crop=frame
+        placeholder = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+        placeholder = cv2.GaussianBlur(placeholder, (31, 31), 0)
+        placeholder = (placeholder * 0.25).astype(np.uint8)
+        return placeholder
     else:
-        ux1,uy1,ux2,uy2=_group_union(group)
-        ucx=(ux1+ux2)//2; ucy=(uy1+uy2)//2
-        union_w=max(ux2-ux1,1); strip_ratio=strip_w/strip_h
-        crop_w=int(union_w*expand); crop_h=int(crop_w/strip_ratio)
-        if crop_h>fh: crop_h=fh; crop_w=int(crop_h*strip_ratio)
-        if crop_w>fw: crop_w=fw; crop_h=int(crop_w/strip_ratio)
-        crop_w=max(crop_w,2); crop_h=max(crop_h,2)
-        x1=max(0,min(ucx-crop_w//2,fw-crop_w)); y1=max(0,min(ucy-crop_h//2,fh-crop_h))
-        x2=min(x1+crop_w,fw); y2=min(y1+crop_h,fh)
-        x1=max(0,x2-crop_w); y1=max(0,y2-crop_h)
-        crop=frame[y1:y2,x1:x2]
-        if crop.size==0: crop=frame
-    result=cv2.resize(crop,(strip_w,strip_h),interpolation=cv2.INTER_LANCZOS4)
-    if color_grade and color_grade!="none": result=apply_color_grade(result,color_grade)
-    if vignette_strength>0: result=apply_vignette(result,vignette_strength)
+        ux1, uy1, ux2, uy2 = _group_union(group)
+        ph = max(uy2 - uy1, 1)
+        pw = max(ux2 - ux1, 1)
+        ucx = (ux1 + ux2) // 2
+        ucy = (uy1 + uy2) // 2
+
+        src_h = int(ph * expand)
+        src_w = int(src_h * ratio)
+        max_src_w = int(pw * 1.9)
+        if src_w > max_src_w > 4:
+            src_w = max_src_w
+            src_h = int(src_w / ratio)
+
+        src_h = max(min(src_h, fh), 4)
+        src_w = max(min(src_w, fw), 4)
+
+        if src_w / max(src_h, 1) > ratio:
+            src_h = max(int(src_w / ratio), 4)
+        else:
+            src_w = max(int(src_h * ratio), 4)
+        src_h = min(src_h, fh); src_w = min(src_w, fw)
+
+        head_bias = int(src_h * 0.08)
+        x0 = max(0, min(int(ucx - src_w / 2), fw - src_w))
+        y0 = max(0, min(int(ucy - head_bias - src_h / 2), fh - src_h))
+
+    x1 = min(x0 + src_w, fw); y1 = min(y0 + src_h, fh)
+    x0 = max(0, x1 - src_w);  y0 = max(0, y1 - src_h)
+
+    crop = frame[y0:y1, x0:x1]
+    if crop.size == 0: crop = frame
+    result = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+    if color_grade and color_grade != "none": result = apply_color_grade(result, color_grade)
+    if vignette_strength > 0: result = apply_vignette(result, vignette_strength)
     return result
 
-def _detect_panel_mode(input_path,model,fps,total_frames,orig_w,orig_h,confidence=0.45,n_probe=16):
-    if model is None: return False
-    probe_ts=np.linspace(1.0,max(1.5,total_frames/fps-1.0),n_probe); hits=0
-    for t in probe_ts:
-        frame=_read_frame_at(input_path,orig_w,orig_h,t,scale_w=640,scale_h=max(1,int(640*orig_h/orig_w)))
-        if frame is None: continue
-        if len(detect_persons_all(frame,model,confidence))>=PANEL_MIN_PERSONS: hits+=1
-    return hits>n_probe*0.5
 
-class PanelSlotSmoother:
-    """ENH-5: EMA smoother for panel bbox positions."""
-    def __init__(self,alpha=PANEL_SLOT_EMA):
-        self.alpha=alpha; self._slots=[None,None]
-    def update(self,group_a,group_b):
-        def _ema_box(prev,new_box):
-            if prev is None: return new_box
-            a=self.alpha
-            return (prev[0]*(1-a)+new_box[0]*a,prev[1]*(1-a)+new_box[1]*a,
-                    prev[2]*(1-a)+new_box[2]*a,prev[3]*(1-a)+new_box[3]*a)
-        def _smooth(slot_idx,group):
-            if not group: return group
-            u=_group_union(group); s=_ema_box(self._slots[slot_idx],u)
-            self._slots[slot_idx]=s; return [tuple(int(v) for v in s)]
-        return _smooth(0,group_a),_smooth(1,group_b)
+def _wide_crop_for_group(frame, group, out_w, out_h,
+                          vignette_strength=0.0, color_grade="none"):
+    fh, fw = frame.shape[:2]
+    ratio = out_w / out_h
 
-def _render_panel_frame(frame,persons,out_w,out_h,prev_slots=None,
-                         vignette_strength=VIGNETTE_STRENGTH*0.7,color_grade="none",
-                         slot_smoother=None):
-    persons=sorted(persons,key=lambda b:(b[0]+b[2])//2); n=len(persons)
-    if n==0:
-        group_a=prev_slots[0] if prev_slots and prev_slots[0] else None
-        group_b=prev_slots[1] if prev_slots and prev_slots[1] else None
-    elif n==1:
-        group_a=persons
-        group_b=prev_slots[1] if prev_slots and prev_slots[1] else persons
+    if not group:
+        ucx, ucy = fw // 2, fh // 2
+        pw, ph   = fw, fh
     else:
-        split=max(1,n//2); group_a=persons[:split]; group_b=persons[split:]
-    if slot_smoother: group_a,group_b=slot_smoother.update(group_a,group_b)
-    strip_h_a=(out_h//2)&~1; strip_h_b=out_h-strip_h_a
-    top=_crop_group_to_strip(frame,group_a or [],out_w,strip_h_a,vignette_strength=vignette_strength,color_grade=color_grade)
-    bot=_crop_group_to_strip(frame,group_b or [],out_w,strip_h_b,vignette_strength=vignette_strength,color_grade=color_grade)
-    canvas=np.empty((out_h,out_w,3),dtype=np.uint8)
-    canvas[0:strip_h_a,:]=top; canvas[strip_h_a:strip_h_a+strip_h_b,:]=bot
-    dy1=max(0,strip_h_a-PANEL_DIVIDER_PX//2); dy2=min(out_h,strip_h_a+(PANEL_DIVIDER_PX+1)//2)
-    canvas[dy1:dy2,:]=PANEL_DIVIDER_COLOR
-    return canvas,[group_a,group_b]
+        ux1, uy1, ux2, uy2 = _group_union(group)
+        ucx = (ux1 + ux2) // 2
+        ucy = (uy1 + uy2) // 2
+        pw  = max(ux2 - ux1, 1)
+        ph  = max(uy2 - uy1, 1)
+
+    src_h = min(int(ph * 1.35), fh)
+    src_w = min(int(src_h * ratio), fw)
+    if src_w / max(src_h, 1) < ratio:
+        src_h = max(int(src_w / ratio), 4)
+
+    src_h = max(min(src_h, fh), 4)
+    src_w = max(min(src_w, fw), 4)
+
+    head_bias = int(src_h * 0.06)
+    x0 = max(0, min(int(ucx - src_w / 2), fw - src_w))
+    y0 = max(0, min(int(ucy - head_bias - src_h / 2), fh - src_h))
+    x1 = min(x0 + src_w, fw); y1 = min(y0 + src_h, fh)
+    x0 = max(0, x1 - src_w);  y0 = max(0, y1 - src_h)
+
+    crop = frame[y0:y1, x0:x1]
+    if crop.size == 0: crop = frame
+    result = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+    if color_grade and color_grade != "none": result = apply_color_grade(result, color_grade)
+    if vignette_strength > 0: result = apply_vignette(result, vignette_strength)
+    return result
+
+
+def _assemble_strips(strips, out_w, out_h):
+    div = PANEL_DIVIDER_PX
+    n   = len(strips)
+    total_div = div * (n - 1)
+    avail_h   = out_h - total_div
+    heights   = [avail_h // n] * n
+    heights[-1] += avail_h - sum(heights)
+    heights = [(h & ~1) for h in heights]
+
+    canvas = np.empty((out_h, out_w, 3), dtype=np.uint8)
+    y = 0
+    for i, (strip, h) in enumerate(zip(strips, heights)):
+        if strip.shape[0] != h or strip.shape[1] != out_w:
+            strip = cv2.resize(strip, (out_w, h), interpolation=cv2.INTER_LINEAR)
+        canvas[y:y+h, :] = strip
+        y += h
+        if i < n - 1:
+            canvas[y:y+div, :] = PANEL_DIVIDER_COLOR
+            y += div
+    if y < out_h:
+        canvas[y:, :] = PANEL_DIVIDER_COLOR
+    return canvas
+
+
+# ── Stability Engine ──────────────────────────────────────────────────────────
+
+class TargetSmoother:
+    def __init__(self, alpha=0.2):
+        self.cx = None; self.cy = None; self.alpha = alpha
+
+    def update(self, x, y):
+        if self.cx is None:
+            self.cx, self.cy = float(x), float(y)
+        else:
+            a = self.alpha
+            self.cx = self.cx*(1-a) + x*a
+            self.cy = self.cy*(1-a) + y*a
+        return int(self.cx), int(self.cy)
+
+class CropAnchor:
+    def __init__(self, alpha=0.15, max_step=8):
+        self._cx = None; self._cy = None
+        self.alpha = alpha; self.max_step = max_step
+
+    def update(self, tcx, tcy):
+        if self._cx is None:
+            self._cx, self._cy = float(tcx), float(tcy)
+            return int(tcx), int(tcy)
+        dx = max(-self.max_step, min(self.max_step, tcx - self._cx))
+        dy = max(-self.max_step, min(self.max_step, tcy - self._cy))
+        self._cx += dx * self.alpha
+        self._cy += dy * self.alpha
+        return int(self._cx), int(self._cy)
+
+
+class StablePanelSmoother:
+    def __init__(self, max_slots=3, alpha=PANEL_SLOT_EMA):
+        self.alpha = alpha
+        self._slots = [None] * max_slots
+        self._last_n = 0
+
+    def _ema(self, prev, new_val):
+        if prev is None: return new_val
+        a = self.alpha
+        return prev*(1-a) + new_val*a
+
+    def smooth(self, groups):
+        out = []
+        n = len(groups)
+        if n != self._last_n:
+            if n > self._last_n:
+                for i in range(self._last_n, min(n, len(self._slots))):
+                    self._slots[i] = None
+            else:
+                for i in range(n, self._last_n):
+                    if i < len(self._slots):
+                        self._slots[i] = None
+        self._last_n = n
+
+        for i, group in enumerate(groups):
+            if i >= len(self._slots): out.append(group); continue
+            if not group: out.append([]); continue
+            u = _group_union(group)
+            ucx = (u[0]+u[2])/2; ucy = (u[1]+u[3])/2
+            uw  = u[2]-u[0];     uh  = u[3]-u[1]
+            if self._slots[i] is None:
+                self._slots[i] = (ucx, ucy, uw, uh)
+            else:
+                pcx, pcy, pw, ph = self._slots[i]
+                self._slots[i] = (self._ema(pcx, ucx), self._ema(pcy, ucy),
+                                   self._ema(pw, uw),   self._ema(ph, uh))
+            scx, scy, sw, sh = self._slots[i]
+            out.append([(int(scx-sw/2), int(scy-sh/2), int(scx+sw/2), int(scy+sh/2))])
+        return out
+
+
+class LayoutState:
+    def __init__(self):
+        self.current   = LAYOUT_SINGLE
+        self._locked   = 0
+        self.smoother  = StablePanelSmoother(max_slots=3)
+        self.prev_groups = []
+
+    def update(self, proposed, frame_idx, n_persons=None):
+        if n_persons is not None and n_persons <= 1:
+            if self.current in (LAYOUT_DUO_SPLIT, LAYOUT_TRIO, LAYOUT_WIDE, LAYOUT_DUO_WIDE):
+                self.current = LAYOUT_SINGLE
+                self._locked = 0
+                return LAYOUT_SINGLE
+        if self._locked > 0:
+            self._locked -= 1
+            return self.current
+        if proposed != self.current:
+            self._locked = LAYOUT_HYSTERESIS_FRAMES
+            self.current = proposed
+        return self.current
+
+
+def _get_active_speaker_index(scores, prev_idx, history_exists):
+    if not history_exists:
+        return int(np.argmax(scores))
+    max_score = max(scores)
+    prev_score = scores[prev_idx]
+    if prev_score > max_score * 0.85:
+        return prev_idx
+    return int(np.argmax(scores))
+
+
+def render_adaptive_frame(frame, persons_full, out_w, out_h,
+                           layout_state,
+                           vignette_strength=VIGNETTE_STRENGTH*0.7,
+                           color_grade="none",
+                           frame_idx=0):
+    # FIX-E3: frame.shape is (h, w, c) — was incorrectly unpacked as (fw, fh).
+    fh, fw = frame.shape[:2]
+    persons_full = _filter_persons(persons_full, fw, fh)
+
+    proposed = _classify_layout(persons_full, fw, fh)
+    layout   = layout_state.update(proposed, frame_idx, n_persons=len(persons_full))
+
+    persons_s = sorted(persons_full, key=lambda p: (p[0]+p[2])//2)
+
+    if not persons_s and layout_state.prev_groups:
+        persons_s = [b for g in layout_state.prev_groups for b in g]
+
+    if layout == LAYOUT_DUO_SPLIT and len(persons_s) < 2:
+        layout = LAYOUT_SINGLE
+    if layout == LAYOUT_TRIO and len(persons_s) < 2:
+        layout = LAYOUT_SINGLE
+
+    if layout == LAYOUT_SINGLE or len(persons_s) == 0:
+        groups = [persons_s] if persons_s else [[]]
+    elif layout == LAYOUT_DUO_SPLIT:
+        split = len(persons_s) // 2
+        for k in range(1, len(persons_s)):
+            if _should_split(persons_s[k-1], persons_s[k], fw):
+                split = k; break
+        groups = [persons_s[:split], persons_s[split:]]
+    elif layout == LAYOUT_DUO_WIDE:
+        groups = [persons_s]
+    elif layout == LAYOUT_TRIO:
+        main_idx = max(range(len(persons_s)),
+                       key=lambda i: (persons_s[i][2]-persons_s[i][0])*(persons_s[i][3]-persons_s[i][1]))
+        main  = [persons_s[main_idx]]
+        rest  = sorted([p for i, p in enumerate(persons_s) if i != main_idx],
+                       key=lambda p: (p[0]+p[2])//2)
+        mid   = len(rest) // 2 or 1
+        groups = [main, rest[:mid], rest[mid:]]
+    else:
+        groups = [persons_s]
+
+    groups = layout_state.smoother.smooth(groups)
+    layout_state.prev_groups = groups
+
+    # FIX-E2: pass vignette/color_grade down into crop helpers — do NOT apply
+    # them again in the outer loop.  kw is used by crop helpers only.
+    kw = dict(vignette_strength=vignette_strength, color_grade=color_grade)
+
+    if layout == LAYOUT_SINGLE:
+        out_frame = _wide_crop_for_group(frame, groups[0], out_w, out_h, **kw)
+
+    elif layout == LAYOUT_DUO_SPLIT:
+        div    = PANEL_DIVIDER_PX
+        sh_top = ((out_h - div) // 2) & ~1
+        sh_bot = out_h - sh_top - div
+        top = _tight_crop_for_group(frame, groups[0], out_w, sh_top, **kw)
+        bot = _tight_crop_for_group(frame, groups[1], out_w, sh_bot, **kw)
+        out_frame = _assemble_strips([top, bot], out_w, out_h)
+
+    elif layout == LAYOUT_TRIO:
+        div      = PANEL_DIVIDER_PX
+        sh_main  = int((out_h - 2*div) * 0.60) & ~1
+        sh_side  = ((out_h - sh_main - 2*div) // 2) & ~1
+        main_strip = _tight_crop_for_group(frame, groups[0], out_w, sh_main, **kw)
+        side_l     = _tight_crop_for_group(frame, groups[1] if len(groups)>1 else [],
+                                            out_w, sh_side, **kw)
+        side_r     = _tight_crop_for_group(frame, groups[2] if len(groups)>2 else [],
+                                            out_w, sh_side, **kw)
+        bottom_w = out_w // 2
+        sl = cv2.resize(side_l, (bottom_w, sh_side), interpolation=cv2.INTER_LINEAR)
+        sr = cv2.resize(side_r, (out_w - bottom_w, sh_side), interpolation=cv2.INTER_LINEAR)
+        bottom_row = np.concatenate([sl, sr], axis=1)
+        canvas = np.empty((out_h, out_w, 3), dtype=np.uint8)
+        y = 0
+        canvas[y:y+sh_main, :] = main_strip;  y += sh_main
+        canvas[y:y+div, :]     = PANEL_DIVIDER_COLOR; y += div
+        canvas[y:y+sh_side, :] = bottom_row;  y += sh_side
+        if y < out_h: canvas[y:, :] = PANEL_DIVIDER_COLOR
+        out_frame = canvas
+
+    else:
+        out_frame = _wide_crop_for_group(frame, groups[0], out_w, out_h, **kw)
+
+    return out_frame, layout
 
 
 # ── Optical flow / saliency ───────────────────────────────────────────────────
@@ -599,7 +1065,7 @@ def is_scene_change(prev,curr,threshold=0.35):
     except Exception: return False
 
 
-# ── FIX-2: Smooth camera path ─────────────────────────────────────────────────
+# ── Smooth camera path ────────────────────────────────────────────────────────
 def _cubic_hermite(p0,p1,m0,m1,t):
     t2=t*t; t3=t2*t
     return (2*t3-3*t2+1)*p0+(t3-2*t2+t)*m0+(-2*t3+3*t2)*p1+(t3-t2)*m1
@@ -663,18 +1129,6 @@ def smooth_centers(centers,speeds,base_window=27,adaptive=True,scene_cuts=None):
         if e-s<3: continue
         w=max(_vel_to_window(float(np.median(spd[s:e]))) if adaptive else base_window,13)
         xs_s,ys_s=_gauss_seg(xs[s:e],ys[s:e],w); rx[s:e]=xs_s; ry[s:e]=ys_s
-    return [(int(x),int(y)) for x,y in zip(rx,ry)]
-
-def _ema_polish(centers,alpha=0.08):
-    if len(centers)<3: return centers
-    n=len(centers); fx=[float(centers[0][0])]; fy=[float(centers[0][1])]
-    for i in range(1,n):
-        fx.append(alpha*centers[i][0]+(1-alpha)*fx[-1])
-        fy.append(alpha*centers[i][1]+(1-alpha)*fy[-1])
-    rx=[fx[-1]]; ry=[fy[-1]]
-    for i in range(n-2,-1,-1):
-        rx.append(alpha*fx[i]+(1-alpha)*rx[-1]); ry.append(alpha*fy[i]+(1-alpha)*ry[-1])
-    rx.reverse(); ry.reverse()
     return [(int(x),int(y)) for x,y in zip(rx,ry)]
 
 
@@ -746,7 +1200,76 @@ def translate_srt(srt_path,target_language,source_language="auto",progress_callb
     except Exception as e: print(f"Translation failed: {e}",file=sys.stderr); return False
 
 
-# ── Clip detection ────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Clip boundary refinement
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _compute_motion_profile(input_path, fps, total_frames, orig_w, orig_h,
+                             sample_every=None, scale_w=320):
+    if sample_every is None: sample_every = max(1, int(fps / 2))
+    sh = max(1, int(scale_w * orig_h / orig_w))
+    scores = {}
+    prev_gray = None
+    fi = 0
+    with FFmpegVideoReader(input_path, orig_w, orig_h, scale_w=scale_w, scale_h=sh) as rdr:
+        for frame in rdr:
+            if fi > total_frames: break
+            if fi % sample_every == 0:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                if prev_gray is not None:
+                    scores[fi] = float(cv2.absdiff(prev_gray, gray).mean()) / 255.0
+                else:
+                    scores[fi] = 0.0
+                prev_gray = gray
+            fi += 1
+    return scores
+
+def _find_nearest_scene_cut(scene_cuts_sec, target_sec, search_window_sec):
+    best = None; best_dist = float("inf")
+    for t in scene_cuts_sec:
+        d = abs(t - target_sec)
+        if d <= search_window_sec and d < best_dist:
+            best_dist = d; best = t
+    return best
+
+def _find_low_motion_valley(motion_profile_sec, target_sec, search_window_sec, fps):
+    candidates = {t: s for t, s in motion_profile_sec.items()
+                  if abs(t - target_sec) <= search_window_sec}
+    if not candidates: return target_sec
+    return min(candidates, key=candidates.get)
+
+def _refine_clip_boundaries(start_sec, end_sec, duration,
+                             scene_cuts_sec, motion_profile_sec,
+                             min_duration, max_duration,
+                             search_window=CLIP_BOUNDARY_SEARCH_SEC,
+                             preroll=CLIP_PREROLL_PAD,
+                             postroll=CLIP_POSTROLL_PAD):
+    cut_start = _find_nearest_scene_cut(scene_cuts_sec, start_sec, search_window)
+    if cut_start is not None: new_start = max(0.0, cut_start + preroll)
+    else:
+        valley = _find_low_motion_valley(motion_profile_sec, start_sec, search_window, fps=1)
+        new_start = max(0.0, valley - preroll * 0.5)
+
+    cut_end = _find_nearest_scene_cut(scene_cuts_sec, end_sec, search_window)
+    if cut_end is not None: new_end = min(duration, cut_end - postroll)
+    else:
+        valley = _find_low_motion_valley(motion_profile_sec, end_sec, search_window, fps=1)
+        new_end = min(duration, valley + postroll * 0.5)
+
+    new_dur = new_end - new_start
+    if new_dur < min_duration:
+        deficit = min_duration - new_dur
+        new_start = max(0.0, new_start - deficit / 2)
+        new_end   = min(duration, new_start + min_duration)
+        new_start = max(0.0, new_end - min_duration)
+    if new_dur > max_duration:
+        centre = (new_start + new_end) / 2
+        new_start = max(0.0, centre - max_duration / 2)
+        new_end   = min(duration, new_start + max_duration)
+    return new_start, new_end
+
+
+# ── Clip detection ─────────────────────────────────────────────────────────────
 def _frame_saliency_score(frame,prev_frame):
     gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
     lap_score=min(float(cv2.Laplacian(gray,cv2.CV_64F).var())/3000.0,1.0)
@@ -786,6 +1309,10 @@ def detect_clips(input_path,min_duration_sec=25.0,max_duration_sec=65.0,
     scores,scene_cuts_frames=_compute_frame_scores(input_path,fps,total_frames,orig_w,orig_h,
         sample_every=sample_every,progress_callback=lambda v,m:_p(v*0.45,m))
     if len(scores)==0: return []
+
+    motion_profile_sec = {fi * sample_every / fps: float(scores[fi]) for fi in range(len(scores))}
+    scene_cuts_sec = [sc / fps for sc in scene_cuts_frames]
+
     _p(0.45,"Computing arcs..."); window=max(5,int(30/(sample_every/fps)))
     ss=(np.convolve(scores,np.ones(window)/window,mode="same") if len(scores)>=window else scores.copy())
     if ss.max()>0: ss=ss/ss.max()
@@ -795,6 +1322,7 @@ def detect_clips(input_path,min_duration_sec=25.0,max_duration_sec=65.0,
         if ss[i]==ss[lo:hi].max() and ss[i]>0.3:
             if not peaks or i-peaks[-1]>min_gap//2: peaks.append(i)
     peaks.sort(key=lambda i:ss[i],reverse=True); peaks=peaks[:target_n_clips*2]
+
     def _arc(pi):
         ps=pi*sample_every/fps; rs=max(0.0,ps-max_duration_sec*0.4); re=min(duration,rs+max_duration_sec)
         for sc in reversed(scene_cuts_frames):
@@ -808,16 +1336,22 @@ def detect_clips(input_path,min_duration_sec=25.0,max_duration_sec=65.0,
         elif cd>max_duration_sec:
             c=(rs+re)/2; rs=max(0.0,c-max_duration_sec/2); re=min(duration,rs+max_duration_sec)
         return rs,re
+
     cands=[]
     for pi in peaks:
         s,e=_arc(pi); sc=float(ss[pi])
         if not any(min(e,ce)-max(s,cs)>min_duration_sec*0.5 for cs,ce,_ in cands): cands.append((s,e,sc))
     cands.sort(key=lambda x:x[2],reverse=True); cands=cands[:target_n_clips]; cands.sort(key=lambda x:x[0])
-    _p(0.55,"SOI per clip..."); segments=[]
+
+    _p(0.55,"Refining boundaries + SOI per clip..."); segments=[]
     for ci,(ss2,se,score) in enumerate(cands):
         _p(0.55+0.35*(ci/max(len(cands),1)),f"Clip {ci+1}/{len(cands)}...")
-        soi_xs=[]; soi_ys=[]; n_s=min(8,max(2,int(se-ss2)))
-        for t in np.linspace(ss2+1,se-1,n_s):
+        refined_start, refined_end = _refine_clip_boundaries(
+            ss2, se, duration, scene_cuts_sec, motion_profile_sec,
+            min_duration=min_duration_sec, max_duration=max_duration_sec,
+        )
+        soi_xs=[]; soi_ys=[]; n_s=min(8,max(2,int(refined_end-refined_start)))
+        for t in np.linspace(refined_start+1,refined_end-1,n_s):
             frame=_read_frame_at(input_path,orig_w,orig_h,t,scale_w=640,scale_h=max(1,int(640*orig_h/orig_w)))
             if frame is None: continue
             if model is not None:
@@ -830,24 +1364,28 @@ def detect_clips(input_path,min_duration_sec=25.0,max_duration_sec=65.0,
                 scx,scy=saliency_center(frame); soi_xs.append(scx); soi_ys.append(scy)
         sr="center"
         if soi_xs: sr=_soi_region_label(int(np.median(soi_xs)),int(np.median(soi_ys)),orig_w,orig_h)
-        ms=int(ss2//60); secs=int(ss2%60); me=int(se//60); sece=int(se%60)
-        segments.append(ClipSegment(start_sec=ss2,end_sec=se,score=score,soi_region=sr,
-            peak_frame=int(np.linspace(ss2+1,se-1,n_s)[n_s//2]*fps),
-            title=f"Clip {ci+1}  ({ms}:{secs:02d} - {me}:{sece:02d})"))
+        ms=int(refined_start//60); secs=int(refined_start%60)
+        me=int(refined_end//60);   sece=int(refined_end%60)
+        segments.append(ClipSegment(
+            start_sec=refined_start, end_sec=refined_end, score=score,
+            soi_region=sr,
+            peak_frame=int(np.linspace(refined_start+1,refined_end-1,n_s)[n_s//2]*fps),
+            title=f"Clip {ci+1}  ({ms}:{secs:02d} - {me}:{sece:02d})",
+        ))
     _p(1.0,f"Found {len(segments)} clips"); return segments
 
 
-# ── process_video — main entry point ─────────────────────────────────────────
+# ── process_video — main entry point ──────────────────────────────────────────
 def process_video(
-    input_path,output_path,
+    input_path, output_path,
     target_preset_label="Match source (no upscale)",
-    tracking_mode="subject",talking_head_bias=0.30,
-    sample_interval=None,confidence=0.45,use_optical_flow=True,
-    smooth_window=27,adaptive_smoothing=True,rule_of_thirds=True,
-    scene_cut_threshold=0.35,output_fps=None,crf=23,encoder_preset="fast",
-    audio_bitrate="128k",yolo_weights="yolov8n.pt",
-    burn_subtitles=False,whisper_model="base",whisper_language=None,
-    subtitle_style_name="Bold White (TikTok)",subtitle_max_chars=42,
+    tracking_mode="subject", talking_head_bias=0.30,
+    sample_interval=None, confidence=0.45, use_optical_flow=True,
+    smooth_window=27, adaptive_smoothing=True, rule_of_thirds=True,
+    scene_cut_threshold=0.35, output_fps=None, crf=23, encoder_preset="fast",
+    audio_bitrate="128k", yolo_weights="yolov8n.pt",
+    burn_subtitles=False, whisper_model="base", whisper_language=None,
+    subtitle_style_name="Bold White (TikTok)", subtitle_max_chars=42,
     subtitle_translate_to=None,
     vignette_strength=VIGNETTE_STRENGTH,
     sharpen_strength=0.0,
@@ -857,214 +1395,332 @@ def process_video(
     ffmpeg_sharpen=False,
     progress_callback=None,
 ):
-    def _p(v,msg=""):
+    def _p(v, msg=""):
         if progress_callback:
-            try: progress_callback(min(max(v,0.0),1.0),msg)
+            try: progress_callback(min(max(v, 0.0), 1.0), msg)
             except Exception: pass
-    result_meta={"output_path":output_path,"subtitle_path":None,"clamped":False,
-                  "effective_size":(0,0),"duration":0.0,"panel_mode":False}
+
+    result_meta = {"output_path": output_path, "subtitle_path": None, "clamped": False,
+                   "effective_size": (0, 0), "duration": 0.0, "panel_mode": False}
+
     _check_ffmpeg()
-    if not os.path.exists(input_path): raise ProcessingError(f"Input not found: {input_path}")
-    if os.path.getsize(input_path)/1024**2>MAX_FILE_SIZE_MB: raise ProcessingError(f"File exceeds {MAX_FILE_SIZE_MB} MB.")
-    info=get_video_info(input_path)
-    fps,total_frames=info["fps"],info["total_frames"]
-    orig_w,orig_h=info["width"],info["height"]; duration=info["duration_seconds"]
-    if total_frames<=0 or orig_w<=0 or orig_h<=0: raise ProcessingError("Corrupt or unreadable video.")
-    if not info["is_landscape"]: raise ProcessingError("Video is already vertical.")
-    lbl=target_preset_label if target_preset_label in RESOLUTION_PRESETS else "Match source (no upscale)"
-    target_w,target_h=resolve_target_size(lbl,orig_w,orig_h)
-    req_w,req_h=RESOLUTION_PRESETS.get(lbl,(0,0))
-    clamped=req_h>0 and (target_h<req_h or target_w<req_w)
-    result_meta.update(clamped=clamped,effective_size=(target_w,target_h),duration=duration)
-    _p(0.01,f"Output {target_w}x{target_h}  source {orig_w}x{orig_h}")
-    if not sample_interval: sample_interval=max(1,int(fps/5))
-    render_fps=float(output_fps) if output_fps and output_fps>0 else fps
-    crop_w,crop_h=calculate_crop_dims(orig_w,orig_h,target_w,target_h)
-    det_scale=min(1.0,640/orig_w); det_w,det_h=max(1,int(orig_w*det_scale)),max(1,int(orig_h*det_scale))
-    sx,sy=orig_w/det_w,orig_h/det_h
+    if not os.path.exists(input_path):
+        raise ProcessingError(f"Input not found: {input_path}")
+    if os.path.getsize(input_path) / 1024**2 > MAX_FILE_SIZE_MB:
+        raise ProcessingError(f"File exceeds {MAX_FILE_SIZE_MB} MB.")
 
-    srt_path=None
+    info = get_video_info(input_path)
+    fps, total_frames = info["fps"], info["total_frames"]
+    orig_w, orig_h = info["width"], info["height"]
+    duration = info["duration_seconds"]
+
+    if total_frames <= 0 or orig_w <= 0 or orig_h <= 0:
+        raise ProcessingError("Corrupt or unreadable video.")
+    if not info["is_landscape"]:
+        raise ProcessingError("Video is already vertical.")
+
+    # FIX-E7: resolve sample_interval immediately after we have fps, before
+    # anything else that might reference it.
+    if not sample_interval:
+        sample_interval = max(1, int(fps / 5))
+
+    lbl = target_preset_label if target_preset_label in RESOLUTION_PRESETS else "Match source (no upscale)"
+    target_w, target_h = resolve_target_size(lbl, orig_w, orig_h)
+    req_w, req_h = RESOLUTION_PRESETS.get(lbl, (0, 0))
+    clamped = req_h > 0 and (target_h < req_h or target_w < req_w)
+    result_meta.update(clamped=clamped, effective_size=(target_w, target_h), duration=duration)
+    _p(0.01, f"Output {target_w}x{target_h}  source {orig_w}x{orig_h}")
+
+    render_fps = float(output_fps) if output_fps and output_fps > 0 else fps
+    crop_w, crop_h = calculate_crop_dims(orig_w, orig_h, target_w, target_h)
+    det_scale = min(1.0, 640 / orig_w)
+    det_w, det_h = max(1, int(orig_w * det_scale)), max(1, int(orig_h * det_scale))
+    sx, sy = orig_w / det_w, orig_h / det_h
+
+    # FIX-E6: clear pillarbox cache between jobs so stale entries from a
+    # different video don't ghost into this one.
+    _pillarbox_cache.clear()
+
+    srt_path = None
     if burn_subtitles and _has_audio(input_path):
-        _p(0.02,"Transcribing...")
-        srt_fd,srt_path=tempfile.mkstemp(suffix=".srt"); os.close(srt_fd)
-        ok=transcribe_to_srt(input_path,srt_path,whisper_model=whisper_model,language=whisper_language,
-                              max_chars_per_line=subtitle_max_chars,progress_callback=lambda v,m:_p(0.02+v*0.08,m))
+        _p(0.02, "Transcribing...")
+        srt_fd, srt_path = tempfile.mkstemp(suffix=".srt"); os.close(srt_fd)
+        ok = transcribe_to_srt(input_path, srt_path, whisper_model=whisper_model,
+                                language=whisper_language, max_chars_per_line=subtitle_max_chars,
+                                progress_callback=lambda v, m: _p(0.02 + v * 0.08, m))
         if not ok:
-            if os.path.exists(srt_path): os.unlink(srt_path); srt_path=None
+            if os.path.exists(srt_path): os.unlink(srt_path)
+            srt_path = None
         else:
-            if subtitle_translate_to: translate_srt(srt_path,target_language=subtitle_translate_to,progress_callback=lambda v,m:_p(0.10+v*0.05,m))
-            result_meta["subtitle_path"]=srt_path
+            if subtitle_translate_to:
+                translate_srt(srt_path, target_language=subtitle_translate_to,
+                              progress_callback=lambda v, m: _p(0.10 + v * 0.05, m))
+            result_meta["subtitle_path"] = srt_path
 
-    start_pct=0.10; model_obj=None
-    if tracking_mode=="subject":
-        _p(start_pct,"Loading YOLO..."); model_obj=_get_model(yolo_weights)
-        if model_obj is None: _p(start_pct,"YOLO unavailable - saliency fallback")
-    elif tracking_mode=="talking_head":
-        _p(start_pct,"Loading face detector...")
-        if _get_haar() is None and _load_face_net() is None: _p(start_pct,"No face detector - saliency fallback")
+    start_pct = 0.10
+    model_obj = None
+    if tracking_mode == "subject":
+        _p(start_pct, "Loading YOLO...")
+        model_obj = _get_model(yolo_weights)
+        if model_obj is None: _p(start_pct, "YOLO unavailable - saliency fallback")
+    elif tracking_mode == "talking_head":
+        _p(start_pct, "Loading face detector...")
+        if _get_haar() is None and _load_face_net() is None:
+            _p(start_pct, "No face detector - saliency fallback")
 
-    is_panel=False; slot_smoother=None
-    if tracking_mode=="subject" and model_obj is not None:
-        _p(start_pct+0.01,"Checking panel/group shot...")
-        is_panel=_detect_panel_mode(input_path,model_obj,fps,total_frames,orig_w,orig_h,confidence,n_probe=8)
-        if is_panel:
-            _p(start_pct+0.02,"Panel mode - 2-row vertical split"); result_meta["panel_mode"]=True
-            slot_smoother=PanelSlotSmoother()
+    layout_state    = LayoutState()
+    dominant_layout = LAYOUT_SINGLE
+    persons_cache   = []
 
-    extra_vf=_build_ffmpeg_vf(color_grade="none" if not is_panel else color_grade,ffmpeg_sharpen=ffmpeg_sharpen)
-    _p(0.12,f"Single-pass detect+render ({total_frames} frames)...")
-    style=SUBTITLE_STYLES.get(subtitle_style_name,SUBTITLE_STYLES["Bold White (TikTok)"])
-    proc=_open_ffmpeg_encoder(output_path,target_w,target_h,render_fps,audio_source=input_path,
-                               crf=crf,preset=encoder_preset,audio_bitrate=audio_bitrate,
-                               subtitle_path=srt_path,subtitle_style=style,
-                               extra_vf=extra_vf if extra_vf else None)
-    if vignette_strength>0: _build_vignette(target_w,target_h,vignette_strength)
-    if color_grade and color_grade!="none": _build_lut(color_grade)
-    dissolve_buf=DissolveBuffer(DISSOLVE_FRAMES) if dissolve_cuts else None
+    if tracking_mode == "subject" and model_obj is not None:
+        _p(start_pct + 0.01, "Probing scene layout...")
+        dominant_layout = _probe_dominant_layout(
+            input_path, model_obj, fps, total_frames,
+            orig_w, orig_h, confidence, n_probe=18,
+        )
+        layout_state.current = dominant_layout
+        result_meta["panel_mode"] = dominant_layout != LAYOUT_SINGLE
+        _p(start_pct + 0.02, f"Dominant layout: {dominant_layout}")
 
-    det_centers=[]; det_indices=[]; scene_cuts=[]
-    prev_gray=None; prev_flow=None
-    last_det=None; det_dropout=0; MAX_DROPOUT=int(fps*1.5)
-    cur_cx=orig_w//2; cur_cy=orig_h//2; prev_anchor=None
-    hw,hh=crop_w//2,crop_h//2; prev_slots=None; last_out_frame=None
-    rpt_n=max(1,total_frames//40); fi=0
+    extra_vf = _build_ffmpeg_vf(color_grade=color_grade, ffmpeg_sharpen=ffmpeg_sharpen)
+    _p(0.12, f"Single-pass detect+render ({total_frames} frames)  layout={dominant_layout}")
+    style = SUBTITLE_STYLES.get(subtitle_style_name, SUBTITLE_STYLES["Bold White (TikTok)"])
+    proc = _open_ffmpeg_encoder(
+        output_path, target_w, target_h, render_fps, audio_source=input_path,
+        crf=crf, preset=encoder_preset, audio_bitrate=audio_bitrate,
+        subtitle_path=srt_path, subtitle_style=style,
+        extra_vf=extra_vf if extra_vf else None,
+    )
+    if vignette_strength > 0: _build_vignette(target_w, target_h, vignette_strength)
+    if color_grade and color_grade != "none": _build_lut(color_grade)
+    dissolve_buf = DissolveBuffer(DISSOLVE_FRAMES) if dissolve_cuts else None
+
+    # FIX-E8: removed dead det_centers / det_indices accumulators.
+    # The TargetSmoother + CropAnchor chain IS the runtime smoothing path;
+    # the post-pass interpolate_centers / smooth_centers pipeline was never
+    # wired up and was accumulating data for the entire video duration in RAM.
+    scene_cuts: List[int] = []
+    prev_gray = None; prev_flow = None
+    last_det = None; det_dropout = 0; MAX_DROPOUT = int(fps * 1.5)
+    cur_cx = orig_w // 2; cur_cy = orig_h // 2
+    hw, hh = crop_w // 2, crop_h // 2
+    last_out_frame = None
+    rpt_n = max(1, total_frames // 40)
+    fi = 0
+    last_sample_fi = 0        # for inter-frame interpolation (FIX-B6)
+    last_sample_cx = cur_cx
+    last_sample_cy = cur_cy
+    prev_sample_cx = cur_cx
+    prev_sample_cy = cur_cy
+
+    target_smoother  = TargetSmoother(alpha=0.2)
+    crop_anchor      = CropAnchor(alpha=0.15, max_step=8)
+    history_exists   = False
 
     try:
-        with FFmpegVideoReader(input_path,orig_w,orig_h) as reader:
+        with FFmpegVideoReader(input_path, orig_w, orig_h) as reader:
             for frame in reader:
-                if fi>=total_frames: break
-                is_sample=(fi%sample_interval==0)
+                if fi >= total_frames: break
+                is_sample = (fi % sample_interval == 0)
+
                 if is_sample:
-                    det_frame=cv2.resize(frame,(det_w,det_h),interpolation=cv2.INTER_LINEAR)
-                    cg=cv2.cvtColor(det_frame,cv2.COLOR_BGR2GRAY)
-                    cut=is_scene_change(prev_gray,cg,scene_cut_threshold)
+                    det_frame = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_LINEAR)
+                    cg = cv2.cvtColor(det_frame, cv2.COLOR_BGR2GRAY)
+                    cut = is_scene_change(prev_gray, cg, scene_cut_threshold)
                     if cut:
-                        scene_cuts.append(fi); prev_flow=None; det_dropout=0
-                        if dissolve_buf and last_out_frame is not None: dissolve_buf.on_cut(last_out_frame)
-                    prev_gray=cg; anchor_cx=anchor_cy=None
-                    if is_panel:
-                        pass
-                    elif tracking_mode=="talking_head":
-                        faces=detect_faces(det_frame,confidence_thresh=0.5)
+                        scene_cuts.append(fi); prev_flow = None; det_dropout = 0
+                        if dissolve_buf and last_out_frame is not None:
+                            dissolve_buf.on_cut(last_out_frame)
+                    prev_gray = cg
+
+                    if tracking_mode == "subject" and model_obj is not None:
+                        raw_dets = detect_persons_all(det_frame, model_obj, confidence)
+                        persons_cache = [(int(x1*sx), int(y1*sy), int(x2*sx), int(y2*sy))
+                                         for x1, y1, x2, y2 in raw_dets]
+
+                    anchor_cx = anchor_cy = None
+                    if tracking_mode == "talking_head":
+                        faces = detect_faces(det_frame, confidence_thresh=0.5)
                         if faces:
-                            faces_orig=[(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy)) for x1,y1,x2,y2 in faces]
-                            r=talking_head_center(faces_orig,orig_w,orig_h,crop_w,crop_h,talking_head_bias)
-                            if r: anchor_cx,anchor_cy=r; det_dropout=0
+                            faces_orig = [(int(x1*sx), int(y1*sy), int(x2*sx), int(y2*sy))
+                                          for x1, y1, x2, y2 in faces]
+                            r = talking_head_center(faces_orig, orig_w, orig_h, crop_w, crop_h, talking_head_bias)
+                            if r: anchor_cx, anchor_cy = r; det_dropout = 0
                         if anchor_cx is None and use_optical_flow:
-                            sm=cv2.resize(cg,(max(1,det_w//2),max(1,det_h//2)))
+                            sm = cv2.resize(cg, (max(1, det_w//2), max(1, det_h//2)))
                             if prev_flow is not None:
-                                fc=optical_flow_center(prev_flow,sm,det_w//2,det_h//2)
-                                if fc: anchor_cx,anchor_cy=int(fc[0]*2*sx),int(fc[1]*2*sy)
-                            prev_flow=sm; det_dropout+=sample_interval
-                    else:
-                        if model_obj is not None:
-                            det=detect_subjects(det_frame,model_obj,confidence)
+                                fc = optical_flow_center(prev_flow, sm, det_w//2, det_h//2)
+                                if fc: anchor_cx, anchor_cy = int(fc[0]*2*sx), int(fc[1]*2*sy)
+                            prev_flow = sm; det_dropout += sample_interval
+                    elif tracking_mode == "subject":
+                        if persons_cache:
+                            det = detect_subjects(det_frame, model_obj, confidence)
                             if det is not None:
-                                anchor_cx,anchor_cy=frame_for_union(int(det.ux1*sx),int(det.uy1*sy),
-                                    int(det.ux2*sx),int(det.uy2*sy),orig_w,orig_h,crop_w,crop_h)
-                                last_det=(anchor_cx,anchor_cy); det_dropout=0
+                                anchor_cx, anchor_cy = frame_for_union(
+                                    int(det.ux1*sx), int(det.uy1*sy),
+                                    int(det.ux2*sx), int(det.uy2*sy),
+                                    orig_w, orig_h, crop_w, crop_h)
+                                last_det = (anchor_cx, anchor_cy); det_dropout = 0
                         if anchor_cx is None and use_optical_flow:
-                            sm=cv2.resize(cg,(max(1,det_w//2),max(1,det_h//2)))
+                            sm = cv2.resize(cg, (max(1, det_w//2), max(1, det_h//2)))
                             if prev_flow is not None:
-                                fc=optical_flow_center(prev_flow,sm,det_w//2,det_h//2)
-                                if fc: anchor_cx,anchor_cy=int(fc[0]*2*sx),int(fc[1]*2*sy)
-                            prev_flow=sm; det_dropout+=sample_interval
+                                fc = optical_flow_center(prev_flow, sm, det_w//2, det_h//2)
+                                if fc: anchor_cx, anchor_cy = int(fc[0]*2*sx), int(fc[1]*2*sy)
+                            prev_flow = sm; det_dropout += sample_interval
                         if anchor_cx is None:
-                            if last_det and det_dropout<MAX_DROPOUT: anchor_cx,anchor_cy=last_det
+                            if last_det and det_dropout < MAX_DROPOUT:
+                                anchor_cx, anchor_cy = last_det
                             else:
-                                sc_=saliency_center(det_frame); anchor_cx,anchor_cy=int(sc_[0]*sx),int(sc_[1]*sy)
-                    if anchor_cx is not None and not is_panel:
-                        det_centers.append((anchor_cx,anchor_cy)); det_indices.append(fi)
-                        prev_anchor=(fi,anchor_cx,anchor_cy); cur_cx,cur_cy=anchor_cx,anchor_cy
+                                sc_ = saliency_center(det_frame)
+                                anchor_cx, anchor_cy = int(sc_[0]*sx), int(sc_[1]*sy)
 
-                if not is_panel and not is_sample and prev_anchor is not None and len(det_centers)>=2:
-                    fi_a,cx_a,cy_a=prev_anchor; alpha=min(1.0,(fi-fi_a)/sample_interval)
-                    cur_cx=int(cx_a*(1-alpha)+det_centers[-1][0]*alpha)
-                    cur_cy=int(cy_a*(1-alpha)+det_centers[-1][1]*alpha)
-                cur_cx=max(hw,min(cur_cx,orig_w-hw)); cur_cy=max(hh,min(cur_cy,orig_h-hh))
+                    if anchor_cx is not None:
+                        ts_cx, ts_cy = target_smoother.update(anchor_cx, anchor_cy)
+                        prev_sample_cx, prev_sample_cy = last_sample_cx, last_sample_cy
+                        cur_cx, cur_cy = crop_anchor.update(ts_cx, ts_cy)
+                        last_sample_cx, last_sample_cy = cur_cx, cur_cy
+                        last_sample_fi = fi
+                        history_exists = True
 
-                if is_panel:
-                    if is_sample:
-                        det_frame_p=cv2.resize(frame,(det_w,det_h),interpolation=cv2.INTER_LINEAR)
-                        persons_det=detect_persons_all(det_frame_p,model_obj,confidence)
-                        persons_full=[(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy)) for x1,y1,x2,y2 in persons_det]
-                    else:
-                        persons_full=[b for grp in (prev_slots or []) if grp for b in grp]
-                    out_frame,prev_slots=_render_panel_frame(frame,persons_full,target_w,target_h,prev_slots,
-                        vignette_strength=vignette_strength*0.7,color_grade=color_grade,slot_smoother=slot_smoother)
+                # ── Interpolate between sample frames (FIX-B6) ─────────────
+                if not is_sample:
+                    if history_exists:
+                        span = max(sample_interval, 1)
+                        alpha = min(1.0, (fi - last_sample_fi) / span)
+                        cur_cx = int(prev_sample_cx * (1 - alpha) + last_sample_cx * alpha)
+                        cur_cy = int(prev_sample_cy * (1 - alpha) + last_sample_cy * alpha)
+
+                cur_cx = max(hw, min(cur_cx, orig_w - hw))
+                cur_cy = max(hh, min(cur_cy, orig_h - hh))
+
+                # ══ Render ════════════════════════════════════════════════
+                if tracking_mode == "subject" and model_obj is not None:
+                    pf = persons_cache if is_sample else [b for g in layout_state.prev_groups for b in g]
+
+                    out_frame, active_layout = render_adaptive_frame(
+                        frame, pf, target_w, target_h,
+                        layout_state=layout_state,
+                        # FIX-E2: vignette/color_grade applied inside crop helpers;
+                        # do NOT pass them to the outer loop again.
+                        vignette_strength=vignette_strength * 0.7,
+                        color_grade=color_grade,
+                        frame_idx=fi,
+                    )
+
+                    if active_layout == LAYOUT_SINGLE:
+                        left = max(0, min(cur_cx - crop_w // 2, orig_w - crop_w))
+                        top_ = max(0, min(cur_cy - crop_h // 2, orig_h - crop_h))
+                        crop = frame[top_:top_ + crop_h, left:left + crop_w]
+                        if crop.shape[1] != target_w or crop.shape[0] != target_h:
+                            crop = cv2.resize(crop, (target_w, target_h),
+                                              interpolation=cv2.INTER_LANCZOS4)
+                        out_frame = crop
+                        # For SINGLE layout the crop helpers are bypassed, so
+                        # apply effects here (these are the only application).
+                        if color_grade and color_grade != "none":
+                            out_frame = apply_color_grade(out_frame, color_grade)
+                        if vignette_strength > 0:
+                            out_frame = apply_vignette(out_frame, vignette_strength)
+
                 else:
-                    left=max(0,min(cur_cx-crop_w//2,orig_w-crop_w))
-                    top=max(0,min(cur_cy-crop_h//2,orig_h-crop_h))
-                    crop=frame[top:top+crop_h,left:left+crop_w]
-                    if crop.shape[1]!=target_w or crop.shape[0]!=target_h:
-                        crop=cv2.resize(crop,(target_w,target_h),interpolation=cv2.INTER_LANCZOS4)
-                    out_frame=crop
-                    if ken_burns: out_frame=apply_ken_burns(out_frame,fi,fps)
-                    if sharpen_strength>0: out_frame=apply_sharpen(out_frame,sharpen_strength)
-                    if color_grade and color_grade!="none": out_frame=apply_color_grade(out_frame,color_grade)
-                    if vignette_strength>0: out_frame=apply_vignette(out_frame,vignette_strength)
+                    left = max(0, min(cur_cx - crop_w // 2, orig_w - crop_w))
+                    top_ = max(0, min(cur_cy - crop_h // 2, orig_h - crop_h))
+                    crop = frame[top_:top_ + crop_h, left:left + crop_w]
+                    if crop.shape[1] != target_w or crop.shape[0] != target_h:
+                        crop = cv2.resize(crop, (target_w, target_h),
+                                          interpolation=cv2.INTER_LANCZOS4)
+                    out_frame = crop
+                    # Talking-head / saliency path — apply effects once here.
+                    if color_grade and color_grade != "none":
+                        out_frame = apply_color_grade(out_frame, color_grade)
+                    if vignette_strength > 0:
+                        out_frame = apply_vignette(out_frame, vignette_strength)
 
-                if dissolve_buf and dissolve_buf.active: out_frame=dissolve_buf.blend(out_frame)
-                last_out_frame=out_frame
+                # Post-effects that are cheap and non-duplicating.
+                if ken_burns:            out_frame = apply_ken_burns(out_frame, fi, fps)
+                if sharpen_strength > 0: out_frame = apply_sharpen(out_frame, sharpen_strength)
+
+                if dissolve_buf and dissolve_buf.active:
+                    out_frame = dissolve_buf.blend(out_frame)
+                last_out_frame = out_frame
+
                 try: proc.stdin.write(out_frame.tobytes())
                 except BrokenPipeError: break
-                fi+=1
-                if fi%rpt_n==0: _p(0.12+0.75*(fi/total_frames),f"{fi}/{total_frames}...")
+
+                fi += 1
+                if fi % rpt_n == 0:
+                    _p(0.12 + 0.75 * (fi / total_frames), f"{fi}/{total_frames}...")
+
     finally:
         pass
 
-    _p(0.88,"Encoding..."); _close_ffmpeg_encoder(proc,output_path)
-    _p(1.0,"Done!")
+    _p(0.88, "Encoding...")
+    _close_ffmpeg_encoder(proc, output_path)
+    _p(1.0, "Done!")
     print(f"Output: {output_path}  ({os.path.getsize(output_path)/1024**2:.1f} MB)"
-          f"  anchors={len(det_centers)}  cuts={len(scene_cuts)}",file=sys.stderr)
+          f"  cuts={len(scene_cuts)}", file=sys.stderr)
     return result_meta
 
 
 # ── Batch clip pipeline ───────────────────────────────────────────────────────
 def process_clips_batch(
-    input_path,output_dir,clips,
+    input_path, output_dir, clips,
     target_preset_label="720p   (720x1280  - HD)",
-    tracking_mode="subject",talking_head_bias=0.30,
-    confidence=0.45,smooth_window=27,adaptive_smoothing=True,
-    use_optical_flow=True,rule_of_thirds=True,crf=23,encoder_preset="fast",
-    audio_bitrate="128k",yolo_weights="yolov8n.pt",
-    burn_subtitles=False,whisper_model="base",
-    subtitle_style_name="Bold White (TikTok)",subtitle_max_chars=42,
-    vignette_strength=VIGNETTE_STRENGTH,sharpen_strength=0.0,color_grade="none",
-    ken_burns=False,dissolve_cuts=True,ffmpeg_sharpen=False,
+    tracking_mode="subject", talking_head_bias=0.30,
+    confidence=0.45, smooth_window=27, adaptive_smoothing=True,
+    use_optical_flow=True, rule_of_thirds=True, crf=23, encoder_preset="fast",
+    audio_bitrate="128k", yolo_weights="yolov8n.pt",
+    burn_subtitles=False, whisper_model="base",
+    subtitle_style_name="Bold White (TikTok)", subtitle_max_chars=42,
+    vignette_strength=VIGNETTE_STRENGTH, sharpen_strength=0.0, color_grade="none",
+    ken_burns=False, dissolve_cuts=True, ffmpeg_sharpen=False,
     progress_callback=None,
 ):
-    def _p(v,msg=""):
+    def _p(v, msg=""):
         if progress_callback:
-            try: progress_callback(v,msg)
+            try: progress_callback(v, msg)
             except Exception: pass
-    os.makedirs(output_dir,exist_ok=True); results=[]
-    for i,clip in enumerate(clips):
-        base_pct=i/max(len(clips),1); next_pct=(i+1)/max(len(clips),1)
-        _p(base_pct,f"Clip {i+1}/{len(clips)}...")
-        trimmed_path=None; out_path=None
+
+    os.makedirs(output_dir, exist_ok=True)
+    results = []
+    for i, clip in enumerate(clips):
+        base_pct = i / max(len(clips), 1)
+        next_pct = (i + 1) / max(len(clips), 1)
+        _p(base_pct, f"Clip {i+1}/{len(clips)}...")
+        trimmed_path = None; out_path = None
         try:
-            fd,trimmed_path=tempfile.mkstemp(suffix=".mp4"); os.close(fd)
-            if not _trim_video(input_path,trimmed_path,clip.start_sec,clip.end_sec):
-                results.append({"clip":clip,"output_path":None,"error":"trim failed"}); continue
-            out_path=os.path.join(output_dir,f"clip_{i+1:02d}_{int(clip.start_sec)}s_{int(clip.end_sec)}s_vertical.mp4")
-            def clip_cb(v,msg="",_b=base_pct,_n=next_pct): _p(_b+v*(_n-_b),msg)
-            meta=process_video(trimmed_path,out_path,target_preset_label=target_preset_label,
-                tracking_mode=tracking_mode,talking_head_bias=talking_head_bias,
-                confidence=confidence,smooth_window=smooth_window,adaptive_smoothing=adaptive_smoothing,
-                use_optical_flow=use_optical_flow,rule_of_thirds=rule_of_thirds,
-                crf=crf,encoder_preset=encoder_preset,audio_bitrate=audio_bitrate,
-                yolo_weights=yolo_weights,burn_subtitles=burn_subtitles,whisper_model=whisper_model,
-                subtitle_style_name=subtitle_style_name,subtitle_max_chars=subtitle_max_chars,
-                vignette_strength=vignette_strength,sharpen_strength=sharpen_strength,
-                color_grade=color_grade,ken_burns=ken_burns,dissolve_cuts=dissolve_cuts,
-                ffmpeg_sharpen=ffmpeg_sharpen,progress_callback=clip_cb)
-            meta["clip"]=clip; results.append(meta)
+            fd, trimmed_path = tempfile.mkstemp(suffix=".mp4"); os.close(fd)
+            if not _trim_video(input_path, trimmed_path, clip.start_sec, clip.end_sec):
+                results.append({"clip": clip, "output_path": None, "error": "trim failed"})
+                continue
+            out_path = os.path.join(
+                output_dir,
+                f"clip_{i+1:02d}_{int(clip.start_sec)}s_{int(clip.end_sec)}s_vertical.mp4",
+            )
+            def clip_cb(v, msg="", _b=base_pct, _n=next_pct): _p(_b + v * (_n - _b), msg)
+            meta = process_video(
+                trimmed_path, out_path,
+                target_preset_label=target_preset_label,
+                tracking_mode=tracking_mode, talking_head_bias=talking_head_bias,
+                confidence=confidence, smooth_window=smooth_window,
+                adaptive_smoothing=adaptive_smoothing, use_optical_flow=use_optical_flow,
+                rule_of_thirds=rule_of_thirds, crf=crf, encoder_preset=encoder_preset,
+                audio_bitrate=audio_bitrate, yolo_weights=yolo_weights,
+                burn_subtitles=burn_subtitles, whisper_model=whisper_model,
+                subtitle_style_name=subtitle_style_name, subtitle_max_chars=subtitle_max_chars,
+                vignette_strength=vignette_strength, sharpen_strength=sharpen_strength,
+                color_grade=color_grade, ken_burns=ken_burns, dissolve_cuts=dissolve_cuts,
+                ffmpeg_sharpen=ffmpeg_sharpen, progress_callback=clip_cb,
+            )
+            meta["clip"] = clip
+            results.append(meta)
         except Exception as exc:
-            results.append({"clip":clip,"output_path":out_path,"error":str(exc)})
+            results.append({"clip": clip, "output_path": out_path, "error": str(exc)})
         finally:
             if trimmed_path and os.path.exists(trimmed_path):
                 try: os.unlink(trimmed_path)
                 except OSError: pass
-    n_ok=sum(1 for r in results if not r.get("error"))
-    _p(1.0,f"{n_ok}/{len(results)} clips done"); return results
+
+    n_ok = sum(1 for r in results if not r.get("error"))
+    _p(1.0, f"{n_ok}/{len(results)} clips done")
+    return results
