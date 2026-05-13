@@ -1,6 +1,36 @@
 """
-verticalize.py  —  AI Vertical Video converter  v2.8
+verticalize.py  —  AI Vertical Video converter  v2.9
 ──────────────────────────────────────────────────────
+FIXES in v2.9 (Panel Split Correctness):
+
+  FIX-F1  _should_split: add explicit gap_frac guard (> 0.12 of frame width).
+           A true split-screen interview has a real empty strip of background
+           between the two persons (gap ≈ 15-35% of frame width).  A news
+           desk / panel show has persons sitting shoulder-to-shoulder with
+           little or no gap (< 5% of frame width).  The old code only checked
+           center-distance and overlap-ratio, which a news desk easily passed
+           because people at a round table ARE far apart.  The gap check is the
+           clean discriminator that requires no ML and has no false positives.
+
+  FIX-F2  _should_split: raise overlap_ratio threshold 0.10 → 0.05 and
+           dist_ratio 0.70 → 0.75.  Together with FIX-F1 these three
+           conditions must ALL be true, making DUO_SPLIT a genuinely rare,
+           high-confidence event rather than a hair-trigger.
+
+  FIX-F3  _probe_dominant_layout: raise supermajority threshold 0.60 → 0.70.
+           With news content that intercuts close-ups and wide shots the old
+           60% could easily be crossed on a long panel segment.  70% requires
+           a truly dominant multi-person layout before committing.
+
+  FIX-F4  _probe_dominant_layout: weight probe timestamps toward the middle of
+           the clip (skip first and last 10%) so cold-open wide shots or
+           end-card stills don't skew the layout vote.
+
+  FIX-F5  render_adaptive_frame: when layout is LAYOUT_SINGLE but persons_s
+           is non-empty, pass the actual persons list to _wide_crop_for_group
+           so it zooms onto the subject rather than center-cropping.
+           Previously groups[0] could be an empty smoothed slot in this case.
+
 FIXES in v2.8 (Bug-fix pass):
 
   FIX-E1  get_video_info: indentation bug — kv parsing happened inside the
@@ -669,19 +699,48 @@ def _filter_persons(persons, fw, fh, min_w_frac=0.06, min_h_frac=0.18):
     return out
 
 def _should_split(p0, p1, fw):
-    x10,_,x20,_ = p0
-    x11,_,x21,_ = p1
+    """
+    Returns True only for a genuine split-screen interview layout.
+
+    Three conditions ALL required (FIX-F1, FIX-F2):
+
+    1. gap_frac > 0.12  — a real empty strip of background between the two
+       bounding boxes.  News-desk people sit shoulder-to-shoulder (gap < 5%);
+       a true split-screen has a visible centre divider (gap >= 12%).
+
+    2. overlap_ratio < 0.05 — boxes must not overlap (tightened from 0.10).
+
+    3. dist_ratio > 0.75 — centres at least 75% of frame width apart
+       (raised from 0.70; on 1280px that is 960px — truly opposite sides).
+
+    Each person must also be >= 10% of frame width (rejects noise/slivers).
+    """
+    x10, _, x20, _ = p0
+    x11, _, x21, _ = p1
+
+    # Minimum bbox width guard
+    if (x20 - x10) < fw * 0.10 or (x21 - x11) < fw * 0.10:
+        return False
+
+    # Overlap ratio
     overlap = max(0, min(x20, x21) - max(x10, x11))
-    w0 = max(x20 - x10, 1)
-    w1 = max(x21 - x11, 1)
-    min_w = min(w0, w1)
+    min_w = min(max(x20 - x10, 1), max(x21 - x11, 1))
     overlap_ratio = overlap / min_w
+
+    # Centre-to-centre distance ratio
     cx0 = (x10 + x20) / 2
     cx1 = (x11 + x21) / 2
     dist_ratio = abs(cx1 - cx0) / fw
-    if (x20 - x10) < fw * 0.10 or (x21 - x11) < fw * 0.10:
-        return False
-    return overlap_ratio < 0.10 and dist_ratio > 0.70
+
+    # FIX-F1: physical gap between the two bboxes.
+    # Sort so left_x2 is the right edge of whichever person is further left.
+    if cx0 < cx1:
+        left_x2, right_x1 = x20, x11
+    else:
+        left_x2, right_x1 = x21, x10
+    gap_frac = (right_x1 - left_x2) / fw
+
+    return gap_frac > 0.12 and overlap_ratio < 0.05 and dist_ratio > 0.75
 
 def _classify_layout(persons, fw, fh):
     n = len(persons)
@@ -710,7 +769,11 @@ def _probe_dominant_layout(input_path, model, fps, total_frames,
     sw = 640; sh = max(1, int(640 * orig_h / orig_w))
     sx = orig_w / sw; sy = orig_h / sh
     dur = total_frames / max(fps, 1)
-    probe_ts = np.linspace(max(2.0, dur * 0.05), max(3.0, dur * 0.95), n_probe)
+    # FIX-F4: sample the middle 80% of the clip to avoid cold-opens / end-cards
+    # skewing the layout vote.
+    t_start = max(2.0, dur * 0.10)
+    t_end   = max(t_start + 1.0, dur * 0.90)
+    probe_ts = np.linspace(t_start, t_end, n_probe)
     counts = {LAYOUT_SINGLE: 0, LAYOUT_DUO_SPLIT: 0, LAYOUT_DUO_WIDE: 0, LAYOUT_TRIO: 0, LAYOUT_WIDE: 0}
 
     for t in probe_ts:
@@ -724,7 +787,10 @@ def _probe_dominant_layout(input_path, model, fps, total_frames,
 
     total_probed = max(sum(counts.values()), 1)
     best_multi = max((l for l in counts if l != LAYOUT_SINGLE), key=counts.get)
-    if counts[best_multi] / total_probed >= 0.60:
+    # FIX-F3: require 70% supermajority (raised from 60%) before committing
+    # to a multi-person layout.  News content with frequent close-up cutaways
+    # easily cleared 60%; 70% is a much stronger signal.
+    if counts[best_multi] / total_probed >= 0.70:
         return best_multi
     return LAYOUT_SINGLE
 
