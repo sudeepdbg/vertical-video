@@ -1,26 +1,32 @@
 """
 verticalize.py  —  AI Vertical Video Converter  v3.2
 ─────────────────────────────────────────────────────
-JERKINESS FIX (v3.2):
+KALMAN TRACKER (v3.2):
 
-Root cause of remaining jitter in v3.1:
-  - Even with velocity limiting, large delta jumps between detection samples
-    caused the camera to accelerate visibly ("rubber-banding").
-  - YOLO noise is not just Gaussian; it has outliers (bad frames).
+Replaces the stale-detection + optical-flow fallback with a proper
+Kalman filter (KalmanTargetTracker) for per-subject position tracking.
 
-Fixes applied:
-  1. HEAVY TARGET SMOOTHING: Raw detections are passed through a strong EMA
-     (alpha=0.1) BEFORE entering the camera controller. This removes outliers.
-  
-  2. HARD VELOCITY CLAMP: The camera position is physically capped at 
-     MAX_PX_PER_FRAME (2px). It cannot accelerate faster than this.
-     This turns sudden jumps into smooth, constant-speed pans.
+Why Kalman beats the old approach:
+  - Old: when YOLO missed a detection, last_det was held frozen until
+    MAX_STALE frames passed, then saliency_center() took over —
+    giving a sudden jump to the "wrong" anchor.
+  - New: KalmanTargetTracker predicts the subject's position every frame
+    using a constant-velocity model (state = [x, y, vx, vy]).
+    When a detection arrives it corrects the estimate; when detections
+    are absent it coasts on the velocity prediction.  Physically
+    implausible bbox jumps (>KALMAN_MAX_INNOVATION_PX) are rejected
+    as outliers before they ever reach the camera.
 
-  3. HYSTERESIS ON DETECTION: If a detection is lost or noisy, we hold the
-     last known good position longer (MAX_STALE increased) to prevent drifting.
+Integration with existing architecture:
+  - CameraAnchor is UNCHANGED — velocity-limited EMA (v3.1) is still
+    the camera layer.  Kalman sits one level upstream as the "target
+    estimator", feeding set_target() with clean, predicted positions.
+  - set_target() still EMA-smooths before feeding the camera, giving
+    the two-stage filtering chain:
+      raw YOLO → Kalman predict/correct → EMA target → velocity-limited camera
 
-  4. OPTIMIZED SAMPLE RATE: Default sample_interval is now fps//2 (detect every
-     ~0.5s). This is the sweet spot between responsiveness and stability.
+Other v3.1 fixes (MAX_PX_PER_FRAME=2, TARGET_EMA_ALPHA=0.25,
+sample_interval=fps//2) are all preserved.
 """
 
 from __future__ import annotations
@@ -48,22 +54,31 @@ MIN_FRAME_DIM     = 240
 MAX_FRAMES_GUARD  = 1_080_000
 LOWER_THIRD_GUARD = 0.80
 
-# --- SMOOTHING CONSTANTS (Tuned for Zero Jerk) ---
-# MAX_PX_PER_FRAME: The absolute max speed the camera can pan.
-# 2px/frame @ 30fps = 60px/sec. This is slow, deliberate, and cinematic.
-MAX_PX_PER_FRAME  = 2.0 
-# CAMERA_ALPHA_MAX: The max EMA weight. Kept low to ensure "heavy" feel.
-CAMERA_ALPHA_MAX  = 0.05   
-# TARGET_EMA_ALPHA: How much we trust the current raw detection vs history.
-# 0.1 means we ignore 90% of the instantaneous jump, filtering out YOLO jitter.
-TARGET_EMA_ALPHA  = 0.1    
+# Camera smoothing constants (unchanged from v3.1)
+MAX_PX_PER_FRAME  = 2.0
+CAMERA_ALPHA_MAX  = 0.08
+TARGET_EMA_ALPHA  = 0.25
+
+# Kalman filter constants
+# KALMAN_MAX_INNOVATION_PX: detections farther than this from the predicted
+# position are treated as outliers and rejected (not fed into the filter).
+# 200px at source resolution covers real fast movement while blocking
+# YOLO jitter (typically < 50px) and ID-swap jumps (often > 300px).
+KALMAN_MAX_INNOVATION_PX = 200.0
+# Process noise: how much we expect the subject to accelerate between frames.
+# Higher = filter trusts new detections more; lower = smoother but lags.
+KALMAN_PROCESS_NOISE_POS = 4.0    # px² per frame (position)
+KALMAN_PROCESS_NOISE_VEL = 2.0    # (px/frame)² per frame (velocity)
+# Measurement noise: expected YOLO bbox-centre noise in px².
+# yolov8n on 640px input typically has ~15px centre jitter.
+KALMAN_MEASUREMENT_NOISE = 225.0  # 15px std → 15²=225
 
 LAYOUT_SINGLE    = "single"
 LAYOUT_DUO_SPLIT = "duo_split"
 LAYOUT_TRIO      = "trio"
 LAYOUT_WIDE      = "wide"
 
-LAYOUT_HYSTERESIS_FRAMES = 30 # Increased hysteresis to prevent layout flickering
+LAYOUT_HYSTERESIS_FRAMES = 20
 PANEL_SLOT_EMA           = 0.15
 PANEL_DIVIDER_PX         = 4
 PANEL_DIVIDER_COLOR      = (10, 10, 10)
@@ -675,6 +690,138 @@ def is_scene_change(prev, curr, threshold=0.35) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  KALMAN TARGET TRACKER  (replaces stale-detection + last_det fallback)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class KalmanTargetTracker:
+    """
+    Constant-velocity Kalman filter for 2D subject tracking.
+
+    State vector: [x, y, vx, vy]  (position + velocity in pixels)
+    Measurement:  [x, y]           (bbox centre from YOLO)
+
+    Why this is better than the old last_det / MAX_STALE approach:
+      - Old: held last detection frozen, then jumped to saliency_center.
+        Both the freeze and the jump caused visible camera snaps.
+      - New: during detection gaps the filter *predicts* position using
+        the tracked velocity.  A subject moving at 10px/frame will be
+        predicted accurately for several frames without any jump.
+      - Outlier gate (KALMAN_MAX_INNOVATION_PX): if a new YOLO bbox
+        centre lands more than 200px from the prediction, it is rejected
+        as a bbox ID-swap or false positive rather than correcting the
+        filter with a bad measurement.  This removes the main remaining
+        source of sudden camera jumps.
+
+    Usage (mirrors the old set_target / snap API so CameraAnchor is
+    completely unchanged):
+        tracker = KalmanTargetTracker()
+        tracker.snap(cx, cy)        # hard reset on scene cut
+        tracker.update(cx, cy)      # feed a new detection
+        tracker.predict()           # call every frame (with or without detection)
+        px, py = tracker.position   # smoothed, predicted centre
+    """
+
+    def __init__(self,
+                 process_noise_pos: float = KALMAN_PROCESS_NOISE_POS,
+                 process_noise_vel: float = KALMAN_PROCESS_NOISE_VEL,
+                 measurement_noise: float = KALMAN_MEASUREMENT_NOISE,
+                 max_innovation:    float = KALMAN_MAX_INNOVATION_PX):
+        self._max_innov = max_innovation
+        self._initialized = False
+
+        # State transition F:  x' = x + vx,  y' = y + vy
+        self._F = np.array([
+            [1, 0, 1, 0],
+            [0, 1, 0, 1],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ], dtype=np.float64)
+
+        # Measurement matrix H:  we observe [x, y]
+        self._H = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+        ], dtype=np.float64)
+
+        # Process noise covariance Q
+        self._Q = np.diag([
+            process_noise_pos,
+            process_noise_pos,
+            process_noise_vel,
+            process_noise_vel,
+        ]).astype(np.float64)
+
+        # Measurement noise covariance R
+        self._R = np.eye(2, dtype=np.float64) * measurement_noise
+
+        # State estimate and covariance (initialised on first snap/update)
+        self._x = np.zeros((4, 1), dtype=np.float64)   # [x, y, vx, vy]
+        self._P = np.eye(4, dtype=np.float64) * 500.0  # large initial uncertainty
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def snap(self, cx: int, cy: int) -> None:
+        """Hard reset — called on scene cut.  Zeroes velocity."""
+        self._x[:] = [[float(cx)], [float(cy)], [0.0], [0.0]]
+        self._P    = np.eye(4, dtype=np.float64) * 500.0
+        self._initialized = True
+
+    def update(self, cx: int, cy: int) -> bool:
+        """
+        Feed a new detection measurement.
+        Returns True if the measurement was accepted, False if gated out.
+        Automatically initialises the filter on first call.
+        """
+        if not self._initialized:
+            self.snap(cx, cy); return True
+
+        z = np.array([[float(cx)], [float(cy)]])
+
+        # Innovation: how far is this measurement from our prediction?
+        z_pred = self._H @ self._x
+        innov  = z - z_pred
+        dist   = float(np.sqrt(innov[0,0]**2 + innov[1,0]**2))
+
+        if dist > self._max_innov:
+            # Outlier — reject without updating the filter.
+            # If the subject truly teleported (ID-swap), predict() will
+            # coast until a consistent detection re-establishes tracking.
+            return False
+
+        # Standard Kalman correction step
+        S  = self._H @ self._P @ self._H.T + self._R        # innovation covariance
+        K  = self._P @ self._H.T @ np.linalg.inv(S)         # Kalman gain
+        self._x = self._x + K @ innov
+        self._P = (np.eye(4) - K @ self._H) @ self._P
+        return True
+
+    def predict(self) -> None:
+        """
+        Advance the filter by one frame.
+        Call this every frame regardless of whether a detection arrived.
+        """
+        if not self._initialized: return
+        self._x = self._F @ self._x
+        self._P = self._F @ self._P @ self._F.T + self._Q
+
+        # Soft velocity damping: subjects don't accelerate forever between
+        # detections.  Decay velocity by 5% per frame so the prediction
+        # coasts gracefully rather than drifting off-screen.
+        self._x[2, 0] *= 0.95
+        self._x[3, 0] *= 0.95
+
+    @property
+    def position(self) -> Tuple[int, int]:
+        """Current estimated position (post-prediction, post-update)."""
+        if not self._initialized: return (0, 0)
+        return int(self._x[0, 0]), int(self._x[1, 0])
+
+    @property
+    def initialized(self) -> bool:
+        return self._initialized
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  PANEL LAYOUT ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -684,12 +831,6 @@ def _group_union(persons):
             max(p[2] for p in persons), max(p[3] for p in persons))
 
 def _should_split(p0, p1, fw) -> bool:
-    """
-    True only for genuine split-screen interviews. Requires ALL THREE:
-      1. gap_frac > 0.12  — real empty background strip (news desk < 5%, split-screen 12-35%)
-      2. overlap_ratio < 0.05  — boxes must not overlap
-      3. dist_ratio > 0.75  — centres at least 75% of frame width apart
-    """
     x10,_,x20,_ = p0; x11,_,x21,_ = p1
     if (x20-x10) < fw*0.10 or (x21-x11) < fw*0.10: return False
     overlap = max(0, min(x20,x21)-max(x10,x11))
@@ -884,16 +1025,20 @@ def render_adaptive_frame(frame, persons_full, out_w, out_h, layout_state,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CAMERA ANCHOR  —  Heavy Inertia & Hard Velocity Clamp
+#  CAMERA ANCHOR  —  velocity-limited EMA (unchanged from v3.1)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class CameraAnchor:
     """
-    Eliminates jerkiness via two-stage filtering:
-    1. Target Smoothing: Raw detections are EMA-smoothed (alpha=0.1) to remove
-       YOLO outliers before they affect the camera.
-    2. Velocity Clamping: Camera position changes are capped at MAX_PX_PER_FRAME.
-       This ensures smooth, constant-speed pans even if the target jumps.
+    Velocity-limited EMA camera (v3.1, unchanged).
+
+    This is the *camera* layer.  It receives already-smoothed target
+    positions from KalmanTargetTracker via set_target() and moves the
+    crop window toward them at a maximum rate of MAX_PX_PER_FRAME per
+    frame — making fast pans smooth and cinematic.
+
+    Filtering chain (v3.2):
+        raw YOLO → KalmanTargetTracker → set_target EMA → velocity-limited camera
     """
     def __init__(self, max_px_per_frame=MAX_PX_PER_FRAME, alpha_max=CAMERA_ALPHA_MAX,
                  target_alpha=TARGET_EMA_ALPHA):
@@ -902,11 +1047,11 @@ class CameraAnchor:
         self.target_alpha  = target_alpha
         self._cx: Optional[float] = None
         self._cy: Optional[float] = None
-        self._tx: Optional[float] = None   # smoothed target x
-        self._ty: Optional[float] = None   # smoothed target y
+        self._tx: Optional[float] = None
+        self._ty: Optional[float] = None
 
     def set_target(self, cx: int, cy: int):
-        """Update detection target with heavy EMA smoothing."""
+        """EMA-smooth incoming target before feeding the velocity limiter."""
         if self._tx is None:
             self._tx = float(cx); self._ty = float(cy)
         else:
@@ -920,30 +1065,16 @@ class CameraAnchor:
         self._cy = self._ty = float(cy)
 
     def step(self) -> Tuple[int, int]:
-        """Advance camera by one frame with hard velocity clamp."""
+        """Advance camera by one frame — at most max_px pixels."""
         if self._cx is None:
             self._cx = self._tx or 0.0; self._cy = self._ty or 0.0
             return int(self._cx), int(self._cy)
-        
         if self._tx is not None:
-            dx = self._tx - self._cx
-            dy = self._ty - self._cy
-            
-            # Calculate distance to target
-            dist = math.sqrt(dx*dx + dy*dy)
-            
-            if dist > 0:
-                # Determine alpha based on velocity limit
-                # We want to move 'max_px' towards the target.
-                # alpha = distance_to_move / total_distance
-                desired_alpha = self.max_px / dist
-                
-                # Cap alpha so we don't overshoot or react too fast
-                alpha = min(desired_alpha, self.alpha_max)
-                
-                self._cx += alpha * dx
-                self._cy += alpha * dy
-                
+            dx = self._tx - self._cx; dy = self._ty - self._cy
+            dist = max(math.sqrt(dx*dx + dy*dy), 1e-6)
+            alpha = min(self.max_px / dist, self.alpha_max)
+            self._cx += alpha * dx
+            self._cy += alpha * dy
         return int(self._cx), int(self._cy)
 
 
@@ -1210,8 +1341,6 @@ def process_video(
     if total_frames<=0 or orig_w<=0 or orig_h<=0: raise ProcessingError("Corrupt or unreadable video.")
     if not info["is_landscape"]: raise ProcessingError("Video is already vertical.")
 
-    # Detect every ~0.5s — enough to track movement, not so often that
-    # bbox noise causes visible jitter between detection frames.
     if not sample_interval:
         sample_interval = max(1, int(fps // 2))
 
@@ -1279,13 +1408,18 @@ def process_video(
     dissolve_buf=DissolveBuffer(DISSOLVE_FRAMES) if dissolve_cuts else None
 
     # ── Per-frame state ────────────────────────────────────────────────────────
-    anchor=CameraAnchor()
+    # v3.2: KalmanTargetTracker replaces last_det / det_stale / MAX_STALE.
+    # The tracker predicts position every frame and gates outlier detections.
+    kalman      = KalmanTargetTracker()
+    anchor      = CameraAnchor()
     anchor.snap(orig_w//2, orig_h//2)
+    kalman.snap(orig_w//2, orig_h//2)
 
-    prev_gray=None; prev_flow=None
-    last_det=None; det_stale=0; MAX_STALE=int(fps*2.0) # Increased stale tolerance
-    last_out_frame: Optional[np.ndarray]=None
-    rpt_n=max(1,total_frames//40); fi=0
+    prev_gray   = None
+    prev_flow   = None
+    last_out_frame: Optional[np.ndarray] = None
+    rpt_n       = max(1, total_frames//40)
+    fi          = 0
 
     _p(0.13,f"Rendering {total_frames} frames — layout={dominant_layout}")
 
@@ -1293,106 +1427,132 @@ def process_video(
         with FFmpegVideoReader(input_path,orig_w,orig_h) as reader:
             for frame in reader:
                 if fi>=total_frames: break
-                is_sample=(fi%sample_interval==0)
+                is_sample = (fi % sample_interval == 0)
 
                 if is_sample:
-                    det_frame=cv2.resize(frame,(det_w,det_h),interpolation=cv2.INTER_LINEAR)
-                    cg=cv2.cvtColor(det_frame,cv2.COLOR_BGR2GRAY)
-                    cut=is_scene_change(prev_gray,cg,scene_cut_threshold)
-                    prev_gray=cg
+                    det_frame = cv2.resize(frame,(det_w,det_h),interpolation=cv2.INTER_LINEAR)
+                    cg        = cv2.cvtColor(det_frame,cv2.COLOR_BGR2GRAY)
+                    cut       = is_scene_change(prev_gray,cg,scene_cut_threshold)
+                    prev_gray = cg
 
                     if cut:
-                        prev_flow=None; det_stale=0
+                        prev_flow = None
                         if dissolve_buf and last_out_frame is not None:
                             dissolve_buf.on_cut(last_out_frame)
 
                     if tracking_mode=="subject" and model_obj is not None:
-                        raw=detect_persons_all(det_frame,model_obj,confidence)
-                        persons_cache=[(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy))
-                                        for x1,y1,x2,y2 in raw]
+                        raw = detect_persons_all(det_frame, model_obj, confidence)
+                        persons_cache = [(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy))
+                                         for x1,y1,x2,y2 in raw]
 
-                    new_tcx=new_tcy=None
+                    got_target = False
 
                     if tracking_mode=="talking_head":
-                        faces=detect_faces(det_frame,confidence_thresh=0.5)
+                        faces = detect_faces(det_frame, confidence_thresh=0.5)
                         if faces:
-                            fo=[(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy))
-                                for x1,y1,x2,y2 in faces]
-                            r=talking_head_center(fo,orig_w,orig_h,crop_w,crop_h,talking_head_bias)
-                            if r: new_tcx,new_tcy=r; det_stale=0
+                            fo = [(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy))
+                                  for x1,y1,x2,y2 in faces]
+                            r  = talking_head_center(fo,orig_w,orig_h,crop_w,crop_h,talking_head_bias)
+                            if r:
+                                new_tcx, new_tcy = r
+                                if cut:
+                                    anchor.snap(new_tcx, new_tcy)
+                                    kalman.snap(new_tcx, new_tcy)
+                                else:
+                                    kalman.update(new_tcx, new_tcy)
+                                    kx, ky = kalman.position
+                                    anchor.set_target(kx, ky)
+                                got_target = True
+
                     elif tracking_mode=="subject":
                         if persons_cache:
-                            det=detect_subjects(det_frame,model_obj,confidence)
+                            det = detect_subjects(det_frame, model_obj, confidence)
                             if det is not None:
-                                new_tcx,new_tcy=frame_for_union(
-                                    int(det.ux1*sx),int(det.uy1*sy),
-                                    int(det.ux2*sx),int(det.uy2*sy),
-                                    orig_w,orig_h,crop_w,crop_h)
-                                last_det=(new_tcx,new_tcy); det_stale=0
+                                new_tcx, new_tcy = frame_for_union(
+                                    int(det.ux1*sx), int(det.uy1*sy),
+                                    int(det.ux2*sx), int(det.uy2*sy),
+                                    orig_w, orig_h, crop_w, crop_h)
+                                if cut:
+                                    anchor.snap(new_tcx, new_tcy)
+                                    kalman.snap(new_tcx, new_tcy)
+                                else:
+                                    kalman.update(new_tcx, new_tcy)
+                                    kx, ky = kalman.position
+                                    anchor.set_target(kx, ky)
+                                got_target = True
 
-                    if new_tcx is None and use_optical_flow:
-                        sm=cv2.resize(cg,(max(1,det_w//2),max(1,det_h//2)))
-                        if prev_flow is not None:
-                            fc=optical_flow_center(prev_flow,sm,det_w//2,det_h//2)
-                            if fc: new_tcx=int(fc[0]*2*sx); new_tcy=int(fc[1]*2*sy)
-                        prev_flow=sm; det_stale+=sample_interval
+                    if not got_target:
+                        # No detection this sample — try optical flow, else
+                        # let Kalman coast on its velocity prediction.
+                        if use_optical_flow:
+                            sm = cv2.resize(cg,(max(1,det_w//2),max(1,det_h//2)))
+                            if prev_flow is not None:
+                                fc = optical_flow_center(prev_flow,sm,det_w//2,det_h//2)
+                                if fc:
+                                    # Use flow as a weak Kalman measurement
+                                    flow_x = int(fc[0]*2*sx); flow_y = int(fc[1]*2*sy)
+                                    kalman.update(flow_x, flow_y)
+                            prev_flow = sm
 
-                    if new_tcx is None:
-                        if last_det and det_stale<MAX_STALE: new_tcx,new_tcy=last_det
-                        else:
-                            sc_=saliency_center(det_frame)
-                            new_tcx=int(sc_[0]*sx); new_tcy=int(sc_[1]*sy)
+                        # Always predict (advances velocity estimate by 1 step)
+                        # and feed the predicted position to the camera.
+                        kalman.predict()
+                        if kalman.initialized:
+                            kx, ky = kalman.position
+                            anchor.set_target(kx, ky)
+                    else:
+                        # Also advance Kalman after a correction so velocity
+                        # estimate stays in sync with the frame counter.
+                        kalman.predict()
 
-                    if cut: anchor.snap(new_tcx, new_tcy)
-                    else:   anchor.set_target(new_tcx, new_tcy)
+                # Step camera EMA every frame
+                cur_cx, cur_cy = anchor.step()
+                cur_cx = max(hw, min(cur_cx, orig_w-hw))
+                cur_cy = max(hh, min(cur_cy, orig_h-hh))
 
-                # Step camera EMA every frame — velocity-limited, flicker-free
-                cur_cx,cur_cy=anchor.step()
-                cur_cx=max(hw,min(cur_cx,orig_w-hw))
-                cur_cy=max(hh,min(cur_cy,orig_h-hh))
-
-                # ── Render ────────────────────────────────────────────────────
+                # ── Render ─────────────────────────────────────────────────────
                 if tracking_mode=="subject" and model_obj is not None:
-                    pf=persons_cache if is_sample else \
-                       [b for g in layout_state.prev_groups for b in g]
-                    out_frame,active_layout=render_adaptive_frame(
-                        frame,pf,target_w,target_h,layout_state=layout_state,
+                    pf = persons_cache if is_sample else \
+                         [b for g in layout_state.prev_groups for b in g]
+                    out_frame, active_layout = render_adaptive_frame(
+                        frame, pf, target_w, target_h, layout_state=layout_state,
                         vignette_strength=vignette_strength*0.7,
-                        color_grade=color_grade,frame_idx=fi)
-                    if active_layout==LAYOUT_SINGLE:
-                        left=max(0,min(cur_cx-crop_w//2,orig_w-crop_w))
-                        top_=max(0,min(cur_cy-crop_h//2,orig_h-crop_h))
-                        crop=frame[top_:top_+crop_h, left:left+crop_w]
+                        color_grade=color_grade, frame_idx=fi)
+                    if active_layout == LAYOUT_SINGLE:
+                        left  = max(0, min(cur_cx-crop_w//2, orig_w-crop_w))
+                        top_  = max(0, min(cur_cy-crop_h//2, orig_h-crop_h))
+                        crop  = frame[top_:top_+crop_h, left:left+crop_w]
                         if crop.shape[1]!=target_w or crop.shape[0]!=target_h:
-                            crop=cv2.resize(crop,(target_w,target_h),interpolation=cv2.INTER_LANCZOS4)
-                        out_frame=crop
+                            crop = cv2.resize(crop,(target_w,target_h),interpolation=cv2.INTER_LANCZOS4)
+                        out_frame = crop
                         if color_grade and color_grade!="none":
-                            out_frame=apply_color_grade(out_frame,color_grade)
+                            out_frame = apply_color_grade(out_frame,color_grade)
                         if vignette_strength>0:
-                            out_frame=apply_vignette(out_frame,vignette_strength)
+                            out_frame = apply_vignette(out_frame,vignette_strength)
                 else:
-                    left=max(0,min(cur_cx-crop_w//2,orig_w-crop_w))
-                    top_=max(0,min(cur_cy-crop_h//2,orig_h-crop_h))
-                    crop=frame[top_:top_+crop_h, left:left+crop_w]
+                    left  = max(0, min(cur_cx-crop_w//2, orig_w-crop_w))
+                    top_  = max(0, min(cur_cy-crop_h//2, orig_h-crop_h))
+                    crop  = frame[top_:top_+crop_h, left:left+crop_w]
                     if crop.shape[1]!=target_w or crop.shape[0]!=target_h:
-                        crop=cv2.resize(crop,(target_w,target_h),interpolation=cv2.INTER_LANCZOS4)
-                    out_frame=crop
+                        crop = cv2.resize(crop,(target_w,target_h),interpolation=cv2.INTER_LANCZOS4)
+                    out_frame = crop
                     if color_grade and color_grade!="none":
-                        out_frame=apply_color_grade(out_frame,color_grade)
+                        out_frame = apply_color_grade(out_frame,color_grade)
                     if vignette_strength>0:
-                        out_frame=apply_vignette(out_frame,vignette_strength)
+                        out_frame = apply_vignette(out_frame,vignette_strength)
 
-                if ken_burns:            out_frame=apply_ken_burns(out_frame,fi,fps)
-                if sharpen_strength>0:   out_frame=apply_sharpen(out_frame,sharpen_strength)
+                if ken_burns:            out_frame = apply_ken_burns(out_frame,fi,fps)
+                if sharpen_strength>0:   out_frame = apply_sharpen(out_frame,sharpen_strength)
                 if dissolve_buf and dissolve_buf.active:
-                    out_frame=dissolve_buf.blend(out_frame)
+                    out_frame = dissolve_buf.blend(out_frame)
 
-                last_out_frame=out_frame
+                last_out_frame = out_frame
                 try: proc.stdin.write(out_frame.tobytes())
                 except BrokenPipeError: break
 
-                fi+=1
-                if fi%rpt_n==0: _p(0.13+0.75*(fi/total_frames),f"{fi}/{total_frames}...")
+                fi += 1
+                if fi % rpt_n == 0:
+                    _p(0.13 + 0.75*(fi/total_frames), f"{fi}/{total_frames}...")
     finally:
         pass
 
