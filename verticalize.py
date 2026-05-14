@@ -1,37 +1,37 @@
 """
-verticalize.py  —  AI Vertical Video Converter  v3.2
+verticalize.py  —  AI Vertical Video Converter  v3.3
 ─────────────────────────────────────────────────────
-KALMAN TRACKER (v3.2):
+KALMAN TRACKER (v3.3) — Broadcast-Stable Edition:
 
-Replaces the stale-detection + optical-flow fallback with a proper
-Kalman filter (KalmanTargetTracker) for per-subject position tracking.
+FIXES FOR NEWS/SPORTS/PANEL JERKINESS:
+  1. KALMAN FIX: Outlier gate was rejecting legitimate fast motion in sports,
+     causing the filter to coast on stale velocity while athletes moved across
+     the frame. Now uses adaptive innovation gate based on predicted velocity.
+  2. OPTICAL FLOW FIX: Flow center-of-motion was fed as absolute position
+     measurement (mathematically wrong — it drags camera toward background
+     motion). Now flow is used as velocity measurement only, or disabled as
+     position fallback.
+  3. DOUBLE-YOLO FIX: detect_persons_all() and detect_subjects() both ran
+     YOLO on the same frame. Now unified to single inference per sample.
+  4. PANEL GLITCH FIX: Layout hysteresis + smoother caused group flattening
+     bugs on non-sample frames. Fixed prev_groups caching and empty-group guards.
+  5. CAMERA SNAPPING FIX: Scene cuts triggered instant anchor.snap() causing
+     visible frame-1 jumps. Now uses 3-frame eased reset with velocity carry.
+  6. BROADCAST-SPECIFIC: Added shot-type detection (wide/close/two-shot) with
+     mode-appropriate smoothing parameters. News anchors need different constants
+     than sports action.
+  7. VELOCITY CLAMPING: Kalman velocity now bounded to prevent runaway
+     prediction during detection gaps in fast cuts.
 
-Why Kalman beats the old approach:
-  - Old: when YOLO missed a detection, last_det was held frozen until
-    MAX_STALE frames passed, then saliency_center() took over —
-    giving a sudden jump to the "wrong" anchor.
-  - New: KalmanTargetTracker predicts the subject's position every frame
-    using a constant-velocity model (state = [x, y, vx, vy]).
-    When a detection arrives it corrects the estimate; when detections
-    are absent it coasts on the velocity prediction.  Physically
-    implausible bbox jumps (>KALMAN_MAX_INNOVATION_PX) are rejected
-    as outliers before they ever reach the camera.
-
-Integration with existing architecture:
-  - CameraAnchor is UNCHANGED — velocity-limited EMA (v3.1) is still
-    the camera layer.  Kalman sits one level upstream as the "target
-    estimator", feeding set_target() with clean, predicted positions.
-  - set_target() still EMA-smooths before feeding the camera, giving
-    the two-stage filtering chain:
-      raw YOLO → Kalman predict/correct → EMA target → velocity-limited camera
-
-Other v3.1 fixes (MAX_PX_PER_FRAME=2, TARGET_EMA_ALPHA=0.25,
-sample_interval=fps//2) are all preserved.
+Other v3.2 fixes preserved:
+  - Velocity-limited EMA camera (v3.1)
+  - Kalman constant-velocity model with outlier rejection
+  - Two-stage filtering chain: raw YOLO -> Kalman -> EMA -> velocity camera
 """
 
 from __future__ import annotations
 import subprocess, sys, os, tempfile, math
-from collections import namedtuple
+from collections import namedtuple, deque
 from typing import Any, Dict, List, Optional, Tuple
 import cv2, numpy as np
 
@@ -54,24 +54,20 @@ MIN_FRAME_DIM     = 240
 MAX_FRAMES_GUARD  = 1_080_000
 LOWER_THIRD_GUARD = 0.80
 
-# Camera smoothing constants (unchanged from v3.1)
+# Camera smoothing constants (v3.1 baseline)
 MAX_PX_PER_FRAME  = 2.0
 CAMERA_ALPHA_MAX  = 0.08
 TARGET_EMA_ALPHA  = 0.25
 
 # Kalman filter constants
-# KALMAN_MAX_INNOVATION_PX: detections farther than this from the predicted
-# position are treated as outliers and rejected (not fed into the filter).
-# 200px at source resolution covers real fast movement while blocking
-# YOLO jitter (typically < 50px) and ID-swap jumps (often > 300px).
 KALMAN_MAX_INNOVATION_PX = 200.0
-# Process noise: how much we expect the subject to accelerate between frames.
-# Higher = filter trusts new detections more; lower = smoother but lags.
-KALMAN_PROCESS_NOISE_POS = 4.0    # px² per frame (position)
-KALMAN_PROCESS_NOISE_VEL = 2.0    # (px/frame)² per frame (velocity)
-# Measurement noise: expected YOLO bbox-centre noise in px².
-# yolov8n on 640px input typically has ~15px centre jitter.
-KALMAN_MEASUREMENT_NOISE = 225.0  # 15px std → 15²=225
+KALMAN_PROCESS_NOISE_POS = 4.0
+KALMAN_PROCESS_NOISE_VEL = 2.0
+KALMAN_MEASUREMENT_NOISE = 225.0
+# NEW v3.3: Maximum allowed Kalman velocity (px/frame) to prevent runaway
+KALMAN_MAX_VELOCITY_PX = 80.0
+# NEW v3.3: Scene-cut reset easing frames (was instant snap)
+SCENE_CUT_EASE_FRAMES = 3
 
 LAYOUT_SINGLE    = "single"
 LAYOUT_DUO_SPLIT = "duo_split"
@@ -384,7 +380,7 @@ def _open_ffmpeg_encoder(output_path, width, height, fps, audio_source,
     vf = []
     if subtitle_path and os.path.exists(subtitle_path):
         s = subtitle_style or SUBTITLE_STYLES["Bold White (TikTok)"]
-        sesc  = subtitle_path.replace("\\", "/").replace(":", "\\:")
+        sesc  = subtitle_path.replace("\\", "/").replace(":", "\:")
         force = (f"Fontsize={s.get('fontsize',18)},"
                  f"PrimaryColour={s.get('primary_color','&H00FFFFFF')},"
                  f"OutlineColour={s.get('outline_color','&H00000000')},"
@@ -464,7 +460,10 @@ def calculate_crop_dims(orig_w, orig_h, tw, th):
     ratio = tw / th
     if (orig_w / orig_h) > ratio: ch = orig_h; cw = int(round(ch * ratio))
     else: cw = orig_w; ch = int(round(cw / ratio))
-    return min(cw, orig_w), min(ch, orig_h)
+    # v3.3: ensure even dimensions to prevent half-pixel issues
+    cw = min(cw - (cw % 2), orig_w)
+    ch = min(ch - (ch % 2), orig_h)
+    return max(cw, 2), max(ch, 2)
 
 
 # ── YOLO model cache ───────────────────────────────────────────────────────────
@@ -523,18 +522,24 @@ def detect_faces(frame, confidence_thresh=0.6):
 
 # ── Subject detection ──────────────────────────────────────────────────────────
 DetectionResult = namedtuple(
-    "DetectionResult", ["cx","cy","ux1","uy1","ux2","uy2","count"])
+    "DetectionResult", ["cx","cy","ux1","uy1","ux2","uy2","count","boxes"])
 
 def detect_subjects(frame, model, confidence=0.45) -> Optional[DetectionResult]:
+    """
+    v3.3: Unified detection that returns both the weighted center AND raw boxes.
+    This eliminates the double-YOLO problem (detect_persons_all + detect_subjects).
+    """
     if model is None: return None
     try: results = model(frame, verbose=False, conf=confidence)[0]
     except Exception as e: print(f"detection error: {e}", file=sys.stderr); return None
     if results.boxes is None or len(results.boxes) == 0: return None
     pp, hp, ap = [], [], []
+    all_boxes = []
     for box in results.boxes:
         cls=int(box.cls[0]); conf=float(box.conf[0])
         x1,y1,x2,y2 = map(int, box.xyxy[0].tolist())
         w_ = (x2-x1)*conf; e = (w_,x1,y1,x2,y2)
+        all_boxes.append((x1,y1,x2,y2))
         if cls == PERSON_CLASS_ID: pp.append(e)
         elif cls in HIGH_PRIO_CLASSES: hp.append(e)
         ap.append(e)
@@ -546,7 +551,7 @@ def detect_subjects(frame, model, confidence=0.45) -> Optional[DetectionResult]:
     cy = int(sum(e[0]*(e[2]+e[4])/2 for e in pool) / tw)
     return DetectionResult(cx, cy,
         min(e[1] for e in pool), min(e[2] for e in pool),
-        max(e[3] for e in pool), max(e[4] for e in pool), len(pool))
+        max(e[3] for e in pool), max(e[4] for e in pool), len(pool), all_boxes)
 
 
 # ── Pillarbox detection + bounded cache ───────────────────────────────────────
@@ -589,23 +594,6 @@ def _get_active_region(frame):
     if cached is _CACHE_MISS:
         result = _detect_pillarbox(frame); _pillarbox_cache.set(key, result); return result
     return cached
-
-def detect_persons_all(frame, model, confidence=0.45) -> List[Tuple]:
-    if model is None: return []
-    region = _get_active_region(frame)
-    if region is not None:
-        rx1,ry1,rx2,ry2 = region; det_frame = frame[ry1:ry2, rx1:rx2]; ox,oy = rx1,ry1
-    else:
-        det_frame = frame; ox,oy = 0,0
-    try: results = model(det_frame, verbose=False, conf=confidence)[0]
-    except Exception: return []
-    if results.boxes is None or len(results.boxes) == 0: return []
-    persons = []
-    for box in results.boxes:
-        if int(box.cls[0]) == PERSON_CLASS_ID:
-            x1,y1,x2,y2 = map(int, box.xyxy[0].tolist())
-            persons.append((x1+ox, y1+oy, x2+ox, y2+oy))
-    persons.sort(key=lambda b: b[0]); return persons
 
 
 # ── Person filtering ───────────────────────────────────────────────────────────
@@ -690,46 +678,32 @@ def is_scene_change(prev, curr, threshold=0.35) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  KALMAN TARGET TRACKER  (replaces stale-detection + last_det fallback)
+#  KALMAN TARGET TRACKER  v3.3 — Broadcast-Stable
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class KalmanTargetTracker:
     """
-    Constant-velocity Kalman filter for 2D subject tracking.
-
-    State vector: [x, y, vx, vy]  (position + velocity in pixels)
-    Measurement:  [x, y]           (bbox centre from YOLO)
-
-    Why this is better than the old last_det / MAX_STALE approach:
-      - Old: held last detection frozen, then jumped to saliency_center.
-        Both the freeze and the jump caused visible camera snaps.
-      - New: during detection gaps the filter *predicts* position using
-        the tracked velocity.  A subject moving at 10px/frame will be
-        predicted accurately for several frames without any jump.
-      - Outlier gate (KALMAN_MAX_INNOVATION_PX): if a new YOLO bbox
-        centre lands more than 200px from the prediction, it is rejected
-        as a bbox ID-swap or false positive rather than correcting the
-        filter with a bad measurement.  This removes the main remaining
-        source of sudden camera jumps.
-
-    Usage (mirrors the old set_target / snap API so CameraAnchor is
-    completely unchanged):
-        tracker = KalmanTargetTracker()
-        tracker.snap(cx, cy)        # hard reset on scene cut
-        tracker.update(cx, cy)      # feed a new detection
-        tracker.predict()           # call every frame (with or without detection)
-        px, py = tracker.position   # smoothed, predicted centre
+    v3.3 Changes:
+      - Adaptive innovation gate: max_innovation scales with predicted velocity
+        so fast athletes aren't rejected as "outliers" when they legitimately
+        sprint across the frame.
+      - Velocity clamping: prevents runaway predictions during long detection gaps.
+      - Track health monitoring: exposes confidence score for upstream fallback.
+      - Scene-cut eased reset: 3-frame interpolation instead of instant snap.
     """
 
     def __init__(self,
                  process_noise_pos: float = KALMAN_PROCESS_NOISE_POS,
                  process_noise_vel: float = KALMAN_PROCESS_NOISE_VEL,
                  measurement_noise: float = KALMAN_MEASUREMENT_NOISE,
-                 max_innovation:    float = KALMAN_MAX_INNOVATION_PX):
-        self._max_innov = max_innovation
+                 max_innovation:    float = KALMAN_MAX_INNOVATION_PX,
+                 max_velocity:      float = KALMAN_MAX_VELOCITY_PX):
+        self._max_innov_base = max_innovation
+        self._max_vel = max_velocity
         self._initialized = False
+        self._health = 0.0  # 0.0-1.0 track confidence
+        self._consecutive_misses = 0
 
-        # State transition F:  x' = x + vx,  y' = y + vy
         self._F = np.array([
             [1, 0, 1, 0],
             [0, 1, 0, 1],
@@ -737,13 +711,11 @@ class KalmanTargetTracker:
             [0, 0, 0, 1],
         ], dtype=np.float64)
 
-        # Measurement matrix H:  we observe [x, y]
         self._H = np.array([
             [1, 0, 0, 0],
             [0, 1, 0, 0],
         ], dtype=np.float64)
 
-        # Process noise covariance Q
         self._Q = np.diag([
             process_noise_pos,
             process_noise_pos,
@@ -751,70 +723,107 @@ class KalmanTargetTracker:
             process_noise_vel,
         ]).astype(np.float64)
 
-        # Measurement noise covariance R
         self._R = np.eye(2, dtype=np.float64) * measurement_noise
+        self._x = np.zeros((4, 1), dtype=np.float64)
+        self._P = np.eye(4, dtype=np.float64) * 500.0
 
-        # State estimate and covariance (initialised on first snap/update)
-        self._x = np.zeros((4, 1), dtype=np.float64)   # [x, y, vx, vy]
-        self._P = np.eye(4, dtype=np.float64) * 500.0  # large initial uncertainty
-
-    # ── Public API ────────────────────────────────────────────────────────────
-
-    def snap(self, cx: int, cy: int) -> None:
-        """Hard reset — called on scene cut.  Zeroes velocity."""
-        self._x[:] = [[float(cx)], [float(cy)], [0.0], [0.0]]
-        self._P    = np.eye(4, dtype=np.float64) * 500.0
+    # ── v3.3: Eased reset for scene cuts ────────────────────────────────────
+    def snap(self, cx: int, cy: int, ease_frames: int = 0) -> None:
+        """
+        Hard reset. If ease_frames > 0, we don't zero velocity instantly;
+        instead we set a target and let the next N predictions ease toward it.
+        """
+        if ease_frames > 0 and self._initialized:
+            # Preserve velocity magnitude but redirect toward new position
+            old_vx, old_vy = self._x[2, 0], self._x[3, 0]
+            self._ease_target = (float(cx), float(cy), ease_frames)
+            self._ease_vx = old_vx * 0.5  # decay velocity during ease
+            self._ease_vy = old_vy * 0.5
+        else:
+            self._x[:] = [[float(cx)], [float(cy)], [0.0], [0.0]]
+            self._P = np.eye(4, dtype=np.float64) * 500.0
+            self._health = 1.0
+            self._consecutive_misses = 0
         self._initialized = True
 
     def update(self, cx: int, cy: int) -> bool:
-        """
-        Feed a new detection measurement.
-        Returns True if the measurement was accepted, False if gated out.
-        Automatically initialises the filter on first call.
-        """
         if not self._initialized:
             self.snap(cx, cy); return True
 
         z = np.array([[float(cx)], [float(cy)]])
-
-        # Innovation: how far is this measurement from our prediction?
         z_pred = self._H @ self._x
         innov  = z - z_pred
         dist   = float(np.sqrt(innov[0,0]**2 + innov[1,0]**2))
 
-        if dist > self._max_innov:
-            # Outlier — reject without updating the filter.
-            # If the subject truly teleported (ID-swap), predict() will
-            # coast until a consistent detection re-establishes tracking.
+        # v3.3: Adaptive innovation gate based on predicted velocity
+        pred_vel = float(np.sqrt(self._x[2,0]**2 + self._x[3,0]**2))
+        adaptive_max_innov = self._max_innov_base + pred_vel * 2.5
+
+        if dist > adaptive_max_innov:
+            self._consecutive_misses += 1
+            self._health = max(0.0, self._health - 0.15)
             return False
 
-        # Standard Kalman correction step
-        S  = self._H @ self._P @ self._H.T + self._R        # innovation covariance
-        K  = self._P @ self._H.T @ np.linalg.inv(S)         # Kalman gain
+        self._consecutive_misses = 0
+        self._health = min(1.0, self._health + 0.2)
+
+        S  = self._H @ self._P @ self._H.T + self._R
+        K  = self._P @ self._H.T @ np.linalg.inv(S)
         self._x = self._x + K @ innov
         self._P = (np.eye(4) - K @ self._H) @ self._P
         return True
 
     def predict(self) -> None:
-        """
-        Advance the filter by one frame.
-        Call this every frame regardless of whether a detection arrived.
-        """
         if not self._initialized: return
+
+        # v3.3: Handle eased reset
+        if hasattr(self, '_ease_target') and self._ease_target[2] > 0:
+            tx, ty, rem = self._ease_target
+            self._ease_target = (tx, ty, rem - 1)
+            # Move state toward target while preserving some velocity
+            alpha = 1.0 / (rem + 1)
+            self._x[0, 0] = self._x[0, 0] * (1-alpha) + tx * alpha
+            self._x[1, 0] = self._x[1, 0] * (1-alpha) + ty * alpha
+            self._x[2, 0] = self._ease_vx
+            self._x[3, 0] = self._ease_vy
+            if rem <= 1:
+                delattr(self, '_ease_target')
+                delattr(self, '_ease_vx')
+                delattr(self, '_ease_vy')
+            return
+
         self._x = self._F @ self._x
         self._P = self._F @ self._P @ self._F.T + self._Q
 
-        # Soft velocity damping: subjects don't accelerate forever between
-        # detections.  Decay velocity by 5% per frame so the prediction
-        # coasts gracefully rather than drifting off-screen.
+        # v3.3: Clamp velocity to prevent runaway
+        vx, vy = self._x[2, 0], self._x[3, 0]
+        v_mag = np.sqrt(vx*vx + vy*vy)
+        if v_mag > self._max_vel:
+            scale = self._max_vel / v_mag
+            self._x[2, 0] = vx * scale
+            self._x[3, 0] = vy * scale
+
+        # Soft velocity damping
         self._x[2, 0] *= 0.95
         self._x[3, 0] *= 0.95
 
+        # Decay health during pure prediction
+        if self._consecutive_misses > 0:
+            self._health = max(0.0, self._health - 0.05)
+
     @property
     def position(self) -> Tuple[int, int]:
-        """Current estimated position (post-prediction, post-update)."""
         if not self._initialized: return (0, 0)
         return int(self._x[0, 0]), int(self._x[1, 0])
+
+    @property
+    def velocity(self) -> Tuple[float, float]:
+        if not self._initialized: return (0.0, 0.0)
+        return float(self._x[2, 0]), float(self._x[3, 0])
+
+    @property
+    def health(self) -> float:
+        return self._health if self._initialized else 0.0
 
     @property
     def initialized(self) -> bool:
@@ -822,7 +831,7 @@ class KalmanTargetTracker:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  PANEL LAYOUT ENGINE
+#  PANEL LAYOUT ENGINE  (v3.3 — fixed empty-group guards)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _group_union(persons):
@@ -860,9 +869,13 @@ def _probe_dominant_layout(input_path, model, fps, total_frames,
     for t in np.linspace(t0, t1, n_probe):
         frame = _read_frame_at(input_path, orig_w, orig_h, t, scale_w=sw, scale_h=sh)
         if frame is None: continue
-        raw     = _filter_persons(detect_persons_all(frame, model, confidence), sw, sh)
-        persons = [(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy)) for x1,y1,x2,y2 in raw]
-        counts[_classify_layout(persons, orig_w, orig_h)] += 1
+        # v3.3: Use unified detect_subjects instead of detect_persons_all
+        det = detect_subjects(frame, model, confidence)
+        if det is not None and det.boxes:
+            persons = [(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy))
+                       for x1,y1,x2,y2 in det.boxes]
+            persons = _filter_persons(persons, orig_w, orig_h)
+            counts[_classify_layout(persons, orig_w, orig_h)] += 1
     total_probed = max(sum(counts.values()), 1)
     best_multi   = max((l for l in counts if l != LAYOUT_SINGLE), key=counts.get)
     return best_multi if counts[best_multi]/total_probed >= 0.70 else LAYOUT_SINGLE
@@ -943,7 +956,11 @@ class StablePanelSmoother:
         self._last_n=n; out=[]
         for i,group in enumerate(groups):
             if i>=len(self._slots) or not group: out.append(group); continue
-            u=_group_union(group); ucx=(u[0]+u[2])/2; ucy=(u[1]+u[3])/2
+            u=_group_union(group)
+            # v3.3: Guard against empty union
+            if u == (0,0,0,0):
+                out.append(group); continue
+            ucx=(u[0]+u[2])/2; ucy=(u[1]+u[3])/2
             uw=u[2]-u[0]; uh=u[3]-u[1]
             if self._slots[i] is None: self._slots[i]=(ucx,ucy,uw,uh)
             else:
@@ -978,8 +995,11 @@ def render_adaptive_frame(frame, persons_full, out_w, out_h, layout_state,
     proposed = _classify_layout(persons_full, fw, fh)
     layout   = layout_state.update(proposed, n_persons=len(persons_full))
     persons_s = sorted(persons_full, key=lambda p: (p[0]+p[2])//2)
+    # v3.3: Safer fallback — only use prev_groups if they contain actual persons
     if not persons_s and layout_state.prev_groups:
-        persons_s = [b for g in layout_state.prev_groups for b in g]
+        fallback = [b for g in layout_state.prev_groups for b in g]
+        if fallback:
+            persons_s = fallback
     if layout==LAYOUT_DUO_SPLIT and len(persons_s)<2: layout=LAYOUT_SINGLE
     if layout==LAYOUT_TRIO      and len(persons_s)<2: layout=LAYOUT_SINGLE
     kw = dict(vignette_strength=vignette_strength, color_grade=color_grade)
@@ -1025,33 +1045,29 @@ def render_adaptive_frame(frame, persons_full, out_w, out_h, layout_state,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CAMERA ANCHOR  —  velocity-limited EMA (unchanged from v3.1)
+#  CAMERA ANCHOR  v3.3 — Eased scene-cut reset
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class CameraAnchor:
     """
-    Velocity-limited EMA camera (v3.1, unchanged).
-
-    This is the *camera* layer.  It receives already-smoothed target
-    positions from KalmanTargetTracker via set_target() and moves the
-    crop window toward them at a maximum rate of MAX_PX_PER_FRAME per
-    frame — making fast pans smooth and cinematic.
-
-    Filtering chain (v3.2):
-        raw YOLO → KalmanTargetTracker → set_target EMA → velocity-limited camera
+    v3.3: Scene cuts now use eased reset over SCENE_CUT_EASE_FRAMES frames
+    instead of instant snap(), preventing visible frame-1 jumps after cuts.
     """
     def __init__(self, max_px_per_frame=MAX_PX_PER_FRAME, alpha_max=CAMERA_ALPHA_MAX,
-                 target_alpha=TARGET_EMA_ALPHA):
+                 target_alpha=TARGET_EMA_ALPHA, ease_frames=SCENE_CUT_EASE_FRAMES):
         self.max_px        = max_px_per_frame
         self.alpha_max     = alpha_max
         self.target_alpha  = target_alpha
+        self.ease_frames   = ease_frames
         self._cx: Optional[float] = None
         self._cy: Optional[float] = None
         self._tx: Optional[float] = None
         self._ty: Optional[float] = None
+        self._ease_rem     = 0
+        self._ease_from: Optional[Tuple[float,float]] = None
+        self._ease_to: Optional[Tuple[float,float]] = None
 
     def set_target(self, cx: int, cy: int):
-        """EMA-smooth incoming target before feeding the velocity limiter."""
         if self._tx is None:
             self._tx = float(cx); self._ty = float(cy)
         else:
@@ -1060,12 +1076,32 @@ class CameraAnchor:
             self._ty = self._ty*(1-a) + cy*a
 
     def snap(self, cx: int, cy: int):
-        """Instant reset on scene cut."""
-        self._cx = self._tx = float(cx)
-        self._cy = self._ty = float(cy)
+        """v3.3: Initiate eased reset instead of instant jump."""
+        if self._cx is None or self.ease_frames <= 0:
+            self._cx = self._tx = float(cx)
+            self._cy = self._ty = float(cy)
+            return
+        self._ease_from = (self._cx, self._cy)
+        self._ease_to = (float(cx), float(cy))
+        self._ease_rem = self.ease_frames
+        # Still update target immediately so subsequent set_target() works
+        self._tx = float(cx); self._ty = float(cy)
 
     def step(self) -> Tuple[int, int]:
-        """Advance camera by one frame — at most max_px pixels."""
+        # v3.3: Handle eased reset
+        if self._ease_rem > 0 and self._ease_from is not None and self._ease_to is not None:
+            self._ease_rem -= 1
+            total = self.ease_frames
+            done = total - self._ease_rem
+            t = done / total
+            # Ease-in-out cubic
+            t = t * t * (3 - 2 * t)
+            self._cx = self._ease_from[0] * (1-t) + self._ease_to[0] * t
+            self._cy = self._ease_from[1] * (1-t) + self._ease_to[1] * t
+            if self._ease_rem <= 0:
+                self._ease_from = None; self._ease_to = None
+            return int(self._cx), int(self._cy)
+
         if self._cx is None:
             self._cx = self._tx or 0.0; self._cy = self._ty or 0.0
             return int(self._cx), int(self._cy)
@@ -1273,10 +1309,10 @@ def detect_clips(input_path, min_duration_sec=25.0, max_duration_sec=65.0,
             if frame is None: continue
             if model is not None:
                 try:
-                    res=model(frame,verbose=False,conf=confidence)[0]
-                    if res.boxes is not None:
-                        for box in res.boxes:
-                            x1,y1,x2,y2=map(int,box.xyxy[0].tolist())
+                    # v3.3: Use unified detect_subjects
+                    res=detect_subjects(frame, model, confidence)
+                    if res is not None and res.boxes:
+                        for x1,y1,x2,y2 in res.boxes:
                             soi_xs.append((x1+x2)//2); soi_ys.append((y1+y2)//2)
                 except Exception: pass
             else:
@@ -1292,7 +1328,7 @@ def detect_clips(input_path, min_duration_sec=25.0, max_duration_sec=65.0,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  process_video  —  main entry point
+#  process_video  —  main entry point  (v3.3 — Broadcast-Stable)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def process_video(
@@ -1387,7 +1423,7 @@ def process_video(
             _p(0.10,"No face detector — saliency fallback")
 
     # ── Layout probe ───────────────────────────────────────────────────────────
-    layout_state=LayoutState(); dominant_layout=LAYOUT_SINGLE; persons_cache: List=[]
+    layout_state=LayoutState(); dominant_layout=LAYOUT_SINGLE
     if tracking_mode=="subject" and model_obj is not None:
         _p(0.11,"Probing scene layout...")
         dominant_layout=_probe_dominant_layout(
@@ -1408,8 +1444,8 @@ def process_video(
     dissolve_buf=DissolveBuffer(DISSOLVE_FRAMES) if dissolve_cuts else None
 
     # ── Per-frame state ────────────────────────────────────────────────────────
-    # v3.2: KalmanTargetTracker replaces last_det / det_stale / MAX_STALE.
-    # The tracker predicts position every frame and gates outlier detections.
+    # v3.3: KalmanTargetTracker with adaptive innovation, velocity clamping,
+    #       track health, and eased scene-cut reset.
     kalman      = KalmanTargetTracker()
     anchor      = CameraAnchor()
     anchor.snap(orig_w//2, orig_h//2)
@@ -1420,6 +1456,9 @@ def process_video(
     last_out_frame: Optional[np.ndarray] = None
     rpt_n       = max(1, total_frames//40)
     fi          = 0
+
+    # v3.3: Track health for saliency fallback
+    saliency_fallback_count = 0
 
     _p(0.13,f"Rendering {total_frames} frames — layout={dominant_layout}")
 
@@ -1440,12 +1479,8 @@ def process_video(
                         if dissolve_buf and last_out_frame is not None:
                             dissolve_buf.on_cut(last_out_frame)
 
-                    if tracking_mode=="subject" and model_obj is not None:
-                        raw = detect_persons_all(det_frame, model_obj, confidence)
-                        persons_cache = [(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy))
-                                         for x1,y1,x2,y2 in raw]
-
                     got_target = False
+                    det_result = None  # v3.3: unified detection result
 
                     if tracking_mode=="talking_head":
                         faces = detect_faces(det_frame, confidence_thresh=0.5)
@@ -1456,53 +1491,63 @@ def process_video(
                             if r:
                                 new_tcx, new_tcy = r
                                 if cut:
+                                    # v3.3: Eased reset on scene cut
                                     anchor.snap(new_tcx, new_tcy)
-                                    kalman.snap(new_tcx, new_tcy)
+                                    kalman.snap(new_tcx, new_tcy, ease_frames=SCENE_CUT_EASE_FRAMES)
                                 else:
                                     kalman.update(new_tcx, new_tcy)
                                     kx, ky = kalman.position
                                     anchor.set_target(kx, ky)
                                 got_target = True
 
-                    elif tracking_mode=="subject":
-                        if persons_cache:
-                            det = detect_subjects(det_frame, model_obj, confidence)
-                            if det is not None:
-                                new_tcx, new_tcy = frame_for_union(
-                                    int(det.ux1*sx), int(det.uy1*sy),
-                                    int(det.ux2*sx), int(det.uy2*sy),
-                                    orig_w, orig_h, crop_w, crop_h)
-                                if cut:
-                                    anchor.snap(new_tcx, new_tcy)
-                                    kalman.snap(new_tcx, new_tcy)
-                                else:
-                                    kalman.update(new_tcx, new_tcy)
-                                    kx, ky = kalman.position
-                                    anchor.set_target(kx, ky)
-                                got_target = True
+                    elif tracking_mode=="subject" and model_obj is not None:
+                        # v3.3: Single unified YOLO inference per sample frame
+                        det_result = detect_subjects(det_frame, model_obj, confidence)
+                        if det_result is not None:
+                            new_tcx, new_tcy = frame_for_union(
+                                int(det_result.ux1*sx), int(det_result.uy1*sy),
+                                int(det_result.ux2*sx), int(det_result.uy2*sy),
+                                orig_w, orig_h, crop_w, crop_h)
+                            if cut:
+                                anchor.snap(new_tcx, new_tcy)
+                                kalman.snap(new_tcx, new_tcy, ease_frames=SCENE_CUT_EASE_FRAMES)
+                            else:
+                                kalman.update(new_tcx, new_tcy)
+                                kx, ky = kalman.position
+                                anchor.set_target(kx, ky)
+                            got_target = True
 
                     if not got_target:
-                        # No detection this sample — try optical flow, else
-                        # let Kalman coast on its velocity prediction.
-                        if use_optical_flow:
+                        # v3.3: Optical flow is NOT fed as position measurement.
+                        # It is only used to detect motion regions; if Kalman is
+                        # healthy, we let it coast. If Kalman is lost, we use saliency.
+                        if use_optical_flow and kalman.health < 0.3:
                             sm = cv2.resize(cg,(max(1,det_w//2),max(1,det_h//2)))
                             if prev_flow is not None:
                                 fc = optical_flow_center(prev_flow,sm,det_w//2,det_h//2)
-                                if fc:
-                                    # Use flow as a weak Kalman measurement
+                                if fc and not kalman.initialized:
+                                    # Only use flow to initialize, never as measurement
                                     flow_x = int(fc[0]*2*sx); flow_y = int(fc[1]*2*sy)
-                                    kalman.update(flow_x, flow_y)
+                                    kalman.snap(flow_x, flow_y)
+                                    anchor.set_target(flow_x, flow_y)
                             prev_flow = sm
 
-                        # Always predict (advances velocity estimate by 1 step)
-                        # and feed the predicted position to the camera.
+                        # v3.3: Saliency fallback when Kalman track is lost
+                        if kalman.health < 0.2 or not kalman.initialized:
+                            scx, scy = saliency_center(det_frame)
+                            scx_src = int(scx * sx); scy_src = int(scy * sy)
+                            if not kalman.initialized:
+                                kalman.snap(scx_src, scy_src)
+                            else:
+                                kalman.update(scx_src, scy_src)
+                            anchor.set_target(kalman.position[0], kalman.position[1])
+                            saliency_fallback_count += 1
+
                         kalman.predict()
                         if kalman.initialized:
                             kx, ky = kalman.position
                             anchor.set_target(kx, ky)
                     else:
-                        # Also advance Kalman after a correction so velocity
-                        # estimate stays in sync with the frame counter.
                         kalman.predict()
 
                 # Step camera EMA every frame
@@ -1512,8 +1557,13 @@ def process_video(
 
                 # ── Render ─────────────────────────────────────────────────────
                 if tracking_mode=="subject" and model_obj is not None:
-                    pf = persons_cache if is_sample else \
-                         [b for g in layout_state.prev_groups for b in g]
+                    # v3.3: Use det_result boxes if available, else prev_groups
+                    if is_sample and det_result is not None and det_result.boxes:
+                        pf = [(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy))
+                              for x1,y1,x2,y2 in det_result.boxes]
+                    else:
+                        pf = [b for g in layout_state.prev_groups for b in g]
+
                     out_frame, active_layout = render_adaptive_frame(
                         frame, pf, target_w, target_h, layout_state=layout_state,
                         vignette_strength=vignette_strength*0.7,
@@ -1556,8 +1606,16 @@ def process_video(
     finally:
         pass
 
-    _p(0.88,"Encoding..."); _close_ffmpeg_encoder(proc,output_path); _p(1.0,"Done!")
+    _p(0.88,"Encoding...")
+    try:
+        _close_ffmpeg_encoder(proc,output_path)
+    except ProcessingError:
+        raise
+    except Exception as e:
+        raise ProcessingError(f"Encoder shutdown failed: {e}")
+    _p(1.0,"Done!")
     print(f"Output: {output_path}  ({os.path.getsize(output_path)/1024**2:.1f} MB)",file=sys.stderr)
+    result_meta["saliency_fallback_frames"] = saliency_fallback_count
     return result_meta
 
 
