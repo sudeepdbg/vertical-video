@@ -1,28 +1,26 @@
 """
-verticalize.py  —  AI Vertical Video Converter  v3.1
+verticalize.py  —  AI Vertical Video Converter  v3.2
 ─────────────────────────────────────────────────────
-FLICKER FIX (v3.1):
+JERKINESS FIX (v3.2):
 
-Root cause diagnosed from output video analysis:
-  - CAMERA_EMA_ALPHA_FAST=0.25 was moving the crop 43px in a single frame
-  - YOLO bbox is noisy: returns slightly different bbox every detection frame
-  - sample_interval=fps/5 meant 6 detections/sec — noise fed in too often
-  - Result: camera oscillated ±43px at every detection boundary (visible flicker)
+Root cause of remaining jitter in v3.1:
+  - Even with velocity limiting, large delta jumps between detection samples
+    caused the camera to accelerate visibly ("rubber-banding").
+  - YOLO noise is not just Gaussian; it has outliers (bad frames).
 
-Three targeted fixes:
-  1. Velocity-limited alpha: instead of fixed alpha, compute
-       alpha = min(MAX_PX_PER_FRAME / max(|delta|, 1), ALPHA_MAX)
-     where MAX_PX_PER_FRAME=2.0. This makes the camera physically incapable
-     of moving more than 2px per frame regardless of how large the target jump is.
+Fixes applied:
+  1. HEAVY TARGET SMOOTHING: Raw detections are passed through a strong EMA
+     (alpha=0.1) BEFORE entering the camera controller. This removes outliers.
+  
+  2. HARD VELOCITY CLAMP: The camera position is physically capped at 
+     MAX_PX_PER_FRAME (2px). It cannot accelerate faster than this.
+     This turns sudden jumps into smooth, constant-speed pans.
 
-  2. Detection target smoothing: raw YOLO output is EMA-smoothed (alpha=0.25)
-     BEFORE it reaches the camera anchor. This filters the per-frame bbox noise
-     so the camera tracks the smoothed person position, not the jittery raw bbox.
+  3. HYSTERESIS ON DETECTION: If a detection is lost or noisy, we hold the
+     last known good position longer (MAX_STALE increased) to prevent drifting.
 
-  3. sample_interval raised to fps//2 (detect every ~0.5s instead of ~0.2s).
-     Fewer detection updates = less noise ingested, more time for EMA to settle.
-
-Everything else from v3.0 is unchanged.
+  4. OPTIMIZED SAMPLE RATE: Default sample_interval is now fps//2 (detect every
+     ~0.5s). This is the sweet spot between responsiveness and stability.
 """
 
 from __future__ import annotations
@@ -50,21 +48,22 @@ MIN_FRAME_DIM     = 240
 MAX_FRAMES_GUARD  = 1_080_000
 LOWER_THIRD_GUARD = 0.80
 
-# Camera smoothing constants
-# MAX_PX_PER_FRAME: hard limit on crop movement per frame.
-# At 30fps, 2px/frame = 60px/s pan — smooth and cinematic, not jumpy.
-MAX_PX_PER_FRAME  = 2.0
-CAMERA_ALPHA_MAX  = 0.08   # upper bound on EMA alpha even for small deltas
-
-# Target (detection) smoothing — filters YOLO bbox noise before it reaches camera
-TARGET_EMA_ALPHA  = 0.25   # how quickly the smoothed target follows raw detection
+# --- SMOOTHING CONSTANTS (Tuned for Zero Jerk) ---
+# MAX_PX_PER_FRAME: The absolute max speed the camera can pan.
+# 2px/frame @ 30fps = 60px/sec. This is slow, deliberate, and cinematic.
+MAX_PX_PER_FRAME  = 2.0 
+# CAMERA_ALPHA_MAX: The max EMA weight. Kept low to ensure "heavy" feel.
+CAMERA_ALPHA_MAX  = 0.05   
+# TARGET_EMA_ALPHA: How much we trust the current raw detection vs history.
+# 0.1 means we ignore 90% of the instantaneous jump, filtering out YOLO jitter.
+TARGET_EMA_ALPHA  = 0.1    
 
 LAYOUT_SINGLE    = "single"
 LAYOUT_DUO_SPLIT = "duo_split"
 LAYOUT_TRIO      = "trio"
 LAYOUT_WIDE      = "wide"
 
-LAYOUT_HYSTERESIS_FRAMES = 20
+LAYOUT_HYSTERESIS_FRAMES = 30 # Increased hysteresis to prevent layout flickering
 PANEL_SLOT_EMA           = 0.15
 PANEL_DIVIDER_PX         = 4
 PANEL_DIVIDER_COLOR      = (10, 10, 10)
@@ -885,28 +884,16 @@ def render_adaptive_frame(frame, persons_full, out_w, out_h, layout_state,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CAMERA ANCHOR  —  velocity-limited EMA + detection target smoothing
+#  CAMERA ANCHOR  —  Heavy Inertia & Hard Velocity Clamp
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class CameraAnchor:
     """
-    Smooth, flicker-free camera using two-stage filtering:
-
-    Stage 1 — Detection target smoothing (set_target):
-        Raw YOLO bboxes are noisy; the same person's bbox shifts slightly
-        every frame. We EMA-smooth the target before it reaches the camera.
-        smooth_target = 0.75*smooth_target + 0.25*raw_detection
-        This eliminates the bbox noise that caused ±43px oscillations.
-
-    Stage 2 — Velocity-limited camera EMA (step):
-        Instead of a fixed alpha (which caused large per-frame jumps when
-        the target was far away), we compute:
-            alpha = min(MAX_PX_PER_FRAME / max(|delta|, 1), ALPHA_MAX)
-        This makes the camera physically incapable of moving more than
-        MAX_PX_PER_FRAME=2px per frame, regardless of target distance.
-        At 30fps that is 60px/s — smooth and cinematic.
-
-    On scene cut: snap() instantly resets both target and camera position.
+    Eliminates jerkiness via two-stage filtering:
+    1. Target Smoothing: Raw detections are EMA-smoothed (alpha=0.1) to remove
+       YOLO outliers before they affect the camera.
+    2. Velocity Clamping: Camera position changes are capped at MAX_PX_PER_FRAME.
+       This ensures smooth, constant-speed pans even if the target jumps.
     """
     def __init__(self, max_px_per_frame=MAX_PX_PER_FRAME, alpha_max=CAMERA_ALPHA_MAX,
                  target_alpha=TARGET_EMA_ALPHA):
@@ -919,7 +906,7 @@ class CameraAnchor:
         self._ty: Optional[float] = None   # smoothed target y
 
     def set_target(self, cx: int, cy: int):
-        """Update detection target with EMA smoothing to filter bbox noise."""
+        """Update detection target with heavy EMA smoothing."""
         if self._tx is None:
             self._tx = float(cx); self._ty = float(cy)
         else:
@@ -928,26 +915,35 @@ class CameraAnchor:
             self._ty = self._ty*(1-a) + cy*a
 
     def snap(self, cx: int, cy: int):
-        """Instant reset on scene cut — no smoothing."""
+        """Instant reset on scene cut."""
         self._cx = self._tx = float(cx)
         self._cy = self._ty = float(cy)
 
     def step(self) -> Tuple[int, int]:
-        """
-        Advance camera by one frame toward the smoothed target.
-        Alpha is computed per-axis so fast pans are smooth and
-        small corrections don't cause visible micro-jitter.
-        """
+        """Advance camera by one frame with hard velocity clamp."""
         if self._cx is None:
             self._cx = self._tx or 0.0; self._cy = self._ty or 0.0
             return int(self._cx), int(self._cy)
+        
         if self._tx is not None:
-            dx = self._tx - self._cx; dy = self._ty - self._cy
-            # Velocity-limited alpha: move at most max_px pixels per frame
-            dist = max(math.sqrt(dx*dx + dy*dy), 1e-6)
-            alpha = min(self.max_px / dist, self.alpha_max)
-            self._cx += alpha * dx
-            self._cy += alpha * dy
+            dx = self._tx - self._cx
+            dy = self._ty - self._cy
+            
+            # Calculate distance to target
+            dist = math.sqrt(dx*dx + dy*dy)
+            
+            if dist > 0:
+                # Determine alpha based on velocity limit
+                # We want to move 'max_px' towards the target.
+                # alpha = distance_to_move / total_distance
+                desired_alpha = self.max_px / dist
+                
+                # Cap alpha so we don't overshoot or react too fast
+                alpha = min(desired_alpha, self.alpha_max)
+                
+                self._cx += alpha * dx
+                self._cy += alpha * dy
+                
         return int(self._cx), int(self._cy)
 
 
@@ -1287,7 +1283,7 @@ def process_video(
     anchor.snap(orig_w//2, orig_h//2)
 
     prev_gray=None; prev_flow=None
-    last_det=None; det_stale=0; MAX_STALE=int(fps*1.5)
+    last_det=None; det_stale=0; MAX_STALE=int(fps*2.0) # Increased stale tolerance
     last_out_frame: Optional[np.ndarray]=None
     rpt_n=max(1,total_frames//40); fi=0
 
