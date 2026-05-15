@@ -8,10 +8,11 @@ v4.0 CHANGES:
 - INTERPOLATION: Person boxes and motion vectors are interpolated for non-sample frames.
 - OPTIMIZED DETECTION: YOLO runs only on sampled frames during Pass 1.
 - FIXED ARTIFACTS: Single-pass color grading and sharpening applied post-crop.
+- ASPECT RATIO FIX: Forces strict 9:16 crop to prevent distortion (e.g., 404x720).
 """
 from __future__ import annotations
 import subprocess, sys, os, tempfile, math, time
-from collections import namedtuple, deque
+from collections import namedtuple
 from typing import Any, Dict, List, Optional, Tuple
 import cv2, numpy as np
 
@@ -24,7 +25,7 @@ except ImportError:
 class ProcessingError(Exception):
     pass
 
-# ─── Constants ──────────────────────────────────────────────────────────────────
+# ─── Constants ─────────────────────────────────────────────────────────────────
 PERSON_CLASS_ID   = 0
 HIGH_PRIO_CLASSES = {0, 2, 3, 5, 7, 15, 16}
 MAX_FILE_SIZE_MB  = 2000
@@ -33,16 +34,16 @@ MAX_FRAMES_GUARD  = 1_080_000
 LOWER_THIRD_GUARD = 0.80
 
 # Camera smoothing constants
-MAX_PX_PER_FRAME  = 2.0
-CAMERA_ALPHA_MAX  = 0.08
-TARGET_EMA_ALPHA  = 0.25
+MAX_PX_PER_FRAME  = 3.0  # Increased for fast basketball motion
+CAMERA_ALPHA_MAX  = 0.12
+TARGET_EMA_ALPHA  = 0.30
 
-# Kalman filter constants (Used in Pass 2 for fine-tuning if needed, but mostly replaced by interpolation)
+# Kalman filter constants (Used in Pass 2 for fine-tuning if needed)
 KALMAN_MAX_INNOVATION_PX = 200.0
-KALMAN_PROCESS_NOISE_POS = 4.0
-KALMAN_PROCESS_NOISE_VEL = 2.0
-KALMAN_MEASUREMENT_NOISE = 225.0
-KALMAN_MAX_VELOCITY_PX = 80.0
+KALMAN_PROCESS_NOISE_POS = 6.0
+KALMAN_PROCESS_NOISE_VEL = 3.0
+KALMAN_MEASUREMENT_NOISE = 180.0
+KALMAN_MAX_VELOCITY_PX = 120.0
 
 SCENE_CUT_EASE_FRAMES = 3
 LAYOUT_SINGLE    = "single"
@@ -333,7 +334,7 @@ def _trim_video(inp, out, start, end) -> bool:
         capture_output=True)
     return r.returncode == 0 and os.path.exists(out)
 
-# ─── Encoder ────────────────────────────────────────────────────────────────────
+# ─── Encoder ───────────────────────────────────────────────────────────────────
 def _open_ffmpeg_encoder(output_path, width, height, fps, audio_source,
                          crf=23, preset="fast", audio_bitrate="128k",
                          subtitle_path=None, subtitle_style=None, extra_vf=None):
