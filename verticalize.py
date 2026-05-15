@@ -1,17 +1,22 @@
 """
-verticalize.py  —  AI Vertical Video Converter  v3.4
+verticalize.py  —  AI Vertical Video Converter  v3.5
 ─────────────────────────────────────────────────────
-v3.4 FIXES:
-  1. CRITICAL: process_video no longer discards render_adaptive_frame() output
-     for SINGLE layout. Subject-detection-based crop is now actually used.
-  2. CRITICAL: KalmanTargetTracker.predict() properly propagates state/covariance
-     during scene-cut ease frames.
-  3. CRITICAL: Non-sample frames use cached layout instead of re-classifying.
-  4. HIGH: CameraAnchor.snap() clears ongoing ease before starting new one.
-  5. HIGH: KalmanTargetTracker.snap() always resets health and misses.
-  6. HIGH: Velocity clamping and decay applied even during ease.
-  7. MEDIUM: Adaptive innovation gate scales with video dimensions.
-  8. MEDIUM: Unified render code path - no more double render.
+v3.5 FIXES:
+  1. HIGH: Non-sample frames re-crop from current frame using cached persons
+     (_last_pf), not stale rendered pixels (_last_out_frame). Eliminates
+     motion freeze between detection intervals.
+  2. HIGH: apply_sharpen() is now actually called in the render path when
+     sharpen_strength > 0. Previously wired up but never invoked.
+
+v3.4 fixes preserved:
+  - process_video no longer discards render_adaptive_frame() output for SINGLE layout
+  - KalmanTargetTracker.predict() properly propagates state/covariance during ease
+  - Non-sample frames use cached layout instead of re-classifying
+  - CameraAnchor.snap() clears ongoing ease before starting new one
+  - KalmanTargetTracker.snap() always resets health and misses
+  - Velocity clamping and decay applied even during ease
+  - Adaptive innovation gate scales with video dimensions
+  - Unified render code path - no more double render
 
 v3.3 fixes preserved:
   - Adaptive innovation gate based on predicted velocity
@@ -866,7 +871,6 @@ def _probe_dominant_layout(input_path, model, fps, total_frames,
     for t in np.linspace(t0, t1, n_probe):
         frame = _read_frame_at(input_path, orig_w, orig_h, t, scale_w=sw, scale_h=sh)
         if frame is None: continue
-        # v3.4: Use unified detect_subjects instead of detect_persons_all
         det = detect_subjects(frame, model, confidence)
         if det is not None and det.boxes:
             persons = [(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy))
@@ -1310,7 +1314,6 @@ def detect_clips(input_path, min_duration_sec=25.0, max_duration_sec=65.0,
             if frame is None: continue
             if model is not None:
                 try:
-                    # v3.4: Use unified detect_subjects
                     res=detect_subjects(frame, model, confidence)
                     if res is not None and res.boxes:
                         for x1,y1,x2,y2 in res.boxes:
@@ -1329,7 +1332,7 @@ def detect_clips(input_path, min_duration_sec=25.0, max_duration_sec=65.0,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  process_video  —  main entry point  (v3.4 — Fixed)
+#  process_video  —  main entry point  (v3.5 — Fixed)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def process_video(
@@ -1445,7 +1448,6 @@ def process_video(
     dissolve_buf=DissolveBuffer(DISSOLVE_FRAMES) if dissolve_cuts else None
 
     # ── Per-frame state ────────────────────────────────────────────────────────
-    # v3.4: KalmanTargetTracker with fixed predict(), snap(), and ease handling.
     kalman      = KalmanTargetTracker()
     anchor      = CameraAnchor()
     anchor.snap(orig_w//2, orig_h//2)
@@ -1457,7 +1459,6 @@ def process_video(
     rpt_n       = max(1, total_frames//40)
     fi          = 0
 
-    # v3.4: Track health for saliency fallback
     saliency_fallback_count = 0
 
     _p(0.13,f"Rendering {total_frames} frames — layout={dominant_layout}")
@@ -1480,7 +1481,7 @@ def process_video(
                             dissolve_buf.on_cut(last_out_frame)
 
                     got_target = False
-                    det_result = None  # v3.3: unified detection result
+                    det_result = None
 
                     if tracking_mode=="talking_head":
                         faces = detect_faces(det_frame, confidence_thresh=0.5)
@@ -1491,7 +1492,6 @@ def process_video(
                             if r:
                                 new_tcx, new_tcy = r
                                 if cut:
-                                    # v3.3: Eased reset on scene cut
                                     anchor.snap(new_tcx, new_tcy)
                                     kalman.snap(new_tcx, new_tcy, ease_frames=SCENE_CUT_EASE_FRAMES)
                                 else:
@@ -1501,7 +1501,6 @@ def process_video(
                                 got_target = True
 
                     elif tracking_mode=="subject" and model_obj is not None:
-                        # v3.3: Single unified YOLO inference per sample frame
                         det_result = detect_subjects(det_frame, model_obj, confidence)
                         if det_result is not None:
                             new_tcx, new_tcy = frame_for_union(
@@ -1518,21 +1517,16 @@ def process_video(
                             got_target = True
 
                     if not got_target:
-                        # v3.4: Optical flow is NOT fed as position measurement.
-                        # It is only used to detect motion regions; if Kalman is
-                        # healthy, we let it coast. If Kalman is lost, we use saliency.
                         if use_optical_flow and kalman.health < 0.3:
                             sm = cv2.resize(cg,(max(1,det_w//2),max(1,det_h//2)))
                             if prev_flow is not None:
                                 fc = optical_flow_center(prev_flow,sm,det_w//2,det_h//2)
                                 if fc and not kalman.initialized:
-                                    # Only use flow to initialize, never as measurement
                                     flow_x = int(fc[0]*2*sx); flow_y = int(fc[1]*2*sy)
                                     kalman.snap(flow_x, flow_y)
                                     anchor.set_target(flow_x, flow_y)
                             prev_flow = sm
 
-                        # v3.4: Saliency fallback when Kalman track is lost
                         if kalman.health < 0.2 or not kalman.initialized:
                             scx, scy = saliency_center(det_frame)
                             scx_src = int(scx * sx); scy_src = int(scy * sy)
@@ -1556,47 +1550,35 @@ def process_video(
                 cur_cy = max(hh, min(cur_cy, orig_h-hh))
 
                 # ── Render ─────────────────────────────────────────────────────
-                # v3.4: Unified render path. Subject detection drives framing.
-                # The tracker (Kalman/Anchor) still runs for health monitoring,
-                # but the actual crop uses render_adaptive_frame output.
-
                 if tracking_mode=="subject" and model_obj is not None:
-                    # v3.4: On sample frames, run detection and update layout
                     if is_sample:
                         if det_result is not None and det_result.boxes:
                             pf = [(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy))
                                   for x1,y1,x2,y2 in det_result.boxes]
                         else:
-                            # No detection this frame - use previous groups
                             pf = [b for g in layout_state.prev_groups for b in g]
 
                         out_frame, active_layout = render_adaptive_frame(
                             frame, pf, target_w, target_h, layout_state=layout_state,
                             vignette_strength=vignette_strength*0.7,
                             color_grade=color_grade, frame_idx=fi)
-                        # Cache for non-sample frames
-                        layout_state._last_out_frame = out_frame
+                        # v3.5: Cache persons (not pixels) for non-sample frames.
+                        # Non-sample frames re-crop from their own current pixels
+                        # using these positions, avoiding motion freeze.
+                        layout_state._last_pf = pf
                         layout_state._last_layout = active_layout
                     else:
-                        # v3.4: On non-sample frames, use cached output from
-                        # last sample frame. This avoids re-classifying with stale
-                        # data and ensures smooth output between detections.
-                        if hasattr(layout_state, '_last_out_frame'):
-                            out_frame = layout_state._last_out_frame
-                        else:
-                            # Fallback: tracker-based crop
-                            left = max(0, min(cur_cx-crop_w//2, orig_w-crop_w))
-                            top_ = max(0, min(cur_cy-crop_h//2, orig_h-crop_h))
-                            crop = frame[top_:top_+crop_h, left:left+crop_w]
-                            if crop.shape[1]!=target_w or crop.shape[0]!=target_h:
-                                crop = cv2.resize(crop,(target_w,target_h),interpolation=cv2.INTER_LANCZOS4)
-                            out_frame = crop
-                            if color_grade and color_grade!="none":
-                                out_frame = apply_color_grade(out_frame,color_grade)
-                            if vignette_strength>0:
-                                out_frame = apply_vignette(out_frame,vignette_strength)
+                        # v3.5: Re-render from current frame using cached persons.
+                        # This is the fix: current frame pixels + cached positions
+                        # = smooth motion without re-running detection.
+                        cached_pf = getattr(layout_state, '_last_pf', [])
+                        out_frame, _ = render_adaptive_frame(
+                            frame, cached_pf, target_w, target_h,
+                            layout_state=layout_state,
+                            vignette_strength=vignette_strength*0.7,
+                            color_grade=color_grade, frame_idx=fi)
                 else:
-                    # talking_head or no model: use tracker-based crop
+                    # talking_head or no model: tracker-based crop
                     left = max(0, min(cur_cx-crop_w//2, orig_w-crop_w))
                     top_ = max(0, min(cur_cy-crop_h//2, orig_h-crop_h))
                     crop = frame[top_:top_+crop_h, left:left+crop_w]
@@ -1607,6 +1589,9 @@ def process_video(
                         out_frame = apply_color_grade(out_frame,color_grade)
                     if vignette_strength>0:
                         out_frame = apply_vignette(out_frame,vignette_strength)
+
+                # v3.5: Post-processing applied to all render paths
+                if sharpen_strength > 0: out_frame = apply_sharpen(out_frame, sharpen_strength)
                 if ken_burns:            out_frame = apply_ken_burns(out_frame,fi,fps)
                 if dissolve_buf and dissolve_buf.active:
                     out_frame = dissolve_buf.blend(out_frame)
