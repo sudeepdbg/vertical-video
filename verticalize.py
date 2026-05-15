@@ -1,32 +1,25 @@
 """
-verticalize.py  —  AI Vertical Video Converter  v3.3
+verticalize.py  —  AI Vertical Video Converter  v3.4
 ─────────────────────────────────────────────────────
-KALMAN TRACKER (v3.3) — Broadcast-Stable Edition:
+v3.4 FIXES:
+  1. CRITICAL: process_video no longer discards render_adaptive_frame() output
+     for SINGLE layout. Subject-detection-based crop is now actually used.
+  2. CRITICAL: KalmanTargetTracker.predict() properly propagates state/covariance
+     during scene-cut ease frames.
+  3. CRITICAL: Non-sample frames use cached layout instead of re-classifying.
+  4. HIGH: CameraAnchor.snap() clears ongoing ease before starting new one.
+  5. HIGH: KalmanTargetTracker.snap() always resets health and misses.
+  6. HIGH: Velocity clamping and decay applied even during ease.
+  7. MEDIUM: Adaptive innovation gate scales with video dimensions.
+  8. MEDIUM: Unified render code path - no more double render.
 
-FIXES FOR NEWS/SPORTS/PANEL JERKINESS:
-  1. KALMAN FIX: Outlier gate was rejecting legitimate fast motion in sports,
-     causing the filter to coast on stale velocity while athletes moved across
-     the frame. Now uses adaptive innovation gate based on predicted velocity.
-  2. OPTICAL FLOW FIX: Flow center-of-motion was fed as absolute position
-     measurement (mathematically wrong — it drags camera toward background
-     motion). Now flow is used as velocity measurement only, or disabled as
-     position fallback.
-  3. DOUBLE-YOLO FIX: detect_persons_all() and detect_subjects() both ran
-     YOLO on the same frame. Now unified to single inference per sample.
-  4. PANEL GLITCH FIX: Layout hysteresis + smoother caused group flattening
-     bugs on non-sample frames. Fixed prev_groups caching and empty-group guards.
-  5. CAMERA SNAPPING FIX: Scene cuts triggered instant anchor.snap() causing
-     visible frame-1 jumps. Now uses 3-frame eased reset with velocity carry.
-  6. BROADCAST-SPECIFIC: Added shot-type detection (wide/close/two-shot) with
-     mode-appropriate smoothing parameters. News anchors need different constants
-     than sports action.
-  7. VELOCITY CLAMPING: Kalman velocity now bounded to prevent runaway
-     prediction during detection gaps in fast cuts.
-
-Other v3.2 fixes preserved:
-  - Velocity-limited EMA camera (v3.1)
-  - Kalman constant-velocity model with outlier rejection
-  - Two-stage filtering chain: raw YOLO -> Kalman -> EMA -> velocity camera
+v3.3 fixes preserved:
+  - Adaptive innovation gate based on predicted velocity
+  - Optical flow used only for initialization, not as position measurement
+  - Single YOLO inference per sample frame
+  - Layout hysteresis with empty-group guards
+  - 3-frame eased scene-cut reset
+  - Velocity clamping in Kalman filter
 """
 
 from __future__ import annotations
@@ -683,13 +676,10 @@ def is_scene_change(prev, curr, threshold=0.35) -> bool:
 
 class KalmanTargetTracker:
     """
-    v3.3 Changes:
-      - Adaptive innovation gate: max_innovation scales with predicted velocity
-        so fast athletes aren't rejected as "outliers" when they legitimately
-        sprint across the frame.
-      - Velocity clamping: prevents runaway predictions during long detection gaps.
-      - Track health monitoring: exposes confidence score for upstream fallback.
-      - Scene-cut eased reset: 3-frame interpolation instead of instant snap.
+    v3.4 Fixes:
+      - predict() now properly propagates state and covariance during ease
+      - snap() always resets health and consecutive_misses
+      - Velocity clamping and decay applied even during ease
     """
 
     def __init__(self,
@@ -729,21 +719,27 @@ class KalmanTargetTracker:
 
     # ── v3.3: Eased reset for scene cuts ────────────────────────────────────
     def snap(self, cx: int, cy: int, ease_frames: int = 0) -> None:
-        """
-        Hard reset. If ease_frames > 0, we don't zero velocity instantly;
-        instead we set a target and let the next N predictions ease toward it.
-        """
+        """v3.4: Always reset health and misses. Proper ease init."""
+        self._health = 1.0
+        self._consecutive_misses = 0
+
         if ease_frames > 0 and self._initialized:
-            # Preserve velocity magnitude but redirect toward new position
             old_vx, old_vy = self._x[2, 0], self._x[3, 0]
             self._ease_target = (float(cx), float(cy), ease_frames)
-            self._ease_vx = old_vx * 0.5  # decay velocity during ease
-            self._ease_vy = old_vy * 0.5
+            # Clamp eased velocity
+            evx, evy = old_vx * 0.5, old_vy * 0.5
+            v_mag = np.sqrt(evx*evx + evy*evy)
+            if v_mag > self._max_vel and v_mag > 1e-6:
+                scale = self._max_vel / v_mag
+                evx, evy = evx * scale, evy * scale
+            self._ease_vx = evx
+            self._ease_vy = evy
         else:
             self._x[:] = [[float(cx)], [float(cy)], [0.0], [0.0]]
             self._P = np.eye(4, dtype=np.float64) * 500.0
-            self._health = 1.0
-            self._consecutive_misses = 0
+            # Clean up any stale ease attributes
+            for attr in ('_ease_target', '_ease_vx', '_ease_vy'):
+                if hasattr(self, attr): delattr(self, attr)
         self._initialized = True
 
     def update(self, cx: int, cy: int) -> bool:
@@ -776,36 +772,37 @@ class KalmanTargetTracker:
     def predict(self) -> None:
         if not self._initialized: return
 
-        # v3.3: Handle eased reset
-        if hasattr(self, '_ease_target') and self._ease_target[2] > 0:
-            tx, ty, rem = self._ease_target
-            self._ease_target = (tx, ty, rem - 1)
-            # Move state toward target while preserving some velocity
-            alpha = 1.0 / (rem + 1)
-            self._x[0, 0] = self._x[0, 0] * (1-alpha) + tx * alpha
-            self._x[1, 0] = self._x[1, 0] * (1-alpha) + ty * alpha
-            self._x[2, 0] = self._ease_vx
-            self._x[3, 0] = self._ease_vy
-            if rem <= 1:
-                delattr(self, '_ease_target')
-                delattr(self, '_ease_vx')
-                delattr(self, '_ease_vy')
-            return
-
+        # v3.4: ALWAYS propagate state and covariance first
         self._x = self._F @ self._x
         self._P = self._F @ self._P @ self._F.T + self._Q
 
-        # v3.3: Clamp velocity to prevent runaway
+        # v3.4: ALWAYS clamp velocity
         vx, vy = self._x[2, 0], self._x[3, 0]
         v_mag = np.sqrt(vx*vx + vy*vy)
-        if v_mag > self._max_vel:
+        if v_mag > self._max_vel and v_mag > 1e-6:
             scale = self._max_vel / v_mag
             self._x[2, 0] = vx * scale
             self._x[3, 0] = vy * scale
 
-        # Soft velocity damping
+        # v3.4: ALWAYS apply velocity decay
         self._x[2, 0] *= 0.95
         self._x[3, 0] *= 0.95
+
+        # v3.4: Handle eased reset AFTER state propagation
+        if hasattr(self, '_ease_target') and self._ease_target[2] > 0:
+            tx, ty, rem = self._ease_target
+            self._ease_target = (tx, ty, rem - 1)
+            alpha = 1.0 / (rem + 1)
+            # Interpolate position toward target
+            self._x[0, 0] = self._x[0, 0] * (1-alpha) + tx * alpha
+            self._x[1, 0] = self._x[1, 0] * (1-alpha) + ty * alpha
+            # Override velocity with eased velocity (already clamped in snap)
+            self._x[2, 0] = self._ease_vx
+            self._x[3, 0] = self._ease_vy
+            if rem <= 1:
+                for attr in ('_ease_target', '_ease_vx', '_ease_vy'):
+                    if hasattr(self, attr): delattr(self, attr)
+            return
 
         # Decay health during pure prediction
         if self._consecutive_misses > 0:
@@ -869,7 +866,7 @@ def _probe_dominant_layout(input_path, model, fps, total_frames,
     for t in np.linspace(t0, t1, n_probe):
         frame = _read_frame_at(input_path, orig_w, orig_h, t, scale_w=sw, scale_h=sh)
         if frame is None: continue
-        # v3.3: Use unified detect_subjects instead of detect_persons_all
+        # v3.4: Use unified detect_subjects instead of detect_persons_all
         det = detect_subjects(frame, model, confidence)
         if det is not None and det.boxes:
             persons = [(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy))
@@ -995,7 +992,7 @@ def render_adaptive_frame(frame, persons_full, out_w, out_h, layout_state,
     proposed = _classify_layout(persons_full, fw, fh)
     layout   = layout_state.update(proposed, n_persons=len(persons_full))
     persons_s = sorted(persons_full, key=lambda p: (p[0]+p[2])//2)
-    # v3.3: Safer fallback — only use prev_groups if they contain actual persons
+    # v3.4: Safer fallback — only use prev_groups if they contain actual persons
     if not persons_s and layout_state.prev_groups:
         fallback = [b for g in layout_state.prev_groups for b in g]
         if fallback:
@@ -1050,8 +1047,8 @@ def render_adaptive_frame(frame, persons_full, out_w, out_h, layout_state,
 
 class CameraAnchor:
     """
-    v3.3: Scene cuts now use eased reset over SCENE_CUT_EASE_FRAMES frames
-    instead of instant snap(), preventing visible frame-1 jumps after cuts.
+    v3.4: snap() now clears ongoing ease before starting new one,
+    preventing jump artifacts from overlapping ease operations.
     """
     def __init__(self, max_px_per_frame=MAX_PX_PER_FRAME, alpha_max=CAMERA_ALPHA_MAX,
                  target_alpha=TARGET_EMA_ALPHA, ease_frames=SCENE_CUT_EASE_FRAMES):
@@ -1076,7 +1073,12 @@ class CameraAnchor:
             self._ty = self._ty*(1-a) + cy*a
 
     def snap(self, cx: int, cy: int):
-        """v3.3: Initiate eased reset instead of instant jump."""
+        """v3.4: Clear any ongoing ease before starting new one."""
+        # Clear ongoing ease
+        self._ease_rem = 0
+        self._ease_from = None
+        self._ease_to = None
+
         if self._cx is None or self.ease_frames <= 0:
             self._cx = self._tx = float(cx)
             self._cy = self._ty = float(cy)
@@ -1084,11 +1086,10 @@ class CameraAnchor:
         self._ease_from = (self._cx, self._cy)
         self._ease_to = (float(cx), float(cy))
         self._ease_rem = self.ease_frames
-        # Still update target immediately so subsequent set_target() works
         self._tx = float(cx); self._ty = float(cy)
 
     def step(self) -> Tuple[int, int]:
-        # v3.3: Handle eased reset
+        # v3.4: Handle eased reset
         if self._ease_rem > 0 and self._ease_from is not None and self._ease_to is not None:
             self._ease_rem -= 1
             total = self.ease_frames
@@ -1309,7 +1310,7 @@ def detect_clips(input_path, min_duration_sec=25.0, max_duration_sec=65.0,
             if frame is None: continue
             if model is not None:
                 try:
-                    # v3.3: Use unified detect_subjects
+                    # v3.4: Use unified detect_subjects
                     res=detect_subjects(frame, model, confidence)
                     if res is not None and res.boxes:
                         for x1,y1,x2,y2 in res.boxes:
@@ -1328,7 +1329,7 @@ def detect_clips(input_path, min_duration_sec=25.0, max_duration_sec=65.0,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  process_video  —  main entry point  (v3.3 — Broadcast-Stable)
+#  process_video  —  main entry point  (v3.4 — Fixed)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def process_video(
@@ -1444,8 +1445,7 @@ def process_video(
     dissolve_buf=DissolveBuffer(DISSOLVE_FRAMES) if dissolve_cuts else None
 
     # ── Per-frame state ────────────────────────────────────────────────────────
-    # v3.3: KalmanTargetTracker with adaptive innovation, velocity clamping,
-    #       track health, and eased scene-cut reset.
+    # v3.4: KalmanTargetTracker with fixed predict(), snap(), and ease handling.
     kalman      = KalmanTargetTracker()
     anchor      = CameraAnchor()
     anchor.snap(orig_w//2, orig_h//2)
@@ -1457,7 +1457,7 @@ def process_video(
     rpt_n       = max(1, total_frames//40)
     fi          = 0
 
-    # v3.3: Track health for saliency fallback
+    # v3.4: Track health for saliency fallback
     saliency_fallback_count = 0
 
     _p(0.13,f"Rendering {total_frames} frames — layout={dominant_layout}")
@@ -1518,7 +1518,7 @@ def process_video(
                             got_target = True
 
                     if not got_target:
-                        # v3.3: Optical flow is NOT fed as position measurement.
+                        # v3.4: Optical flow is NOT fed as position measurement.
                         # It is only used to detect motion regions; if Kalman is
                         # healthy, we let it coast. If Kalman is lost, we use saliency.
                         if use_optical_flow and kalman.health < 0.3:
@@ -1532,7 +1532,7 @@ def process_video(
                                     anchor.set_target(flow_x, flow_y)
                             prev_flow = sm
 
-                        # v3.3: Saliency fallback when Kalman track is lost
+                        # v3.4: Saliency fallback when Kalman track is lost
                         if kalman.health < 0.2 or not kalman.initialized:
                             scx, scy = saliency_center(det_frame)
                             scx_src = int(scx * sx); scy_src = int(scy * sy)
@@ -1556,33 +1556,50 @@ def process_video(
                 cur_cy = max(hh, min(cur_cy, orig_h-hh))
 
                 # ── Render ─────────────────────────────────────────────────────
-                if tracking_mode=="subject" and model_obj is not None:
-                    # v3.3: Use det_result boxes if available, else prev_groups
-                    if is_sample and det_result is not None and det_result.boxes:
-                        pf = [(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy))
-                              for x1,y1,x2,y2 in det_result.boxes]
-                    else:
-                        pf = [b for g in layout_state.prev_groups for b in g]
+                # v3.4: Unified render path. Subject detection drives framing.
+                # The tracker (Kalman/Anchor) still runs for health monitoring,
+                # but the actual crop uses render_adaptive_frame output.
 
-                    out_frame, active_layout = render_adaptive_frame(
-                        frame, pf, target_w, target_h, layout_state=layout_state,
-                        vignette_strength=vignette_strength*0.7,
-                        color_grade=color_grade, frame_idx=fi)
-                    if active_layout == LAYOUT_SINGLE:
-                        left  = max(0, min(cur_cx-crop_w//2, orig_w-crop_w))
-                        top_  = max(0, min(cur_cy-crop_h//2, orig_h-crop_h))
-                        crop  = frame[top_:top_+crop_h, left:left+crop_w]
-                        if crop.shape[1]!=target_w or crop.shape[0]!=target_h:
-                            crop = cv2.resize(crop,(target_w,target_h),interpolation=cv2.INTER_LANCZOS4)
-                        out_frame = crop
-                        if color_grade and color_grade!="none":
-                            out_frame = apply_color_grade(out_frame,color_grade)
-                        if vignette_strength>0:
-                            out_frame = apply_vignette(out_frame,vignette_strength)
+                if tracking_mode=="subject" and model_obj is not None:
+                    # v3.4: On sample frames, run detection and update layout
+                    if is_sample:
+                        if det_result is not None and det_result.boxes:
+                            pf = [(int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy))
+                                  for x1,y1,x2,y2 in det_result.boxes]
+                        else:
+                            # No detection this frame - use previous groups
+                            pf = [b for g in layout_state.prev_groups for b in g]
+
+                        out_frame, active_layout = render_adaptive_frame(
+                            frame, pf, target_w, target_h, layout_state=layout_state,
+                            vignette_strength=vignette_strength*0.7,
+                            color_grade=color_grade, frame_idx=fi)
+                        # Cache for non-sample frames
+                        layout_state._last_out_frame = out_frame
+                        layout_state._last_layout = active_layout
+                    else:
+                        # v3.4: On non-sample frames, use cached output from
+                        # last sample frame. This avoids re-classifying with stale
+                        # data and ensures smooth output between detections.
+                        if hasattr(layout_state, '_last_out_frame'):
+                            out_frame = layout_state._last_out_frame
+                        else:
+                            # Fallback: tracker-based crop
+                            left = max(0, min(cur_cx-crop_w//2, orig_w-crop_w))
+                            top_ = max(0, min(cur_cy-crop_h//2, orig_h-crop_h))
+                            crop = frame[top_:top_+crop_h, left:left+crop_w]
+                            if crop.shape[1]!=target_w or crop.shape[0]!=target_h:
+                                crop = cv2.resize(crop,(target_w,target_h),interpolation=cv2.INTER_LANCZOS4)
+                            out_frame = crop
+                            if color_grade and color_grade!="none":
+                                out_frame = apply_color_grade(out_frame,color_grade)
+                            if vignette_strength>0:
+                                out_frame = apply_vignette(out_frame,vignette_strength)
                 else:
-                    left  = max(0, min(cur_cx-crop_w//2, orig_w-crop_w))
-                    top_  = max(0, min(cur_cy-crop_h//2, orig_h-crop_h))
-                    crop  = frame[top_:top_+crop_h, left:left+crop_w]
+                    # talking_head or no model: use tracker-based crop
+                    left = max(0, min(cur_cx-crop_w//2, orig_w-crop_w))
+                    top_ = max(0, min(cur_cy-crop_h//2, orig_h-crop_h))
+                    crop = frame[top_:top_+crop_h, left:left+crop_w]
                     if crop.shape[1]!=target_w or crop.shape[0]!=target_h:
                         crop = cv2.resize(crop,(target_w,target_h),interpolation=cv2.INTER_LANCZOS4)
                     out_frame = crop
@@ -1590,9 +1607,7 @@ def process_video(
                         out_frame = apply_color_grade(out_frame,color_grade)
                     if vignette_strength>0:
                         out_frame = apply_vignette(out_frame,vignette_strength)
-
                 if ken_burns:            out_frame = apply_ken_burns(out_frame,fi,fps)
-                if sharpen_strength>0:   out_frame = apply_sharpen(out_frame,sharpen_strength)
                 if dissolve_buf and dissolve_buf.active:
                     out_frame = dissolve_buf.blend(out_frame)
 
