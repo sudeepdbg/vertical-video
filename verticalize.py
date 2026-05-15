@@ -1,30 +1,23 @@
 """
-verticalize.py  —  AI Vertical Video Converter  v3.5
+verticalize.py  —  AI Vertical Video Converter  v3.6
 ─────────────────────────────────────────────────────
-v3.5 FIXES:
-  1. HIGH: Non-sample frames re-crop from current frame using cached persons
-     (_last_pf), not stale rendered pixels (_last_out_frame). Eliminates
-     motion freeze between detection intervals.
-  2. HIGH: apply_sharpen() is now actually called in the render path when
-     sharpen_strength > 0. Previously wired up but never invoked.
+v3.6 FIXES:
+  1. HIGH: Removed double color‑grade (FFmpeg eq + Python LUT). Python
+     LUT is kept because it runs per‑panel in subject mode.
+  2. HIGH: process_clips_batch now forwards whisper_language,
+     subtitle_translate_to and output_fps.
+  3. HIGH: prev_flow updated every sample frame, not only on
+     detection failure.
+  4. HIGH: Layout fallback applied before classification; non‑sample
+     frames force cached layout to prevent flicker.
+  5. HIGH: Scene cuts clear prev_groups / _last_pf / smoother so old
+     scene subjects don't ghost into the new scene.
+  6. MED:  Ken Burns uses render_fps when output_fps is overridden.
+  7. LOW: _trim_video passes -crf as string; useless finally removed.
 
-v3.4 fixes preserved:
-  - process_video no longer discards render_adaptive_frame() output for SINGLE layout
-  - KalmanTargetTracker.predict() properly propagates state/covariance during ease
-  - Non-sample frames use cached layout instead of re-classifying
-  - CameraAnchor.snap() clears ongoing ease before starting new one
-  - KalmanTargetTracker.snap() always resets health and misses
-  - Velocity clamping and decay applied even during ease
-  - Adaptive innovation gate scales with video dimensions
-  - Unified render code path - no more double render
-
-v3.3 fixes preserved:
-  - Adaptive innovation gate based on predicted velocity
-  - Optical flow used only for initialization, not as position measurement
-  - Single YOLO inference per sample frame
-  - Layout hysteresis with empty-group guards
-  - 3-frame eased scene-cut reset
-  - Velocity clamping in Kalman filter
+v3.5 fixes preserved:
+  - Non‑sample frames re‑crop from current frame using cached persons
+  - apply_sharpen() actually invoked when sharpen_strength > 0
 """
 
 from __future__ import annotations
@@ -62,9 +55,7 @@ KALMAN_MAX_INNOVATION_PX = 200.0
 KALMAN_PROCESS_NOISE_POS = 4.0
 KALMAN_PROCESS_NOISE_VEL = 2.0
 KALMAN_MEASUREMENT_NOISE = 225.0
-# NEW v3.3: Maximum allowed Kalman velocity (px/frame) to prevent runaway
 KALMAN_MAX_VELOCITY_PX = 80.0
-# NEW v3.3: Scene-cut reset easing frames (was instant snap)
 SCENE_CUT_EASE_FRAMES = 3
 
 LAYOUT_SINGLE    = "single"
@@ -359,7 +350,7 @@ def _trim_video(inp, out, start, end) -> bool:
     r = subprocess.run(
         ["ffmpeg", "-y", "-hwaccel", "none",
          "-ss", str(start), "-to", str(end), "-i", inp,
-         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+         "-c:v", "libx264", "-preset", "ultrafast", "-crf", str(18),
          "-c:a", "aac", "-b:a", "128k",
          "-avoid_negative_ts", "make_zero", "-reset_timestamps", "1", out],
         capture_output=True)
@@ -458,7 +449,6 @@ def calculate_crop_dims(orig_w, orig_h, tw, th):
     ratio = tw / th
     if (orig_w / orig_h) > ratio: ch = orig_h; cw = int(round(ch * ratio))
     else: cw = orig_w; ch = int(round(cw / ratio))
-    # v3.3: ensure even dimensions to prevent half-pixel issues
     cw = min(cw - (cw % 2), orig_w)
     ch = min(ch - (ch % 2), orig_h)
     return max(cw, 2), max(ch, 2)
@@ -523,10 +513,6 @@ DetectionResult = namedtuple(
     "DetectionResult", ["cx","cy","ux1","uy1","ux2","uy2","count","boxes"])
 
 def detect_subjects(frame, model, confidence=0.45) -> Optional[DetectionResult]:
-    """
-    v3.3: Unified detection that returns both the weighted center AND raw boxes.
-    This eliminates the double-YOLO problem (detect_persons_all + detect_subjects).
-    """
     if model is None: return None
     try: results = model(frame, verbose=False, conf=confidence)[0]
     except Exception as e: print(f"detection error: {e}", file=sys.stderr); return None
@@ -680,13 +666,6 @@ def is_scene_change(prev, curr, threshold=0.35) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class KalmanTargetTracker:
-    """
-    v3.4 Fixes:
-      - predict() now properly propagates state and covariance during ease
-      - snap() always resets health and consecutive_misses
-      - Velocity clamping and decay applied even during ease
-    """
-
     def __init__(self,
                  process_noise_pos: float = KALMAN_PROCESS_NOISE_POS,
                  process_noise_vel: float = KALMAN_PROCESS_NOISE_VEL,
@@ -696,7 +675,7 @@ class KalmanTargetTracker:
         self._max_innov_base = max_innovation
         self._max_vel = max_velocity
         self._initialized = False
-        self._health = 0.0  # 0.0-1.0 track confidence
+        self._health = 0.0
         self._consecutive_misses = 0
 
         self._F = np.array([
@@ -722,16 +701,13 @@ class KalmanTargetTracker:
         self._x = np.zeros((4, 1), dtype=np.float64)
         self._P = np.eye(4, dtype=np.float64) * 500.0
 
-    # ── v3.3: Eased reset for scene cuts ────────────────────────────────────
     def snap(self, cx: int, cy: int, ease_frames: int = 0) -> None:
-        """v3.4: Always reset health and misses. Proper ease init."""
         self._health = 1.0
         self._consecutive_misses = 0
 
         if ease_frames > 0 and self._initialized:
             old_vx, old_vy = self._x[2, 0], self._x[3, 0]
             self._ease_target = (float(cx), float(cy), ease_frames)
-            # Clamp eased velocity
             evx, evy = old_vx * 0.5, old_vy * 0.5
             v_mag = np.sqrt(evx*evx + evy*evy)
             if v_mag > self._max_vel and v_mag > 1e-6:
@@ -742,7 +718,6 @@ class KalmanTargetTracker:
         else:
             self._x[:] = [[float(cx)], [float(cy)], [0.0], [0.0]]
             self._P = np.eye(4, dtype=np.float64) * 500.0
-            # Clean up any stale ease attributes
             for attr in ('_ease_target', '_ease_vx', '_ease_vy'):
                 if hasattr(self, attr): delattr(self, attr)
         self._initialized = True
@@ -756,7 +731,6 @@ class KalmanTargetTracker:
         innov  = z - z_pred
         dist   = float(np.sqrt(innov[0,0]**2 + innov[1,0]**2))
 
-        # v3.3: Adaptive innovation gate based on predicted velocity
         pred_vel = float(np.sqrt(self._x[2,0]**2 + self._x[3,0]**2))
         adaptive_max_innov = self._max_innov_base + pred_vel * 2.5
 
@@ -777,11 +751,9 @@ class KalmanTargetTracker:
     def predict(self) -> None:
         if not self._initialized: return
 
-        # v3.4: ALWAYS propagate state and covariance first
         self._x = self._F @ self._x
         self._P = self._F @ self._P @ self._F.T + self._Q
 
-        # v3.4: ALWAYS clamp velocity
         vx, vy = self._x[2, 0], self._x[3, 0]
         v_mag = np.sqrt(vx*vx + vy*vy)
         if v_mag > self._max_vel and v_mag > 1e-6:
@@ -789,19 +761,15 @@ class KalmanTargetTracker:
             self._x[2, 0] = vx * scale
             self._x[3, 0] = vy * scale
 
-        # v3.4: ALWAYS apply velocity decay
         self._x[2, 0] *= 0.95
         self._x[3, 0] *= 0.95
 
-        # v3.4: Handle eased reset AFTER state propagation
         if hasattr(self, '_ease_target') and self._ease_target[2] > 0:
             tx, ty, rem = self._ease_target
             self._ease_target = (tx, ty, rem - 1)
             alpha = 1.0 / (rem + 1)
-            # Interpolate position toward target
             self._x[0, 0] = self._x[0, 0] * (1-alpha) + tx * alpha
             self._x[1, 0] = self._x[1, 0] * (1-alpha) + ty * alpha
-            # Override velocity with eased velocity (already clamped in snap)
             self._x[2, 0] = self._ease_vx
             self._x[3, 0] = self._ease_vy
             if rem <= 1:
@@ -809,7 +777,6 @@ class KalmanTargetTracker:
                     if hasattr(self, attr): delattr(self, attr)
             return
 
-        # Decay health during pure prediction
         if self._consecutive_misses > 0:
             self._health = max(0.0, self._health - 0.05)
 
@@ -860,6 +827,25 @@ def _classify_layout(persons, fw, fh) -> str:
         return LAYOUT_DUO_SPLIT if _should_split(ps[0], ps[1], fw) else LAYOUT_SINGLE
     ux1=min(p[0] for p in ps); ux2=max(p[2] for p in ps)
     return LAYOUT_WIDE if (ux2-ux1) > fw*0.80 else LAYOUT_TRIO
+
+
+# ── v3.6: Extracted group formation so it can be reused for forced layouts ────
+def _form_groups(persons_s, layout, fw):
+    if layout == LAYOUT_SINGLE or not persons_s:
+        return [persons_s]
+    if layout == LAYOUT_DUO_SPLIT:
+        split = next((k for k in range(1, len(persons_s))
+                      if _should_split(persons_s[k-1], persons_s[k], fw)), len(persons_s)//2)
+        return [persons_s[:split], persons_s[split:]]
+    if layout == LAYOUT_TRIO:
+        mi = max(range(len(persons_s)),
+                 key=lambda i: (persons_s[i][2]-persons_s[i][0])*(persons_s[i][3]-persons_s[i][1]))
+        main = [persons_s[mi]]
+        rest = sorted([p for i, p in enumerate(persons_s) if i != mi], key=lambda p: (p[0]+p[2])//2)
+        mid = max(len(rest)//2, 1)
+        return [main, rest[:mid], rest[mid:]]
+    return [persons_s]
+
 
 def _probe_dominant_layout(input_path, model, fps, total_frames,
                             orig_w, orig_h, confidence=0.45, n_probe=24) -> str:
@@ -938,7 +924,7 @@ def _assemble_strips(strips, out_w, out_h):
             strip=cv2.resize(strip,(out_w,h),interpolation=cv2.INTER_LINEAR)
         canvas[y:y+h,:]=strip; y+=h
         if i<n-1: canvas[y:y+div,:]=PANEL_DIVIDER_COLOR; y+=div
-    if y<out_h: canvas[y:,:]=PANEL_DIVIDER_COLOR
+    if y<<out_h: canvas[y:,:]=PANEL_DIVIDER_COLOR
     return canvas
 
 
@@ -953,12 +939,11 @@ class StablePanelSmoother:
             for i in range(min(n,len(self._slots))):
                 if i>=self._last_n: self._slots[i]=None
             for i in range(n,self._last_n):
-                if i<len(self._slots): self._slots[i]=None
+                if i<<len(self._slots): self._slots[i]=None
         self._last_n=n; out=[]
         for i,group in enumerate(groups):
             if i>=len(self._slots) or not group: out.append(group); continue
             u=_group_union(group)
-            # v3.3: Guard against empty union
             if u == (0,0,0,0):
                 out.append(group); continue
             ucx=(u[0]+u[2])/2; ucy=(u[1]+u[3])/2
@@ -975,8 +960,12 @@ class StablePanelSmoother:
 # ── Layout state machine ───────────────────────────────────────────────────────
 class LayoutState:
     def __init__(self):
-        self.current=LAYOUT_SINGLE; self._locked=0
-        self.smoother=StablePanelSmoother(max_slots=3); self.prev_groups: List=[]
+        self.current = LAYOUT_SINGLE
+        self._locked = 0
+        self.smoother = StablePanelSmoother(max_slots=3)
+        self.prev_groups: List = []
+        self._last_pf: List = []
+        self._last_layout = LAYOUT_SINGLE
 
     def update(self, proposed, n_persons=None) -> str:
         if n_persons is not None and n_persons <= 1:
@@ -988,61 +977,76 @@ class LayoutState:
         return self.current
 
 
+# ── v3.6: render_adaptive_frame with forced-layout support ────────────────────
 def render_adaptive_frame(frame, persons_full, out_w, out_h, layout_state,
                            vignette_strength=VIGNETTE_STRENGTH*0.7,
-                           color_grade="none", frame_idx=0):
-    fh,fw = frame.shape[:2]
+                           color_grade="none", frame_idx=0,
+                           force_layout=None):
+    fh, fw = frame.shape[:2]
     persons_full = _filter_persons(persons_full, fw, fh)
-    proposed = _classify_layout(persons_full, fw, fh)
-    layout   = layout_state.update(proposed, n_persons=len(persons_full))
-    persons_s = sorted(persons_full, key=lambda p: (p[0]+p[2])//2)
-    # v3.4: Safer fallback — only use prev_groups if they contain actual persons
-    if not persons_s and layout_state.prev_groups:
+    
+    # v3.6: Apply fallback before classification to prevent
+    # premature layout collapse on detection dropouts
+    if not persons_full and layout_state.prev_groups:
         fallback = [b for g in layout_state.prev_groups for b in g]
         if fallback:
-            persons_s = fallback
-    if layout==LAYOUT_DUO_SPLIT and len(persons_s)<2: layout=LAYOUT_SINGLE
-    if layout==LAYOUT_TRIO      and len(persons_s)<2: layout=LAYOUT_SINGLE
+            persons_full = fallback
+    
+    if force_layout is not None:
+        layout = force_layout
+        expected_groups = 1
+        if layout == LAYOUT_DUO_SPLIT: expected_groups = 2
+        elif layout == LAYOUT_TRIO: expected_groups = 3
+        if layout_state.prev_groups and len(layout_state.prev_groups) == expected_groups:
+            groups = layout_state.prev_groups
+        else:
+            persons_s = sorted(persons_full, key=lambda p: (p[0]+p[2])//2)
+            groups = _form_groups(persons_s, layout, fw)
+    else:
+        proposed = _classify_layout(persons_full, fw, fh)
+        layout = layout_state.update(proposed, n_persons=len(persons_full))
+        persons_s = sorted(persons_full, key=lambda p: (p[0]+p[2])//2)
+        if layout == LAYOUT_DUO_SPLIT and len(persons_s) < 2: layout = LAYOUT_SINGLE
+        if layout == LAYOUT_TRIO and len(persons_s) < 2: layout = LAYOUT_SINGLE
+        groups = _form_groups(persons_s, layout, fw)
+        groups = layout_state.smoother.smooth(groups)
+        layout_state.prev_groups = groups
+
     kw = dict(vignette_strength=vignette_strength, color_grade=color_grade)
 
-    if layout==LAYOUT_SINGLE or not persons_s: groups=[persons_s]
-    elif layout==LAYOUT_DUO_SPLIT:
-        split=next((k for k in range(1,len(persons_s))
-                    if _should_split(persons_s[k-1],persons_s[k],fw)), len(persons_s)//2)
-        groups=[persons_s[:split], persons_s[split:]]
-    elif layout==LAYOUT_TRIO:
-        mi=max(range(len(persons_s)),
-               key=lambda i:(persons_s[i][2]-persons_s[i][0])*(persons_s[i][3]-persons_s[i][1]))
-        main=[persons_s[mi]]
-        rest=sorted([p for i,p in enumerate(persons_s) if i!=mi], key=lambda p:(p[0]+p[2])//2)
-        mid=max(len(rest)//2,1); groups=[main,rest[:mid],rest[mid:]]
-    else: groups=[persons_s]
-
-    groups=layout_state.smoother.smooth(groups); layout_state.prev_groups=groups
-
-    if layout==LAYOUT_SINGLE:
-        return _wide_crop_for_group(frame,groups[0],out_w,out_h,**kw), layout
-    if layout==LAYOUT_DUO_SPLIT:
-        div=PANEL_DIVIDER_PX; sh_top=((out_h-div)//2)&~1; sh_bot=out_h-sh_top-div
-        top=_tight_crop_for_group(frame,groups[0],out_w,sh_top,**kw)
-        bot=_tight_crop_for_group(frame,groups[1],out_w,sh_bot,**kw)
-        return _assemble_strips([top,bot],out_w,out_h), layout
-    if layout==LAYOUT_TRIO:
-        div=PANEL_DIVIDER_PX; sh_main=int((out_h-2*div)*0.60)&~1
-        sh_side=((out_h-sh_main-2*div)//2)&~1
-        main_s=_tight_crop_for_group(frame,groups[0],out_w,sh_main,**kw)
-        side_l=_tight_crop_for_group(frame,groups[1] if len(groups)>1 else [],out_w,sh_side,**kw)
-        side_r=_tight_crop_for_group(frame,groups[2] if len(groups)>2 else [],out_w,sh_side,**kw)
-        bw=out_w//2
-        bottom=np.concatenate([cv2.resize(side_l,(bw,sh_side),interpolation=cv2.INTER_LINEAR),
-                                cv2.resize(side_r,(out_w-bw,sh_side),interpolation=cv2.INTER_LINEAR)],axis=1)
-        canvas=np.empty((out_h,out_w,3),dtype=np.uint8); y=0
-        canvas[y:y+sh_main,:]=main_s; y+=sh_main
-        canvas[y:y+div,:]=PANEL_DIVIDER_COLOR; y+=div
-        canvas[y:y+sh_side,:]=bottom; y+=sh_side
-        if y<out_h: canvas[y:,:]=PANEL_DIVIDER_COLOR
+    if layout == LAYOUT_SINGLE:
+        return _wide_crop_for_group(frame, groups[0], out_w, out_h, **kw), layout
+    if layout == LAYOUT_DUO_SPLIT:
+        div = PANEL_DIVIDER_PX
+        sh_top = ((out_h - div) // 2) & ~1
+        sh_bot = out_h - sh_top - div
+        top = _tight_crop_for_group(frame, groups[0], out_w, sh_top, **kw)
+        bot = _tight_crop_for_group(frame, groups[1], out_w, sh_bot, **kw)
+        return _assemble_strips([top, bot], out_w, out_h), layout
+    if layout == LAYOUT_TRIO:
+        div = PANEL_DIVIDER_PX
+        sh_main = int((out_h - 2*div) * 0.60) & ~1
+        sh_side = ((out_h - sh_main - 2*div) // 2) & ~1
+        main_s = _tight_crop_for_group(frame, groups[0], out_w, sh_main, **kw)
+        side_l = _tight_crop_for_group(frame, groups[1] if len(groups) > 1 else [], out_w, sh_side, **kw)
+        side_r = _tight_crop_for_group(frame, groups[2] if len(groups) > 2 else [], out_w, sh_side, **kw)
+        bw = out_w // 2
+        bottom = np.concatenate([
+            cv2.resize(side_l, (bw, sh_side), interpolation=cv2.INTER_LINEAR),
+            cv2.resize(side_r, (out_w - bw, sh_side), interpolation=cv2.INTER_LINEAR)
+        ], axis=1)
+        canvas = np.empty((out_h, out_w, 3), dtype=np.uint8)
+        y = 0
+        canvas[y:y+sh_main, :] = main_s
+        y += sh_main
+        canvas[y:y+div, :] = PANEL_DIVIDER_COLOR
+        y += div
+        canvas[y:y+sh_side, :] = bottom
+        y += sh_side
+        if y < out_h:
+            canvas[y:, :] = PANEL_DIVIDER_COLOR
         return canvas, layout
-    return _wide_crop_for_group(frame,groups[0],out_w,out_h,**kw), layout
+    return _wide_crop_for_group(frame, groups[0], out_w, out_h, **kw), layout
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1050,10 +1054,6 @@ def render_adaptive_frame(frame, persons_full, out_w, out_h, layout_state,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class CameraAnchor:
-    """
-    v3.4: snap() now clears ongoing ease before starting new one,
-    preventing jump artifacts from overlapping ease operations.
-    """
     def __init__(self, max_px_per_frame=MAX_PX_PER_FRAME, alpha_max=CAMERA_ALPHA_MAX,
                  target_alpha=TARGET_EMA_ALPHA, ease_frames=SCENE_CUT_EASE_FRAMES):
         self.max_px        = max_px_per_frame
@@ -1077,8 +1077,6 @@ class CameraAnchor:
             self._ty = self._ty*(1-a) + cy*a
 
     def snap(self, cx: int, cy: int):
-        """v3.4: Clear any ongoing ease before starting new one."""
-        # Clear ongoing ease
         self._ease_rem = 0
         self._ease_from = None
         self._ease_to = None
@@ -1093,13 +1091,11 @@ class CameraAnchor:
         self._tx = float(cx); self._ty = float(cy)
 
     def step(self) -> Tuple[int, int]:
-        # v3.4: Handle eased reset
         if self._ease_rem > 0 and self._ease_from is not None and self._ease_to is not None:
             self._ease_rem -= 1
             total = self.ease_frames
             done = total - self._ease_rem
             t = done / total
-            # Ease-in-out cubic
             t = t * t * (3 - 2 * t)
             self._cx = self._ease_from[0] * (1-t) + self._ease_to[0] * t
             self._cy = self._ease_from[1] * (1-t) + self._ease_to[1] * t
@@ -1225,7 +1221,7 @@ def _find_nearest_scene_cut(scene_cuts_sec, target_sec, window):
     best,best_d=None,float("inf")
     for t in scene_cuts_sec:
         d=abs(t-target_sec)
-        if d<=window and d<best_d: best_d,best=d,t
+        if d<=window and d<<best_d: best_d,best=d,t
     return best
 
 def _find_low_motion_valley(motion_profile, target_sec, window):
@@ -1243,7 +1239,7 @@ def _refine_clip_boundaries(start_sec, end_sec, duration, scene_cuts_sec,
     new_end=min(duration,cut_e-postroll) if cut_e is not None else \
             min(duration,_find_low_motion_valley(motion_profile,end_sec,search_window)+postroll*0.5)
     new_dur=new_end-new_start
-    if new_dur<min_duration:
+    if new_dur<<min_duration:
         deficit=min_duration-new_dur
         new_start=max(0.0,new_start-deficit/2)
         new_end=min(duration,new_start+min_duration)
@@ -1285,12 +1281,12 @@ def detect_clips(input_path, min_duration_sec=25.0, max_duration_sec=65.0,
         ps=pi*sample_every/fps; rs=max(0.0,ps-max_duration_sec*0.4); re=min(duration,rs+max_duration_sec)
         for sc in reversed(scene_cuts_frames):
             sc_s=sc/fps
-            if 0<ps-sc_s<15.0: rs=max(0.0,sc_s-1.0); break
+            if 0<<ps-sc_s<<15.0: rs=max(0.0,sc_s-1.0); break
         for sc in scene_cuts_frames:
             sc_s=sc/fps
-            if 0<sc_s-ps<15.0: re=min(duration,sc_s+0.5); break
+            if 0<<sc_s-ps<<15.0: re=min(duration,sc_s+0.5); break
         cd=re-rs
-        if cd<min_duration_sec: re=min(duration,rs+min_duration_sec)
+        if cd<<min_duration_sec: re=min(duration,rs+min_duration_sec)
         elif cd>max_duration_sec:
             c=(rs+re)/2; rs=max(0.0,c-max_duration_sec/2); re=min(duration,rs+max_duration_sec)
         return rs,re
@@ -1332,7 +1328,7 @@ def detect_clips(input_path, min_duration_sec=25.0, max_duration_sec=65.0,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  process_video  —  main entry point  (v3.5 — Fixed)
+#  process_video  —  main entry point  (v3.6 — Fixed)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def process_video(
@@ -1387,7 +1383,7 @@ def process_video(
     lbl=target_preset_label if target_preset_label in RESOLUTION_PRESETS else "Match source (no upscale)"
     target_w,target_h=resolve_target_size(lbl,orig_w,orig_h)
     req_w,req_h=RESOLUTION_PRESETS.get(lbl,(0,0))
-    clamped=req_h>0 and (target_h<req_h or target_w<req_w)
+    clamped=req_h>0 and (target_h<<req_h or target_w<<req_w)
     result_meta.update(clamped=clamped,effective_size=(target_w,target_h),duration=duration)
     _p(0.01,f"Output {target_w}x{target_h}  source {orig_w}x{orig_h}")
 
@@ -1437,7 +1433,9 @@ def process_video(
         _p(0.12,f"Dominant layout: {dominant_layout}")
 
     # ── Open encoder ───────────────────────────────────────────────────────────
-    extra_vf=_build_ffmpeg_vf(color_grade=color_grade,ffmpeg_sharpen=ffmpeg_sharpen)
+    # v3.6: Python already applies color grade per-frame (and per-panel).
+    # Passing "none" to FFmpeg prevents double-grading.
+    extra_vf=_build_ffmpeg_vf(color_grade="none", ffmpeg_sharpen=ffmpeg_sharpen)
     style=SUBTITLE_STYLES.get(subtitle_style_name,SUBTITLE_STYLES["Bold White (TikTok)"])
     proc=_open_ffmpeg_encoder(
         output_path,target_w,target_h,render_fps,audio_source=input_path,
@@ -1477,6 +1475,11 @@ def process_video(
 
                     if cut:
                         prev_flow = None
+                        # v3.6: Reset layout state on scene cuts to prevent
+                        # carrying stale person groups across scenes
+                        layout_state.prev_groups = []
+                        layout_state._last_pf = []
+                        layout_state.smoother = StablePanelSmoother(max_slots=3)
                         if dissolve_buf and last_out_frame is not None:
                             dissolve_buf.on_cut(last_out_frame)
 
@@ -1516,20 +1519,24 @@ def process_video(
                                 anchor.set_target(kx, ky)
                             got_target = True
 
-                    if not got_target:
-                        if use_optical_flow and kalman.health < 0.3:
-                            sm = cv2.resize(cg,(max(1,det_w//2),max(1,det_h//2)))
-                            if prev_flow is not None:
-                                fc = optical_flow_center(prev_flow,sm,det_w//2,det_h//2)
-                                if fc and not kalman.initialized:
-                                    flow_x = int(fc[0]*2*sx); flow_y = int(fc[1]*2*sy)
-                                    kalman.snap(flow_x, flow_y)
-                                    anchor.set_target(flow_x, flow_y)
-                            prev_flow = sm
+                    # v3.6: Update optical flow reference every sample frame,
+                    # not only when detection fails
+                    if use_optical_flow:
+                        sm = cv2.resize(cg, (max(1, det_w//2), max(1, det_h//2)))
+                        if not got_target and kalman.health < 0.3 and prev_flow is not None:
+                            fc = optical_flow_center(prev_flow, sm, det_w//2, det_h//2)
+                            if fc and not kalman.initialized:
+                                flow_x = int(fc[0]*2*sx)
+                                flow_y = int(fc[1]*2*sy)
+                                kalman.snap(flow_x, flow_y)
+                                anchor.set_target(flow_x, flow_y)
+                        prev_flow = sm
 
+                    if not got_target:
                         if kalman.health < 0.2 or not kalman.initialized:
                             scx, scy = saliency_center(det_frame)
-                            scx_src = int(scx * sx); scy_src = int(scy * sy)
+                            scx_src = int(scx * sx)
+                            scy_src = int(scy * sy)
                             if not kalman.initialized:
                                 kalman.snap(scx_src, scy_src)
                             else:
@@ -1562,21 +1569,18 @@ def process_video(
                             frame, pf, target_w, target_h, layout_state=layout_state,
                             vignette_strength=vignette_strength*0.7,
                             color_grade=color_grade, frame_idx=fi)
-                        # v3.5: Cache persons (not pixels) for non-sample frames.
-                        # Non-sample frames re-crop from their own current pixels
-                        # using these positions, avoiding motion freeze.
                         layout_state._last_pf = pf
                         layout_state._last_layout = active_layout
                     else:
-                        # v3.5: Re-render from current frame using cached persons.
-                        # This is the fix: current frame pixels + cached positions
-                        # = smooth motion without re-running detection.
-                        cached_pf = getattr(layout_state, '_last_pf', [])
+                        # v3.6: Non-sample frames use cached layout directly
+                        # without re-classifying, preventing flicker
+                        cached_pf = layout_state._last_pf
                         out_frame, _ = render_adaptive_frame(
                             frame, cached_pf, target_w, target_h,
                             layout_state=layout_state,
                             vignette_strength=vignette_strength*0.7,
-                            color_grade=color_grade, frame_idx=fi)
+                            color_grade=color_grade, frame_idx=fi,
+                            force_layout=layout_state.current)
                 else:
                     # talking_head or no model: tracker-based crop
                     left = max(0, min(cur_cx-crop_w//2, orig_w-crop_w))
@@ -1592,7 +1596,8 @@ def process_video(
 
                 # v3.5: Post-processing applied to all render paths
                 if sharpen_strength > 0: out_frame = apply_sharpen(out_frame, sharpen_strength)
-                if ken_burns:            out_frame = apply_ken_burns(out_frame,fi,fps)
+                # v3.6: Ken Burns must respect output frame rate when overridden
+                if ken_burns:            out_frame = apply_ken_burns(out_frame, fi, render_fps)
                 if dissolve_buf and dissolve_buf.active:
                     out_frame = dissolve_buf.blend(out_frame)
 
@@ -1603,7 +1608,8 @@ def process_video(
                 fi += 1
                 if fi % rpt_n == 0:
                     _p(0.13 + 0.75*(fi/total_frames), f"{fi}/{total_frames}...")
-    finally:
+    except BrokenPipeError:
+        # FFmpeg encoder exited early — real error reported during shutdown
         pass
 
     _p(0.88,"Encoding...")
@@ -1627,7 +1633,9 @@ def process_clips_batch(
     confidence=0.45, use_optical_flow=True,
     crf=23, encoder_preset="fast", audio_bitrate="128k",
     yolo_weights="yolov8n.pt", burn_subtitles=False, whisper_model="base",
-    subtitle_style_name="Bold White (TikTok)", subtitle_max_chars=42,
+    whisper_language=None, subtitle_style_name="Bold White (TikTok)", 
+    subtitle_max_chars=42, subtitle_translate_to=None,
+    output_fps=None,
     vignette_strength=VIGNETTE_STRENGTH, sharpen_strength=0.0, color_grade="none",
     ken_burns=False, dissolve_cuts=True, ffmpeg_sharpen=False,
     progress_callback=None,
@@ -1652,10 +1660,13 @@ def process_clips_batch(
                 trimmed_path,out_path,target_preset_label=target_preset_label,
                 tracking_mode=tracking_mode,talking_head_bias=talking_head_bias,
                 confidence=confidence,use_optical_flow=use_optical_flow,
+                output_fps=output_fps,
                 crf=crf,encoder_preset=encoder_preset,audio_bitrate=audio_bitrate,
                 yolo_weights=yolo_weights,burn_subtitles=burn_subtitles,
-                whisper_model=whisper_model,subtitle_style_name=subtitle_style_name,
-                subtitle_max_chars=subtitle_max_chars,vignette_strength=vignette_strength,
+                whisper_model=whisper_model,whisper_language=whisper_language,
+                subtitle_style_name=subtitle_style_name,
+                subtitle_max_chars=subtitle_max_chars,subtitle_translate_to=subtitle_translate_to,
+                vignette_strength=vignette_strength,
                 sharpen_strength=sharpen_strength,color_grade=color_grade,
                 ken_burns=ken_burns,dissolve_cuts=dissolve_cuts,
                 ffmpeg_sharpen=ffmpeg_sharpen,progress_callback=clip_cb)
