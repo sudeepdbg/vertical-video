@@ -12,7 +12,7 @@ from verticalize import (
     process_video, get_video_info, detect_clips, process_clips_batch,
     RESOLUTION_PRESETS, SUBTITLE_STYLES, TRANSLATION_LANGUAGES,
     resolve_target_size, whisper_available, translation_available,
-    ClipSection,
+    ClipSegment,  # Changed from ClipSection to ClipSegment
 )
 
 st.set_page_config(
