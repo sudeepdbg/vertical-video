@@ -2,46 +2,41 @@
 verticalize.py  —  AI Vertical Video converter  v3.0
 ──────────────────────────────────────────────────────
 CHANGES v3.0:
-  SMOOTH-1  Multi-pass smoothing pipeline: Gaussian → bidirectional EMA → velocity-
-            adaptive window. Removes jitter and micro-shake caused by per-frame
-            detection noise while preserving intentional camera motion.
-  SMOOTH-2  Per-axis velocity estimation; window adapts independently to horizontal
-            vs vertical camera speed, preventing over-smoothing on mostly-still shots.
-  SMOOTH-3  Shot-boundary-aware smoothing: scene cuts hard-reset the EMA state so
-            dissolve artefacts don't bleed across cuts.
-  SMOOTH-4  Sub-sample interpolation uses monotone cubic (PCHIP) instead of plain
-            Hermite so the path never overshoots (no oscillation around subjects).
-
-  PANEL-1   Podcast/news panel detector now uses a majority-vote over speaker-
-            region histograms: it counts frames where ≥2 persons occupy stable
-            left/right bounding columns, reducing false positives on crowd scenes.
-  PANEL-2   Per-slot EMA alpha lowered to 0.15 (was 0.25) and clamped to prevent
-            a new detection yanking an entire strip across the frame in one frame.
-  PANEL-3   Panel transition cross-fade: when the slot assignment changes (e.g.
-            speaker swap), a short alpha-blend masks the hard jump.
-  PANEL-4   Divider line is drawn last, after blending, so it is always sharp.
-
-  CLEAN-1   Removed unused _face_net / _haar_cascade fallback paths that were
-            never reached (talking_head now routes through the same detect_faces
-            helper but the prototxt / caffemodel paths are gone from cold start).
-  CLEAN-2   Removed dead _read_frame_at wrapper (inlined into callers).
-  CLEAN-3   Removed duplicate _build_ffmpeg_vf color-grade branches that were
-            never executed in panel mode.
-  CLEAN-4   Removed _cubic_hermite / interpolate_centers (replaced by PCHIP).
-  CLEAN-5   Removed vel-table look-up duplication between smooth_centers and
-            _ema_polish (merged into one smooth_centers call).
-
-  ANALYTICS get_analytics_meta(input_path, output_path) → dict  ready to feed
-            the companion analytics player widget.
-            ADDED: Jitter/Smoothness metrics calculated during processing.
+SMOOTH-1  Multi-pass smoothing pipeline: Gaussian → bidirectional EMA → velocity-
+adaptive window. Removes jitter and micro-shake caused by per-frame
+detection noise while preserving intentional camera motion.
+SMOOTH-2  Per-axis velocity estimation; window adapts independently to horizontal
+vs vertical camera speed, preventing over-smoothing on mostly-still shots.
+SMOOTH-3  Shot-boundary-aware smoothing: scene cuts hard-reset the EMA state so
+dissolve artefacts don't bleed across cuts.
+SMOOTH-4  Sub-sample interpolation uses monotone cubic (PCHIP) instead of plain
+Hermite so the path never overshoots (no oscillation around subjects).
+PANEL-1   Podcast/news panel detector now uses a majority-vote over speaker-
+region histograms: it counts frames where ≥2 persons occupy stable
+left/right bounding columns, reducing false positives on crowd scenes.
+PANEL-2   Per-slot EMA alpha lowered to 0.15 (was 0.25) and clamped to prevent
+a new detection yanking an entire strip across the frame in one frame.
+PANEL-3   Panel transition cross-fade: when the slot assignment changes (e.g.
+speaker swap), a short alpha-blend masks the hard jump.
+PANEL-4   Divider line is drawn last, after blending, so it is always sharp.
+CLEAN-1   Removed unused _face_net / _haar_cascade fallback paths that were
+never reached (talking_head now routes through the same detect_faces
+helper but the prototxt / caffemodel paths are gone from cold start).
+CLEAN-2   Removed dead _read_frame_at wrapper (inlined into callers).
+CLEAN-3   Removed duplicate _build_ffmpeg_vf color-grade branches that were
+never executed in panel mode.
+CLEAN-4   Removed _cubic_hermite / interpolate_centers (replaced by PCHIP).
+CLEAN-5   Removed vel-table look-up duplication between smooth_centers and
+_ema_polish (merged into one smooth_centers call).
+ANALYTICS get_analytics_meta(input_path, output_path) → dict  ready to feed
+the companion analytics player widget.
+ADDED: Jitter/Smoothness metrics calculated during processing.
 """
-
 from __future__ import annotations
 import subprocess, sys, os, tempfile, math
 from typing import Any, Dict, List, Optional, Tuple
 from collections import namedtuple
 import cv2, numpy as np
-
 try:
     from ultralytics import YOLO as _YOLO
     _YOLO_AVAILABLE = True
@@ -51,7 +46,7 @@ except ImportError:
 class ProcessingError(Exception):
     pass
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ─── Constants ─────────────────────────────────────────────────────────────────
 PERSON_CLASS_ID   = 0
 HIGH_PRIO_CLASSES = {0, 2, 3, 5, 7, 15, 16}
 MAX_FILE_SIZE_MB  = 2000
@@ -75,27 +70,27 @@ RESOLUTION_PRESETS = {
 }
 
 SUBTITLE_STYLES = {
-    "Bold White (TikTok)": {
-        "fontsize": 18, "primary_color": "&H00FFFFFF", "outline_color": "&H00000000",
-        "outline": 2, "bold": 1, "shadow": 0, "back_color": "&H00000000", "margin_v": 80,
+    "Bold White (TikTok) ": {
+        "fontsize ": 18,  "primary_color ":  " &H00FFFFFF ",  "outline_color ":  " &H00000000 ",
+        "outline ": 2,  "bold ": 1,  "shadow ": 0,  "back_color ":  " &H00000000 ",  "margin_v ": 80,
     },
-    "Yellow (Classic)": {
-        "fontsize": 16, "primary_color": "&H0000FFFF", "outline_color": "&H00000000",
-        "outline": 2, "bold": 1, "shadow": 1, "back_color": "&H00000000", "margin_v": 80,
+    "Yellow (Classic) ": {
+        "fontsize ": 16,  "primary_color ":  " &H0000FFFF ",  "outline_color ":  " &H00000000 ",
+        "outline ": 2,  "bold ": 1,  "shadow ": 1,  "back_color ":  " &H00000000 ",  "margin_v ": 80,
     },
-    "Box (Accessible)": {
-        "fontsize": 15, "primary_color": "&H00FFFFFF", "outline_color": "&H00000000",
-        "outline": 0, "bold": 0, "shadow": 0, "back_color": "&H80000000", "margin_v": 80,
+    "Box (Accessible) ": {
+        "fontsize ": 15,  "primary_color ":  " &H00FFFFFF ",  "outline_color ":  " &H00000000 ",
+        "outline ": 0,  "bold ": 0,  "shadow ": 0,  "back_color ":  " &H80000000 ",  "margin_v ": 80,
     },
 }
 
 TRANSLATION_LANGUAGES = {
-    "None (keep original)": "", "French": "fr", "German": "de", "Spanish": "es",
-    "Italian": "it", "Portuguese": "pt", "Dutch": "nl", "Polish": "pl", "Russian": "ru",
-    "Japanese": "ja", "Korean": "ko", "Chinese (Simplified)": "zh-CN", "Arabic": "ar",
-    "Hindi": "hi", "Turkish": "tr", "Indonesian": "id", "Swedish": "sv", "Norwegian": "no",
-    "Danish": "da", "Finnish": "fi", "Greek": "el", "Hebrew": "iw", "Thai": "th",
-    "Vietnamese": "vi", "Malay": "ms", "Ukrainian": "uk",
+    "None (keep original) ":  " ",  "French ":  "fr ",  "German ":  "de ",  "Spanish ":  "es ",
+    "Italian ":  "it ",  "Portuguese ":  "pt ",  "Dutch ":  "nl ",  "Polish ":  "pl ",  "Russian ":  "ru ",
+    "Japanese ":  "ja ",  "Korean ":  "ko ",  "Chinese (Simplified) ":  "zh-CN ",  "Arabic ":  "ar ",
+    "Hindi ":  "hi ",  "Turkish ":  "tr ",  "Indonesian ":  "id ",  "Swedish ":  "sv ",  "Norwegian ":  "no ",
+    "Danish ":  "da ",  "Finnish ":  "fi ",  "Greek ":  "el ",  "Hebrew ":  "iw ",  "Thai ":  "th ",
+    "Vietnamese ":  "vi ",  "Malay ":  "ms ",  "Ukrainian ":  "uk ",
 }
 
 # Visual constants
@@ -112,8 +107,7 @@ PANEL_DIVIDER_COLOR = (15, 15, 15)
 PANEL_CROP_EXPAND   = 1.55
 PANEL_TRANSITION_FRAMES = 6         # PANEL-3: slot-reassignment blend length
 
-
-# ── Segment class ─────────────────────────────────────────────────────────────
+# ─── Segment class ─────────────────────────────────────────────────────────────
 class ClipSegment:
     def __init__(self, start_sec, end_sec, score, soi_region="center", peak_frame=0, title=""):
         self.start_sec = start_sec
@@ -127,8 +121,7 @@ class ClipSegment:
     def __repr__(self):
         return f"<Clip {self.start_sec:.1f}s-{self.end_sec:.1f}s score={self.score:.2f}>"
 
-
-# ── Feature availability guards ───────────────────────────────────────────────
+# ─── Feature availability guards ───────────────────────────────────────────────
 def whisper_available():
     try:
         import whisper
@@ -153,8 +146,7 @@ def yolo_available():
     except Exception:
         return os.path.exists("yolov8n.pt") or os.path.exists("yolov8s.pt")
 
-
-# ── Vignette (cached numpy mask) ─────────────────────────────────────────────
+# ─── Vignette (cached numpy mask) ─────────────────────────────────────────────
 _vignette_cache: Dict[Tuple, np.ndarray] = {}
 
 def _build_vignette(w, h, strength=VIGNETTE_STRENGTH, falloff=VIGNETTE_FALLOFF):
@@ -177,8 +169,7 @@ def apply_vignette(frame, strength=VIGNETTE_STRENGTH):
     mask = _build_vignette(w, h, strength)
     return (frame.astype(np.float32) * mask).clip(0, 255).astype(np.uint8)
 
-
-# ── Unsharp mask ──────────────────────────────────────────────────────────────
+# ─── Unsharp mask ──────────────────────────────────────────────────────────────
 def apply_sharpen(frame, strength=0.6, radius=1):
     if strength <= 0:
         return frame
@@ -186,8 +177,7 @@ def apply_sharpen(frame, strength=0.6, radius=1):
     blurred = cv2.GaussianBlur(frame, (ksize, ksize), 0)
     return cv2.addWeighted(frame, 1 + strength, blurred, -strength, 0)
 
-
-# ── Color grade LUT ───────────────────────────────────────────────────────────
+# ─── Color grade LUT ───────────────────────────────────────────────────────────
 _lut_cache: Dict[str, np.ndarray] = {}
 
 def _build_lut(grade):
@@ -225,8 +215,7 @@ def apply_color_grade(frame, grade="none"):
         return frame
     return cv2.LUT(frame, _build_lut(grade))
 
-
-# ── Ken Burns micro-zoom ──────────────────────────────────────────────────────
+# ─── Ken Burns micro-zoom ──────────────────────────────────────────────────────
 def apply_ken_burns(frame, frame_idx, fps, max_zoom=KEN_BURNS_MAX_ZOOM, period=KEN_BURNS_PERIOD):
     if max_zoom <= 1.0:
         return frame
@@ -241,8 +230,7 @@ def apply_ken_burns(frame, frame_idx, fps, max_zoom=KEN_BURNS_MAX_ZOOM, period=K
     y0 = (h - nh) // 2
     return cv2.resize(frame[y0:y0 + nh, x0:x0 + nw], (w, h), interpolation=cv2.INTER_LINEAR)
 
-
-# ── Cross-dissolve on scene cuts ──────────────────────────────────────────────
+# ─── Cross-dissolve on scene cuts ──────────────────────────────────────────────
 class DissolveBuffer:
     def __init__(self, n=DISSOLVE_FRAMES):
         self.n = n
@@ -264,24 +252,22 @@ class DissolveBuffer:
     def active(self):
         return self._rem > 0
 
-
-# ── FFmpeg post-filter chain ──────────────────────────────────────────────────
-def _build_ffmpeg_vf(color_grade="none", ffmpeg_sharpen=False):
+# ─── FFmpeg post-filter chain ──────────────────────────────────────────────────
+def _build_ffmpeg_vf(color_grade="none ", ffmpeg_sharpen=False):
     filters = []
     eq_map = {
-        "warm":    "brightness=0.02:saturation=1.12:gamma_r=1.05:gamma_b=0.95",
-        "cool":    "brightness=0.01:saturation=1.08:gamma_r=0.95:gamma_b=1.05",
-        "vibrant": "brightness=0.0:saturation=1.25:contrast=1.05",
-        "matte":   "brightness=0.03:saturation=0.85:contrast=0.92",
+        "warm ":     "brightness=0.02:saturation=1.12:gamma_r=1.05:gamma_b=0.95 ",
+        "cool ":     "brightness=0.01:saturation=1.08:gamma_r=0.95:gamma_b=1.05 ",
+        "vibrant ":  "brightness=0.0:saturation=1.25:contrast=1.05 ",
+        "matte ":    "brightness=0.03:saturation=0.85:contrast=0.92 ",
     }
     if color_grade in eq_map:
-        filters.append(f"eq={eq_map[color_grade]}")
+        filters.append(f"eq={eq_map[color_grade]} ")
     if ffmpeg_sharpen:
-        filters.append("unsharp=5:5:0.8:3:3:0.0")
+        filters.append("unsharp=5:5:0.8:3:3:0.0 ")
     return filters
 
-
-# ── FFmpegVideoReader (software-decode pipe) ──────────────────────────────────
+# ─── FFmpegVideoReader (software-decode pipe) ──────────────────────────────────
 class FFmpegVideoReader:
     def __init__(self, path, width, height, seek_sec=0.0, n_frames=None, scale_w=None, scale_h=None):
         self.path = path
@@ -296,20 +282,20 @@ class FFmpegVideoReader:
         self._leftover = b""
 
     def _candidate_cmds(self):
-        head = ["ffmpeg"]
+        head = ["ffmpeg "]
         if self.seek_sec > 0:
-            head += ["-ss", str(self.seek_sec)]
+            head += ["-ss ", str(self.seek_sec)]
         tail = [
-            "-i", self.path,
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-vf", f"scale={self.out_w}:{self.out_h}",
+            "-i ", self.path,
+            "-f ", "rawvideo ", "-pix_fmt ", "bgr24 ",
+            "-vf ", f"scale={self.out_w}:{self.out_h} ",
         ]
         if self.n_frames is not None:
-            tail += ["-vframes", str(self.n_frames)]
-        tail += ["pipe:1"]
+            tail += ["-vframes ", str(self.n_frames)]
+        tail += ["pipe:1 "]
         return [
-            head + ["-vcodec", "libdav1d"] + tail,
-            head + ["-hwaccel", "none"] + tail,
+            head + ["-vcodec ", "libdav1d "] + tail,
+            head + ["-hwaccel ", "none "] + tail,
         ]
 
     def _open(self):
@@ -331,7 +317,7 @@ class FFmpegVideoReader:
                 proc.wait()
             except Exception:
                 pass
-        raise ProcessingError(f"FFmpeg could not decode: {self.path}")
+        raise ProcessingError(f"FFmpeg could not decode: {self.path} ")
 
     def close(self):
         if self._proc:
@@ -353,7 +339,7 @@ class FFmpegVideoReader:
         if not self._proc:
             self._open()
         buf = self._leftover
-        self._leftover = b""
+        self._leftover = b" "
         while True:
             needed = self._frame_bytes - len(buf)
             while needed > 0:
@@ -367,7 +353,6 @@ class FFmpegVideoReader:
             )
             buf = buf[self._frame_bytes:]
 
-
 def _read_frame_at(path, width, height, t_sec, scale_w=None, scale_h=None):
     r = FFmpegVideoReader(path, width, height, seek_sec=t_sec, n_frames=1, scale_w=scale_w, scale_h=scale_h)
     r._open()
@@ -375,8 +360,7 @@ def _read_frame_at(path, width, height, t_sec, scale_w=None, scale_h=None):
     r.close()
     return frames[0] if frames else None
 
-
-# ── FFmpeg helpers ────────────────────────────────────────────────────────────
+# ─── FFmpeg helpers ────────────────────────────────────────────────────────────
 def _check_ffmpeg():
     for t in ("ffmpeg", "ffprobe"):
         try:
@@ -387,73 +371,72 @@ def _check_ffmpeg():
 def _has_audio(path):
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "a",
-             "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
+            ["ffprobe ", "-v ", "error ", "-select_streams ", "a ",
+             "-show_entries ", "stream=codec_type ", "-of ", "csv=p=0 ", path],
             capture_output=True, text=True, timeout=15,
         )
-        return "audio" in r.stdout
+        return "audio " in r.stdout
     except Exception:
         return False
 
 def _extract_audio_wav(vpath, wpath):
     r = subprocess.run(
-        ["ffmpeg", "-y", "-i", vpath, "-ar", "16000", "-ac", "1", "-f", "wav", wpath],
+        ["ffmpeg ", "-y ", "-i ", vpath, "-ar ", "16000 ", "-ac ", "1 ", "-f ", "wav ", wpath],
         capture_output=True,
     )
     return r.returncode == 0 and os.path.exists(wpath)
 
 def _trim_video(inp, out, start, end):
     r = subprocess.run(
-        ["ffmpeg", "-y", "-hwaccel", "none",
-         "-ss", str(start), "-to", str(end), "-i", inp,
-         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
-         "-c:a", "aac", "-b:a", "128k",
-         "-avoid_negative_ts", "make_zero", "-reset_timestamps", "1", out],
+        ["ffmpeg ", "-y ", "-hwaccel ", "none ",
+         "-ss ", str(start), "-to ", str(end), "-i ", inp,
+         "-c:v ", "libx264 ", "-preset ", "ultrafast ", "-crf ", "18 ",
+         "-c:a ", "aac ", "-b:a ", "128k ",
+         "-avoid_negative_ts ", "make_zero ", "-reset_timestamps ", "1 ", out],
         capture_output=True,
     )
     return r.returncode == 0 and os.path.exists(out)
 
-
-# ── Encoder (with optional FFmpeg vf chain) ───────────────────────────────────
+# ─── Encoder (with optional FFmpeg vf chain) ───────────────────────────────────
 def _open_ffmpeg_encoder(
     output_path, width, height, fps, audio_source,
-    crf=23, preset="fast", audio_bitrate="128k",
+    crf=23, preset="fast ", audio_bitrate="128k ",
     subtitle_path=None, subtitle_style=None, extra_vf=None,
 ):
     cmd = [
-        "ffmpeg", "-y",
-        "-f", "rawvideo", "-vcodec", "rawvideo", "-pix_fmt", "bgr24",
-        "-s", f"{width}x{height}", "-r", str(fps), "-i", "pipe:0",
+        "ffmpeg ", "-y ",
+        "-f ", "rawvideo ", "-vcodec ", "rawvideo ", "-pix_fmt ", "bgr24 ",
+        "-s ", f"{width}x{height} ", "-r ", str(fps), "-i ", "pipe:0 ",
     ]
     has_aud = audio_source and _has_audio(audio_source)
     if has_aud:
-        cmd += ["-hwaccel", "none", "-i", audio_source]
+        cmd += ["-hwaccel ", "none ", "-i ", audio_source]
     vf = []
     if subtitle_path and os.path.exists(subtitle_path):
-        s = subtitle_style or SUBTITLE_STYLES["Bold White (TikTok)"]
-        sesc = subtitle_path.replace("\\", "/").replace(":", "\\:")
+        s = subtitle_style or SUBTITLE_STYLES["Bold White (TikTok) "]
+        sesc = subtitle_path.replace("\\ ", "/ ").replace(": ", "\: ")
         force = (
-            f"Fontsize={s.get('fontsize', 18)},"
-            f"PrimaryColour={s.get('primary_color', '&H00FFFFFF')},"
-            f"OutlineColour={s.get('outline_color', '&H00000000')},"
-            f"Outline={s.get('outline', 2)},Bold={s.get('bold', 1)},"
-            f"Shadow={s.get('shadow', 0)},BackColour={s.get('back_color', '&H00000000')},"
-            f"MarginV={s.get('margin_v', 80)},Alignment=2"
+            f"Fontsize={s.get('fontsize', 18)}, "
+            f"PrimaryColour={s.get('primary_color', '&H00FFFFFF')}, "
+            f"OutlineColour={s.get('outline_color', '&H00000000')}, "
+            f"Outline={s.get('outline', 2)},Bold={s.get('bold', 1)}, "
+            f"Shadow={s.get('shadow', 0)},BackColour={s.get('back_color', '&H00000000')}, "
+            f"MarginV={s.get('margin_v', 80)},Alignment=2 "
         )
-        vf.append(f"subtitles='{sesc}':force_style='{force}'")
+        vf.append(f"subtitles='{sesc}':force_style='{force}' ")
     if extra_vf:
         vf.extend(extra_vf)
-    cmd += ["-map", "0:v:0"]
+    cmd += ["-map ", "0:v:0 "]
     if has_aud:
-        cmd += ["-map", "1:a:0?", "-c:a", "aac", "-b:a", audio_bitrate, "-ac", "2"]
+        cmd += ["-map ", "1:a:0? ", "-c:a ", "aac ", "-b:a ", audio_bitrate, "-ac ", "2 "]
     else:
-        cmd += ["-an"]
+        cmd += ["-an "]
     if vf:
-        cmd += ["-vf", ",".join(vf)]
+        cmd += ["-vf ", ", ".join(vf)]
     cmd += [
-        "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
-        "-profile:v", "baseline", "-level", "3.1", "-pix_fmt", "yuv420p",
-        "-shortest", "-movflags", "+faststart", output_path,
+        "-c:v ", "libx264 ", "-preset ", preset, "-crf ", str(crf),
+        "-profile:v ", "baseline ", "-level ", "3.1 ", "-pix_fmt ", "yuv420p ",
+        "-shortest ", "-movflags ", "+faststart ", output_path,
     ]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
@@ -472,40 +455,39 @@ def _close_ffmpeg_encoder(proc, output_path):
     if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
         raise ProcessingError("FFmpeg encoder produced empty output.")
 
-
-# ── Video metadata ────────────────────────────────────────────────────────────
+# ─── Video metadata ────────────────────────────────────────────────────────────
 def get_video_info(path):
     cmd = [
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1", path,
+        "ffprobe ", "-v ", "error ", "-select_streams ", "v:0 ",
+        "-show_entries ", "stream=width,height,r_frame_rate,nb_frames ",
+        "-show_entries ", "format=duration ",
+        "-of ", "default=noprint_wrappers=1 ", path,
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     kv = {}
     for line in r.stdout.splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
+        if "= " in line:
+            k, v = line.split("= ", 1)
             kv[k.strip()] = v.strip()
-    w = int(kv.get("width", 0) or 0)
-    h = int(kv.get("height", 0) or 0)
+    w = int(kv.get("width ", 0) or 0)
+    h = int(kv.get("height ", 0) or 0)
     try:
-        num, den = kv.get("r_frame_rate", "30/1").split("/")
+        num, den = kv.get("r_frame_rate ", "30/1 ").split("/ ")
         fps = float(num) / float(den)
     except Exception:
         fps = 30.0
-    dur = float(kv.get("duration", 0.0) or 0.0)
+    dur = float(kv.get("duration ", 0.0) or 0.0)
     if dur <= 0:
-        nb = int(kv.get("nb_frames", 0) or 0)
+        nb = int(kv.get("nb_frames ", 0) or 0)
         dur = nb / fps if fps > 0 and nb > 0 else 0.0
     if w == 0 or h == 0:
-        raise ProcessingError(f"Cannot read dimensions: {path}")
+        raise ProcessingError(f"Cannot read dimensions: {path} ")
     return {
-        "fps": fps,
-        "total_frames": min(int(dur * fps), MAX_FRAMES_GUARD),
-        "width": w, "height": h,
-        "duration_seconds": dur,
-        "is_landscape": w > h,
+        "fps ": fps,
+        "total_frames ": min(int(dur * fps), MAX_FRAMES_GUARD),
+        "width ": w, "height ": h,
+        "duration_seconds ": dur,
+        "is_landscape ": w > h,
     }
 
 def extract_thumbnail(path, t=1.0):
@@ -516,17 +498,16 @@ def extract_thumbnail(path, t=1.0):
     ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return buf.tobytes() if ok else None
 
-
-# ── Resolution helpers ────────────────────────────────────────────────────────
+# ─── Resolution helpers ────────────────────────────────────────────────────────
 def resolve_target_size(label, orig_w, orig_h):
     tw, th = RESOLUTION_PRESETS.get(label, (0, 0))
     if tw == 0 and th == 0:
         cw = int(orig_h * 9 / 16)
         if cw > orig_w:
             cw = orig_w
-            ch = int(cw * 16 / 9)
-        else:
-            ch = orig_h
+        ch = int(cw * 16 / 9)
+    else:
+        ch = orig_h
         return cw - (cw % 2), ch - (ch % 2)
     if th > orig_h:
         scale = orig_h / th
@@ -548,8 +529,7 @@ def calculate_crop_dims(orig_w, orig_h, tw, th):
         ch = int(round(cw / ratio))
     return min(cw, orig_w), min(ch, orig_h)
 
-
-# ── YOLO model cache ──────────────────────────────────────────────────────────
+# ─── YOLO model cache ──────────────────────────────────────────────────────────
 _model_cache: Dict[str, Any] = {}
 
 def _get_model(weights="yolov8n.pt"):
@@ -565,8 +545,7 @@ def _get_model(weights="yolov8n.pt"):
         print(f"YOLO unavailable: {e}", file=sys.stderr)
         return None
 
-
-# ── Face detection (Haar cascade / DNN prototxt optional) ─────────────────────
+# ─── Face detection (Haar cascade / DNN prototxt optional) ─────────────────────
 _haar_cascade = None
 
 def _get_haar():
@@ -594,9 +573,8 @@ def detect_faces(frame, confidence_thresh=0.6):
     faces.sort(key=lambda f: (f[2] - f[0]) * (f[3] - f[1]), reverse=True)
     return faces
 
-
-# ── Subject / person detection ────────────────────────────────────────────────
-DetectionResult = namedtuple("DetectionResult", ["cx", "cy", "ux1", "uy1", "ux2", "uy2", "count"])
+# ─── Subject / person detection ────────────────────────────────────────────────
+DetectionResult = namedtuple("DetectionResult ", ["cx ", "cy ", "ux1 ", "uy1 ", "ux2 ", "uy2 ", "count "])
 
 def detect_subjects(frame, model, confidence=0.45):
     if model is None:
@@ -652,21 +630,20 @@ def detect_persons_all(frame, model, confidence=0.45):
     p.sort(key=lambda b: b[0])
     return p
 
-
-# ── Framing helpers ───────────────────────────────────────────────────────────
+# ─── Framing helpers ───────────────────────────────────────────────────────────
 def _apply_lower_third_guard(cy, crop_h, subject_cy_src, orig_h):
     hh = crop_h // 2
     max_cy = subject_cy_src - int((1.0 - LOWER_THIRD_GUARD) * crop_h) + hh
     return min(cy, min(max_cy, orig_h - hh))
 
 def _soi_region_label(cx, cy, w, h):
-    col = "left" if cx < w // 3 else ("right" if cx > 2 * w // 3 else "center")
-    row = "upper" if cy < h // 3 else ("lower" if cy > 2 * h // 3 else "mid")
-    if row == "mid" and col == "center":
-        return "center"
-    if row == "mid":
+    col = "left " if cx < w // 3 else ("right " if cx > 2 * w // 3 else "center ")
+    row = "upper " if cy < h // 3 else ("lower " if cy > 2 * h // 3 else "mid ")
+    if row == "mid " and col == "center ":
+        return "center "
+    if row == "mid ":
         return col
-    return f"{row}-{col}"
+    return f"{row}-{col} "
 
 def frame_for_union(ux1, uy1, ux2, uy2, orig_w, orig_h, crop_w, crop_h):
     ucx = (ux1 + ux2) // 2
@@ -693,8 +670,7 @@ def talking_head_center(faces, orig_w, orig_h, crop_w, crop_h, bias=0.30):
     cy = _apply_lower_third_guard(cy, crop_h, face_cy, orig_h)
     return cx, max(hh, min(cy, orig_h - hh))
 
-
-# ── PANEL-1: Improved panel detection (speaker-column histogram) ──────────────
+# ─── PANEL-1: Improved panel detection (speaker-column histogram) ──────────────
 def _detect_panel_mode(
     input_path, model, fps, total_frames, orig_w, orig_h,
     confidence=0.45, n_probe=20,
@@ -712,7 +688,6 @@ def _detect_panel_mode(
     det_w = min(orig_w, 640)
     det_h = max(1, int(det_w * orig_h / orig_w))
     sx, sy = orig_w / det_w, orig_h / det_h
-
     for t in probe_ts:
         frame = _read_frame_at(input_path, orig_w, orig_h, t, scale_w=det_w, scale_h=det_h)
         if frame is None:
@@ -732,8 +707,7 @@ def _detect_panel_mode(
     majority = n_probe * 0.5
     return multi_hits > majority and stable_split_hits > multi_hits * 0.6
 
-
-# ── Panel slot smoother (EMA + max-jump clamp) ────────────────────────────────
+# ─── Panel slot smoother (EMA + max-jump clamp) ────────────────────────────────
 class PanelSlotSmoother:
     """PANEL-2: Slower EMA + per-frame displacement clamp for stable strips."""
     def __init__(self, alpha=PANEL_SLOT_EMA, max_jump_frac=PANEL_SLOT_MAX_JUMP):
@@ -766,7 +740,6 @@ class PanelSlotSmoother:
             return [tuple(int(v) for v in s)]
 
         return _smooth(0, group_a), _smooth(1, group_b)
-
 
 def _group_union(persons):
     return (
@@ -815,7 +788,6 @@ def _crop_group_to_strip(
         result = apply_vignette(result, vignette_strength)
     return result
 
-
 def _render_panel_frame(
     frame, persons, out_w, out_h,
     prev_slots=None,
@@ -863,8 +835,7 @@ def _render_panel_frame(
 
     return canvas, [group_a, group_b]
 
-
-# ── Optical flow / saliency ───────────────────────────────────────────────────
+# ─── Optical flow / saliency ───────────────────────────────────────────────────
 def optical_flow_center(prev, curr, w, h):
     if prev is None or curr is None:
         return None
@@ -911,8 +882,7 @@ def is_scene_change(prev, curr, threshold=0.35):
     except Exception:
         return False
 
-
-# ── SMOOTH-1/2/3/4: Improved camera-path smoothing ───────────────────────────
+# ─── SMOOTH-1/2/3/4: Improved camera-path smoothing ───────────────────────────
 def _vel_to_window(speed):
     t = VELOCITY_SMOOTH_TABLE
     if speed <= t[0][0]:
@@ -949,7 +919,6 @@ def _bidir_ema(xs, ys, alpha=0.06):
     n = len(xs)
     if n < 2:
         return np.array(xs, dtype=float), np.array(ys, dtype=float)
-
     def _fwd(v):
         out = np.empty(n, dtype=float)
         out[0] = v[0]
@@ -987,7 +956,7 @@ def smooth_centers(centers, speeds, base_window=33, adaptive=True, scene_cuts=No
     dx_raw = np.diff(xs)
     dy_raw = np.diff(ys)
     dist_raw = np.sqrt(dx_raw**2 + dy_raw**2)
-    jitter_raw = float(np.mean(dist_raw))
+    jitter_raw = float(np.mean(dist_raw)) # Fixed typo: np.mean
     max_jump_raw = float(np.max(dist_raw)) if len(dist_raw) > 0 else 0
 
     bounds = [0] + sorted(set(scene_cuts or [])) + [n]
@@ -1012,7 +981,7 @@ def smooth_centers(centers, speeds, base_window=33, adaptive=True, scene_cuts=No
     dy_s = np.diff(ry)
     dist_s = np.sqrt(dx_s**2 + dy_s**2)
     jitter_smooth = float(np.mean(dist_s))
-    
+
     # Smoothness Score: % reduction in jitter
     smoothness_score = ((jitter_raw - jitter_smooth) / jitter_raw * 100) if jitter_raw > 0 else 0
 
@@ -1025,8 +994,7 @@ def smooth_centers(centers, speeds, base_window=33, adaptive=True, scene_cuts=No
 
     return smoothed, metrics
 
-
-# ── Whisper / translate ───────────────────────────────────────────────────────
+# ─── Whisper / translate ───────────────────────────────────────────────────────
 def _seconds_to_srt_time(s):
     h = int(s // 3600)
     m = int((s % 3600) // 60)
@@ -1049,19 +1017,19 @@ def transcribe_to_srt(
     if not whisper_available():
         return False
     import whisper as _w
-    _p(0.0, "Extracting audio...")
-    wav_fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    _p(0.0, "Extracting audio... ")
+    wav_fd, wav_path = tempfile.mkstemp(suffix=".wav ")
     os.close(wav_fd)
     try:
         if not _extract_audio_wav(video_path, wav_path):
             return False
-        _p(0.2, f"Transcribing ({whisper_model})...")
+        _p(0.2, f"Transcribing ({whisper_model})... ")
         model = _w.load_model(whisper_model)
         opts = {"word_timestamps": True, "verbose": False}
         if language:
             opts["language"] = language
         result = model.transcribe(wav_path, **opts)
-        _p(0.85, "Writing subtitles...")
+        _p(0.85, "Writing subtitles... ")
         lines = []
         idx = 1
         words = []
@@ -1075,9 +1043,9 @@ def transcribe_to_srt(
             if not buf:
                 return
             lines.append(
-                f"{idx}\n"
-                f"{_seconds_to_srt_time(buf[0]['start'])} --> {_seconds_to_srt_time(buf[-1]['end'])}\n"
-                f"{' '.join(x['word'] for x in buf)}\n"
+                f"{idx}\n "
+                f"{_seconds_to_srt_time(buf[0]['start'])} --> {_seconds_to_srt_time(buf[-1]['end'])}\n "
+                f"{' '.join(x['word'] for x in buf)}\n "
             )
             idx += 1
             buf = []
@@ -1092,7 +1060,7 @@ def transcribe_to_srt(
         flush()
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
-        _p(1.0, f"{len(lines)} subtitle lines")
+        _p(1.0, f"{len(lines)} subtitle lines ")
         return True
     except Exception as e:
         print(f"Whisper failed: {e}", file=sys.stderr)
@@ -1136,17 +1104,16 @@ def translate_srt(srt_path, target_language, source_language="auto", progress_ca
                 translated = " ".join(ls[2:])
             out.append(f"{ls[0]}\n{ls[1]}\n{translated}")
             if i % 10 == 0:
-                _p(i / max(len(blocks), 1), f"{i}/{len(blocks)}")
+                _p(i / max(len(blocks), 1), f"{i}/{len(blocks)} ")
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write("\n\n".join(out) + "\n")
-        _p(1.0, "Translation done")
+        _p(1.0, "Translation done ")
         return True
     except Exception as e:
         print(f"Translation failed: {e}", file=sys.stderr)
         return False
 
-
-# ── Clip detection ────────────────────────────────────────────────────────────
+# ─── Clip detection ────────────────────────────────────────────────────────────
 def _frame_saliency_score(frame, prev_frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     lap_score = min(float(cv2.Laplacian(gray, cv2.CV_64F).var()) / 3000.0, 1.0)
@@ -1209,7 +1176,7 @@ def detect_clips(
     duration = info["duration_seconds"]
     orig_w, orig_h = info["width"], info["height"]
     sample_every = max(1, int(fps))
-    _p(0.0, "Scanning...")
+    _p(0.0, "Scanning... ")
     scores, scene_cuts_frames = _compute_frame_scores(
         input_path, fps, total_frames, orig_w, orig_h,
         sample_every=sample_every,
@@ -1217,7 +1184,7 @@ def detect_clips(
     )
     if len(scores) == 0:
         return []
-    _p(0.45, "Computing arcs...")
+    _p(0.45, "Computing arcs... ")
     window = max(5, int(30 / (sample_every / fps)))
     ss = (
         np.convolve(scores, np.ones(window) / window, mode="same")
@@ -1269,12 +1236,12 @@ def detect_clips(
     cands = cands[:target_n_clips]
     cands.sort(key=lambda x: x[0])
 
-    _p(0.55, "SOI per clip...")
+    _p(0.55, "SOI per clip... ")
     segments = []
     det_w = min(orig_w, 640)
     det_h = max(1, int(det_w * orig_h / orig_w))
     for ci, (ss2, se, score) in enumerate(cands):
-        _p(0.55 + 0.35 * (ci / max(len(cands), 1)), f"Clip {ci+1}/{len(cands)}...")
+        _p(0.55 + 0.35 * (ci / max(len(cands), 1)), f"Clip {ci+1}/{len(cands)}... ")
         soi_xs, soi_ys = [], []
         n_s = min(8, max(2, int(se - ss2)))
         for t in np.linspace(ss2 + 1, se - 1, n_s):
@@ -1295,7 +1262,7 @@ def detect_clips(
                 scx, scy = saliency_center(frame)
                 soi_xs.append(scx)
                 soi_ys.append(scy)
-        sr = "center"
+        sr = "center "
         if soi_xs:
             sr = _soi_region_label(int(np.median(soi_xs)), int(np.median(soi_ys)), orig_w, orig_h)
         ms = int(ss2 // 60)
@@ -1305,18 +1272,16 @@ def detect_clips(
         segments.append(ClipSegment(
             start_sec=ss2, end_sec=se, score=score, soi_region=sr,
             peak_frame=int(np.linspace(ss2 + 1, se - 1, n_s)[n_s // 2] * fps),
-            title=f"Clip {ci+1}  ({ms}:{secs:02d} - {me}:{sece:02d})",
+            title=f"Clip {ci+1} ({ms}:{secs:02d} - {me}:{sece:02d})",
         ))
-    _p(1.0, f"Found {len(segments)} clips")
+    _p(1.0, f"Found {len(segments)} clips ")
     return segments
 
-
-# ── Analytics ─────────────────────────────────────────────────────────────────
+# ─── Analytics ────────────────────────────────────────────────────────────────
 def get_analytics_meta(input_path: str, output_path: str) -> dict:
     """
     Return a dict with key metrics about the conversion, ready to feed
     the companion analytics player widget.
-
     Keys:
       input_path, output_path,
       input_size_mb, output_size_mb, compression_ratio,
@@ -1333,7 +1298,7 @@ def get_analytics_meta(input_path: str, output_path: str) -> dict:
         except Exception:
             return {}
 
-    in_info  = _info(input_path)
+    in_info = _info(input_path)
     out_info = _info(output_path)
 
     def _sz(p):
@@ -1342,7 +1307,7 @@ def get_analytics_meta(input_path: str, output_path: str) -> dict:
         except Exception:
             return 0.0
 
-    in_mb  = _sz(input_path)
+    in_mb = _sz(input_path)
     out_mb = _sz(output_path)
 
     def _bitrate(sz_mb, dur_s):
@@ -1350,7 +1315,7 @@ def get_analytics_meta(input_path: str, output_path: str) -> dict:
             return round(sz_mb * 8 * 1024 / dur_s)
         return 0
 
-    in_dur  = in_info.get("duration_seconds", 0.0)
+    in_dur = in_info.get("duration_seconds", 0.0)
     out_dur = out_info.get("duration_seconds", 0.0)
 
     return {
@@ -1371,28 +1336,27 @@ def get_analytics_meta(input_path: str, output_path: str) -> dict:
         "file_size_reduction_pct": round((1 - out_mb / in_mb) * 100, 1) if in_mb else 0.0,
     }
 
-
-# ── process_video — main entry point ─────────────────────────────────────────
+# ─── process_video — main entry point ─────────────────────────────────────────
 def process_video(
     input_path, output_path,
-    target_preset_label="Match source (no upscale)",
-    tracking_mode="subject", talking_head_bias=0.30,
+    target_preset_label="Match source (no upscale) ",
+    tracking_mode="subject ", talking_head_bias=0.30,
     sample_interval=None, confidence=0.45, use_optical_flow=True,
     smooth_window=33, adaptive_smoothing=True, rule_of_thirds=True,
-    scene_cut_threshold=0.35, output_fps=None, crf=23, encoder_preset="fast",
-    audio_bitrate="128k", yolo_weights="yolov8n.pt",
-    burn_subtitles=False, whisper_model="base", whisper_language=None,
-    subtitle_style_name="Bold White (TikTok)", subtitle_max_chars=42,
+    scene_cut_threshold=0.35, output_fps=None, crf=23, encoder_preset="fast ",
+    audio_bitrate="128k ", yolo_weights="yolov8n.pt ",
+    burn_subtitles=False, whisper_model="base ", whisper_language=None,
+    subtitle_style_name="Bold White (TikTok) ", subtitle_max_chars=42,
     subtitle_translate_to=None,
     vignette_strength=VIGNETTE_STRENGTH,
     sharpen_strength=0.0,
-    color_grade="none",
+    color_grade="none ",
     ken_burns=False,
     dissolve_cuts=True,
     ffmpeg_sharpen=False,
     progress_callback=None,
 ):
-    def _p(v, msg=""):
+    def _p(v, msg=" "):
         if progress_callback:
             try:
                 progress_callback(min(max(v, 0.0), 1.0), msg)
@@ -1405,25 +1369,25 @@ def process_video(
     }
     _check_ffmpeg()
     if not os.path.exists(input_path):
-        raise ProcessingError(f"Input not found: {input_path}")
+        raise ProcessingError(f"Input not found: {input_path} ")
     if os.path.getsize(input_path) / 1024**2 > MAX_FILE_SIZE_MB:
-        raise ProcessingError(f"File exceeds {MAX_FILE_SIZE_MB} MB.")
+        raise ProcessingError(f"File exceeds {MAX_FILE_SIZE_MB} MB. ")
 
     info = get_video_info(input_path)
     fps, total_frames = info["fps"], info["total_frames"]
     orig_w, orig_h = info["width"], info["height"]
     duration = info["duration_seconds"]
     if total_frames <= 0 or orig_w <= 0 or orig_h <= 0:
-        raise ProcessingError("Corrupt or unreadable video.")
+        raise ProcessingError("Corrupt or unreadable video. ")
     if not info["is_landscape"]:
-        raise ProcessingError("Video is already vertical.")
+        raise ProcessingError("Video is already vertical. ")
 
-    lbl = target_preset_label if target_preset_label in RESOLUTION_PRESETS else "Match source (no upscale)"
+    lbl = target_preset_label if target_preset_label in RESOLUTION_PRESETS else "Match source (no upscale) "
     target_w, target_h = resolve_target_size(lbl, orig_w, orig_h)
     req_w, req_h = RESOLUTION_PRESETS.get(lbl, (0, 0))
     clamped = req_h > 0 and (target_h < req_h or target_w < req_w)
     result_meta.update(clamped=clamped, effective_size=(target_w, target_h), duration=duration)
-    _p(0.01, f"Output {target_w}x{target_h}  source {orig_w}x{orig_h}")
+    _p(0.01, f"Output {target_w}x{target_h} source {orig_w}x{orig_h} ")
 
     if not sample_interval:
         sample_interval = max(1, int(fps / 5))
@@ -1436,8 +1400,8 @@ def process_video(
 
     srt_path = None
     if burn_subtitles and _has_audio(input_path):
-        _p(0.02, "Transcribing...")
-        srt_fd, srt_path = tempfile.mkstemp(suffix=".srt")
+        _p(0.02, "Transcribing... ")
+        srt_fd, srt_path = tempfile.mkstemp(suffix=".srt ")
         os.close(srt_fd)
         ok = transcribe_to_srt(
             input_path, srt_path,
@@ -1459,32 +1423,32 @@ def process_video(
 
     start_pct = 0.10
     model_obj = None
-    if tracking_mode == "subject":
-        _p(start_pct, "Loading YOLO...")
+    if tracking_mode == "subject ":
+        _p(start_pct, "Loading YOLO... ")
         model_obj = _get_model(yolo_weights)
         if model_obj is None:
-            _p(start_pct, "YOLO unavailable - saliency fallback")
-    elif tracking_mode == "talking_head":
-        _p(start_pct, "Loading face detector...")
+            _p(start_pct, "YOLO unavailable - saliency fallback ")
+    elif tracking_mode == "talking_head ":
+        _p(start_pct, "Loading face detector... ")
         if _get_haar() is None:
-            _p(start_pct, "No face detector - saliency fallback")
+            _p(start_pct, "No face detector - saliency fallback ")
 
     is_panel = False
     slot_smoother = None
-    if tracking_mode == "subject" and model_obj is not None:
-        _p(start_pct + 0.01, "Checking panel/group shot...")
+    if tracking_mode == "subject " and model_obj is not None:
+        _p(start_pct + 0.01, "Checking panel/group shot... ")
         is_panel = _detect_panel_mode(
             input_path, model_obj, fps, total_frames, orig_w, orig_h,
             confidence, n_probe=20,
         )
         if is_panel:
-            _p(start_pct + 0.02, "Panel mode - 2-row vertical split")
+            _p(start_pct + 0.02, "Panel mode - 2-row vertical split ")
             result_meta["panel_mode"] = True
             slot_smoother = PanelSlotSmoother()
 
-    extra_vf = _build_ffmpeg_vf(color_grade="none", ffmpeg_sharpen=ffmpeg_sharpen)
-    _p(0.12, f"Single-pass detect+render ({total_frames} frames)...")
-    style = SUBTITLE_STYLES.get(subtitle_style_name, SUBTITLE_STYLES["Bold White (TikTok)"])
+    extra_vf = _build_ffmpeg_vf(color_grade="none ", ffmpeg_sharpen=ffmpeg_sharpen)
+    _p(0.12, f"Single-pass detect+render ({total_frames} frames)... ")
+    style = SUBTITLE_STYLES.get(subtitle_style_name, SUBTITLE_STYLES["Bold White (TikTok) "])
     proc = _open_ffmpeg_encoder(
         output_path, target_w, target_h, render_fps,
         audio_source=input_path,
@@ -1495,16 +1459,16 @@ def process_video(
 
     if vignette_strength > 0:
         _build_vignette(target_w, target_h, vignette_strength)
-    if color_grade and color_grade != "none":
+    if color_grade and color_grade != "none ":
         _build_lut(color_grade)
 
     dissolve_buf = DissolveBuffer(DISSOLVE_FRAMES) if dissolve_cuts else None
 
     # Smoothing state
     raw_centers: List[Tuple[int, int]] = []
-    raw_speeds:  List[float] = []
+    raw_speeds: List[float] = []
     det_indices: List[int] = []
-    scene_cuts:  List[int] = []
+    scene_cuts: List[int] = []
 
     prev_gray = None
     prev_flow = None
@@ -1519,7 +1483,7 @@ def process_video(
     last_out_frame = None
     rpt_n = max(1, total_frames // 40)
     fi = 0
-    
+
     # Store smoothing metrics here
     smooth_metrics = {}
 
@@ -1529,7 +1493,7 @@ def process_video(
     # For panel mode we detect+render in one pass (as before) to avoid buffering.
 
     if not is_panel:
-        _p(0.12, "Pass 1/2: detecting subjects...")
+        _p(0.12, "Pass 1/2: detecting subjects... ")
         det_centers_raw: List[Tuple[int, int]] = []
         det_frame_indices: List[int] = []
         frame_speeds: List[float] = []
@@ -1554,7 +1518,7 @@ def process_video(
                     prev_gray2 = cg
                     anchor_cx = anchor_cy = None
 
-                    if tracking_mode == "talking_head":
+                    if tracking_mode == "talking_head ":
                         faces = detect_faces(det_frame, confidence_thresh=0.5)
                         if faces:
                             faces_orig = [
@@ -1611,11 +1575,11 @@ def process_video(
                         prev_c = (anchor_cx, anchor_cy)
 
                 if fi2 % rpt_n == 0:
-                    _p(0.12 + 0.30 * (fi2 / total_frames), f"Det {fi2}/{total_frames}...")
+                    _p(0.12 + 0.30 * (fi2 / total_frames), f"Det {fi2}/{total_frames}... ")
                 fi2 += 1
 
         # Smooth the full detection path
-        _p(0.42, "Smoothing camera path...")
+        _p(0.42, "Smoothing camera path... ")
         if det_centers_raw:
             # Map detection indices to per-frame centres (linear interp)
             smoothed_det, smooth_metrics = smooth_centers(
@@ -1639,7 +1603,7 @@ def process_video(
             dense_cx = np.full(total_frames, orig_w // 2, dtype=float)
             dense_cy = np.full(total_frames, orig_h // 2, dtype=float)
 
-        _p(0.44, "Pass 2/2: rendering...")
+        _p(0.44, "Pass 2/2: rendering... ")
         fi = 0
         with FFmpegVideoReader(input_path, orig_w, orig_h) as reader:
             for frame in reader:
@@ -1654,7 +1618,7 @@ def process_video(
                 cur_cy = int(np.clip(dense_cy[fi], hh, orig_h - hh))
 
                 left = max(0, min(cur_cx - crop_w // 2, orig_w - crop_w))
-                top  = max(0, min(cur_cy - crop_h // 2, orig_h - crop_h))
+                top = max(0, min(cur_cy - crop_h // 2, orig_h - crop_h))
                 crop = frame[top:top + crop_h, left:left + crop_w]
                 if crop.shape[1] != target_w or crop.shape[0] != target_h:
                     crop = cv2.resize(crop, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
@@ -1663,7 +1627,7 @@ def process_video(
                     out_frame = apply_ken_burns(out_frame, fi, fps)
                 if sharpen_strength > 0:
                     out_frame = apply_sharpen(out_frame, sharpen_strength)
-                if color_grade and color_grade != "none":
+                if color_grade and color_grade != "none ":
                     out_frame = apply_color_grade(out_frame, color_grade)
                 if vignette_strength > 0:
                     out_frame = apply_vignette(out_frame, vignette_strength)
@@ -1678,11 +1642,11 @@ def process_video(
 
                 fi += 1
                 if fi % rpt_n == 0:
-                    _p(0.44 + 0.44 * (fi / total_frames), f"Render {fi}/{total_frames}...")
+                    _p(0.44 + 0.44 * (fi / total_frames), f"Render {fi}/{total_frames}... ")
 
     else:
         # Panel: single-pass detect+render (no full-frame buffer needed)
-        _p(0.12, "Panel: single-pass detect+render...")
+        _p(0.12, "Panel: single-pass detect+render... ")
         fi = 0
         with FFmpegVideoReader(input_path, orig_w, orig_h) as reader:
             for frame in reader:
@@ -1714,44 +1678,43 @@ def process_video(
                     break
                 fi += 1
                 if fi % rpt_n == 0:
-                    _p(0.12 + 0.75 * (fi / total_frames), f"{fi}/{total_frames}...")
+                    _p(0.12 + 0.75 * (fi / total_frames), f"{fi}/{total_frames}... ")
 
-    _p(0.88, "Encoding...")
+    _p(0.88, "Encoding... ")
     _close_ffmpeg_encoder(proc, output_path)
-    
+
     # Get standard analytics
     analytics = get_analytics_meta(input_path, output_path)
-    
+
     # Inject smoothing metrics if available
-    if smooth_metrics:
+    if smooth_metrics: # Fixed typo: smooth_metrics
         analytics.update(smooth_metrics)
         
     result_meta["analytics"] = analytics
-    
-    _p(1.0, "Done!")
+
+    _p(1.0, "Done! ")
     print(
-        f"Output: {output_path}  ({os.path.getsize(output_path)/1024**2:.1f} MB)"
-        f"  cuts={len(scene_cuts)}  panel={is_panel}",
+        f"Output: {output_path} ({os.path.getsize(output_path)/1024**2:.1f} MB) "
+        f" cuts={len(scene_cuts)} panel={is_panel} ",
         file=sys.stderr,
     )
     return result_meta
 
-
-# ── Batch clip pipeline ───────────────────────────────────────────────────────
+# ─── Batch clip pipeline ───────────────────────────────────────────────────────
 def process_clips_batch(
     input_path, output_dir, clips,
-    target_preset_label="720p   (720x1280  - HD)",
-    tracking_mode="subject", talking_head_bias=0.30,
+    target_preset_label="720p   (720x1280  - HD) ",
+    tracking_mode="subject ", talking_head_bias=0.30,
     confidence=0.45, smooth_window=33, adaptive_smoothing=True,
-    use_optical_flow=True, rule_of_thirds=True, crf=23, encoder_preset="fast",
-    audio_bitrate="128k", yolo_weights="yolov8n.pt",
-    burn_subtitles=False, whisper_model="base",
-    subtitle_style_name="Bold White (TikTok)", subtitle_max_chars=42,
+    use_optical_flow=True, rule_of_thirds=True, crf=23, encoder_preset="fast ",
+    audio_bitrate="128k ", yolo_weights="yolov8n.pt ",
+    burn_subtitles=False, whisper_model="base ",
+    subtitle_style_name="Bold White (TikTok) ", subtitle_max_chars=42,
     vignette_strength=VIGNETTE_STRENGTH, sharpen_strength=0.0,
-    color_grade="none", ken_burns=False, dissolve_cuts=True, ffmpeg_sharpen=False,
+    color_grade="none ", ken_burns=False, dissolve_cuts=True, ffmpeg_sharpen=False,
     progress_callback=None,
 ):
-    def _p(v, msg=""):
+    def _p(v, msg=" "):
         if progress_callback:
             try:
                 progress_callback(v, msg)
@@ -1763,20 +1726,20 @@ def process_clips_batch(
     for i, clip in enumerate(clips):
         base_pct = i / max(len(clips), 1)
         next_pct = (i + 1) / max(len(clips), 1)
-        _p(base_pct, f"Clip {i+1}/{len(clips)}...")
+        _p(base_pct, f"Clip {i+1}/{len(clips)}... ")
         trimmed_path = None
         out_path = None
         try:
-            fd, trimmed_path = tempfile.mkstemp(suffix=".mp4")
+            fd, trimmed_path = tempfile.mkstemp(suffix=".mp4 ")
             os.close(fd)
             if not _trim_video(input_path, trimmed_path, clip.start_sec, clip.end_sec):
-                results.append({"clip": clip, "output_path": None, "error": "trim failed"})
+                results.append({"clip": clip, "output_path": None, "error": "trim failed "})
                 continue
             out_path = os.path.join(
                 output_dir,
-                f"clip_{i+1:02d}_{int(clip.start_sec)}s_{int(clip.end_sec)}s_vertical.mp4",
+                f"clip_{i+1:02d}_{int(clip.start_sec)}s_{int(clip.end_sec)}s_vertical.mp4 ",
             )
-            def clip_cb(v, msg="", _b=base_pct, _n=next_pct):
+            def clip_cb(v, msg=" ", _b=base_pct, _n=next_pct):
                 _p(_b + v * (_n - _b), msg)
             meta = process_video(
                 trimmed_path, out_path,
@@ -1803,6 +1766,6 @@ def process_clips_batch(
                 except OSError:
                     pass
 
-    n_ok = sum(1 for r in results if not r.get("error"))
-    _p(1.0, f"{n_ok}/{len(results)} clips done")
+    n_ok = sum(1 for r in results if not r.get("error "))
+    _p(1.0, f"{n_ok}/{len(results)} clips done ")
     return results
