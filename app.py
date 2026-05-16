@@ -2,15 +2,17 @@
 app.py — Reframe · AI Vertical Video Studio
 Mobile-first · Light theme · Single Clip + Auto-Clip modes
 """
+
 import streamlit as st
 import tempfile
 import os
 import glob
+
 from verticalize import (
     process_video, get_video_info, detect_clips, process_clips_batch,
     RESOLUTION_PRESETS, SUBTITLE_STYLES, TRANSLATION_LANGUAGES,
     resolve_target_size, whisper_available, translation_available,
-    ClipSegment,
+    ClipSegment,  # Changed from ClipSection to ClipSegment
 )
 
 st.set_page_config(
@@ -576,6 +578,7 @@ if app_mode == "autoClip" and tab_analytics is not None:
         else:
             st.markdown('<div class="rf-empty" style="min-height:120px;padding:20px;"><div class="rf-empty-s">Process clips to view analytics</div></div>', unsafe_allow_html=True)
 
+
 st.markdown("</div>", unsafe_allow_html=True)  # close settings div
 
 # Settings fingerprint for change detection
@@ -691,18 +694,10 @@ with col_out:
                 red_pct = a['file_size_reduction_pct']
                 ratio = a['compression_ratio']
                 
-                # Extract new smoothing metrics (with fallbacks)
-                jitter_raw = a.get('jitter_raw', 0)
-                jitter_smooth = a.get('jitter_smooth', 0)
-                smooth_pct = a.get('smoothness_pct', 0)
-                max_jump = a.get('max_jump_raw', 0)
-
                 st.markdown(f"""
                 <div class="rf-analytics">
                   <div class="rf-an-title">📊 Conversion Analytics</div>
-                  
-                  {/* File Stats */}
-                  <div class="rf-an-grid" style="margin-bottom:12px;">
+                  <div class="rf-an-grid">
                     <div class="rf-an-item">
                       <div class="rf-an-label">Size Reduction</div>
                       <div class="rf-an-val {'good' if red_pct > 0 else 'bad'}">{red_pct:.1f}%</div>
@@ -717,28 +712,6 @@ with col_out:
                       <div class="rf-an-label">Resolution</div>
                       <div class="rf-an-val">{a['output_resolution']}</div>
                       <div class="rf-an-sub">{a['input_resolution']} source</div>
-                    </div>
-                  </div>
-
-                  {/* Smoothing Stats */}
-                  <div class="rf-an-title" style="margin-top:8px; border-top:1px solid var(--bdr); padding-top:12px;">
-                    🧭 Stabilization Metrics
-                  </div>
-                  <div class="rf-an-grid">
-                    <div class="rf-an-item">
-                      <div class="rf-an-label">Smoothness</div>
-                      <div class="rf-an-val good">{smooth_pct}%</div>
-                      <div class="rf-an-sub">Jitter reduction</div>
-                    </div>
-                    <div class="rf-an-item">
-                      <div class="rf-an-label">Avg Frame Jump</div>
-                      <div class="rf-an-val">{jitter_smooth}px</div>
-                      <div class="rf-an-sub">Was {jitter_raw}px raw</div>
-                    </div>
-                    <div class="rf-an-item">
-                      <div class="rf-an-label">Max Spike</div>
-                      <div class="rf-an-val {'bad' if max_jump > 50 else ''}">{max_jump}px</div>
-                      <div class="rf-an-sub">Largest single jump</div>
                     </div>
                   </div>
                 </div>
