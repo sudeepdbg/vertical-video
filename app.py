@@ -6,12 +6,13 @@ Mobile-first · Light theme · Single Clip + Auto-Clip modes
 import streamlit as st
 import tempfile
 import os
+import glob
 
 from verticalize import (
     process_video, get_video_info, detect_clips, process_clips_batch,
     RESOLUTION_PRESETS, SUBTITLE_STYLES, TRANSLATION_LANGUAGES,
     resolve_target_size, whisper_available, translation_available,
-    ClipSegment,
+    ClipSection,
 )
 
 st.set_page_config(
@@ -113,6 +114,19 @@ video { border-radius: var(--r) !important; width: 100% !important; }
 .rf-mv { font-family:'DM Serif Display',serif; font-size:16px; color:var(--ink); letter-spacing:-0.02em; }
 .rf-mv.a { color:var(--acc); }
 
+/* Analytics Card */
+.rf-analytics { background:var(--surf); border:1px solid var(--bdr); border-radius:var(--r);
+  padding:16px; margin-top:12px; }
+.rf-an-title { font-size:11px; font-weight:700; color:var(--ink3); text-transform:uppercase;
+  letter-spacing:0.1em; margin-bottom:12px; display:flex; align-items:center; gap:6px; }
+.rf-an-grid { display:grid; grid-template-columns:repeat(3, 1fr); gap:12px; }
+.rf-an-item { background:var(--surf2); padding:10px; border-radius:var(--rs); }
+.rf-an-label { font-size:10px; color:var(--ink2); margin-bottom:4px; }
+.rf-an-val { font-family:'DM Serif Display',serif; font-size:15px; color:var(--ink); }
+.rf-an-val.good { color:var(--grn); }
+.rf-an-val.bad { color:var(--acc); }
+.rf-an-sub { font-size:9px; color:var(--ink3); margin-top:2px; }
+
 /* Callouts */
 .rf-ok  { background:var(--grn-l); border:1px solid #9fd4b8; border-radius:var(--rs);
   padding:9px 12px; font-size:12px; color:var(--grn); display:flex; align-items:center;
@@ -207,6 +221,7 @@ video { border-radius: var(--r) !important; width: 100% !important; }
 @media (max-width:768px) {
   .rf-panel, .rf-panelr { padding:12px 14px; }
   .rf-metrics { grid-template-columns:repeat(2,1fr); }
+  .rf-an-grid { grid-template-columns:1fr; }
 }
 .stCaption, small { color:var(--ink3) !important; font-size:10px !important; }
 [data-testid="stHorizontalBlock"] { gap:10px !important; }
@@ -243,6 +258,7 @@ _DEFAULTS = dict(
     # single-clip
     output_path=None, processing_done=False,
     output_bytes=None, srt_bytes=None, last_settings=None,
+    analytics_data=None,
     # auto-clip
     detected_clips=None, selected_clip_indices=None,
     clip_results=None, scan_done=False,
@@ -266,7 +282,7 @@ def _cleanup() -> None:
         srt_bytes=None, video_info=None, processing_done=False,
         detected_clips=None, selected_clip_indices=None,
         clip_results=None, scan_done=False, clip_out_dir=None,
-        playing_clip_idx=-1,
+        playing_clip_idx=-1, analytics_data=None,
     )
 
 
@@ -281,6 +297,7 @@ def _invalidate_if_changed(cur: dict) -> None:
         st.session_state.processing_done = False
         st.session_state.output_bytes    = None
         st.session_state.srt_bytes       = None
+        st.session_state.analytics_data  = None
 
 
 _whisper_ok   = whisper_available()
@@ -371,12 +388,14 @@ tracking_mode = st.session_state.tracking_mode
 tab_list = ["🎞 Output", "🎯 Tracking", "📝 Subtitles", "⚙ Advanced"]
 if app_mode == "autoClip":
     tab_list.append("✂️ Clips")
+    tab_list.append("📊 Analytics")
 
 if app_mode == "autoClip":
-    tab_out, tab_trk, tab_sub, tab_adv, tab_clip = st.tabs(tab_list)
+    tab_out, tab_trk, tab_sub, tab_adv, tab_clip, tab_analytics = st.tabs(tab_list)
 else:
     tab_out, tab_trk, tab_sub, tab_adv = st.tabs(tab_list)
     tab_clip = None  # not used in single mode
+    tab_analytics = None
 
 with tab_out:
     st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
@@ -504,6 +523,62 @@ if app_mode == "autoClip" and tab_clip is not None:
             (beginning · middle · end) in your video.
             </div>""", unsafe_allow_html=True)
 
+# Analytics Tab (Auto-Clip Mode)
+if app_mode == "autoClip" and tab_analytics is not None:
+    with tab_analytics:
+        st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+        
+        if st.session_state.clip_results:
+            results = st.session_state.clip_results
+            valid_results = [r for r in results if not r.get("error") and "analytics" in r]
+            
+            if valid_results:
+                total_in = sum(r["analytics"]["input_size_mb"] for r in valid_results)
+                total_out = sum(r["analytics"]["output_size_mb"] for r in valid_results)
+                avg_ratio = sum(r["analytics"]["compression_ratio"] for r in valid_results) / len(valid_results)
+                
+                st.markdown(f"""
+                <div class="rf-analytics">
+                  <div class="rf-an-title">📊 Batch Analytics</div>
+                  <div class="rf-an-grid">
+                    <div class="rf-an-item">
+                      <div class="rf-an-label">Total Input</div>
+                      <div class="rf-an-val">{total_in:.1f} MB</div>
+                    </div>
+                    <div class="rf-an-item">
+                      <div class="rf-an-label">Total Output</div>
+                      <div class="rf-an-val good">{total_out:.1f} MB</div>
+                      <div class="rf-an-sub">{((1 - total_out/total_in)*100):.1f}% smaller</div>
+                    </div>
+                    <div class="rf-an-item">
+                      <div class="rf-an-label">Avg Compression</div>
+                      <div class="rf-an-val">{avg_ratio:.2f}x</div>
+                    </div>
+                  </div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+                st.markdown("<div style='font-size:11px;font-weight:700;color:var(--ink3);margin-bottom:8px;'>CLIP BREAKDOWN</div>", unsafe_allow_html=True)
+                
+                for i, r in enumerate(valid_results):
+                    a = r["analytics"]
+                    st.markdown(f"""
+                    <div style="background:var(--surf);border:1px solid var(--bdr);border-radius:var(--rs);
+                    padding:8px 12px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;">
+                      <div style="font-size:11px;font-weight:600;color:var(--ink);">Clip {i+1}</div>
+                      <div style="display:flex;gap:12px;font-size:10px;color:var(--ink2);">
+                        <span>{a['input_size_mb']:.1f} MB → <b>{a['output_size_mb']:.1f} MB</b></span>
+                        <span style="color:var(--grn);">{a['compression_ratio']:.2f}x</span>
+                      </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="rf-info">No analytics data available yet. Process clips to see stats.</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="rf-empty" style="min-height:120px;padding:20px;"><div class="rf-empty-s">Process clips to view analytics</div></div>', unsafe_allow_html=True)
+
+
 st.markdown("</div>", unsafe_allow_html=True)  # close settings div
 
 # Settings fingerprint for change detection
@@ -612,6 +687,36 @@ with col_out:
             st.markdown(f'<div class="rf-ok">✓ Done — {out_mb:.1f} MB</div>',
                         unsafe_allow_html=True)
             st.video(st.session_state.output_bytes, format="video/mp4")
+            
+            # ANALYTICS SECTION
+            if st.session_state.analytics_data:
+                a = st.session_state.analytics_data
+                red_pct = a['file_size_reduction_pct']
+                ratio = a['compression_ratio']
+                
+                st.markdown(f"""
+                <div class="rf-analytics">
+                  <div class="rf-an-title">📊 Conversion Analytics</div>
+                  <div class="rf-an-grid">
+                    <div class="rf-an-item">
+                      <div class="rf-an-label">Size Reduction</div>
+                      <div class="rf-an-val {'good' if red_pct > 0 else 'bad'}">{red_pct:.1f}%</div>
+                      <div class="rf-an-sub">{a['input_size_mb']:.1f} MB → {a['output_size_mb']:.1f} MB</div>
+                    </div>
+                    <div class="rf-an-item">
+                      <div class="rf-an-label">Compression</div>
+                      <div class="rf-an-val">{ratio:.2f}x</div>
+                      <div class="rf-an-sub">{a['input_bitrate_kbps']} kbps → {a['output_bitrate_kbps']} kbps</div>
+                    </div>
+                    <div class="rf-an-item">
+                      <div class="rf-an-label">Resolution</div>
+                      <div class="rf-an-val">{a['output_resolution']}</div>
+                      <div class="rf-an-sub">{a['input_resolution']} source</div>
+                    </div>
+                  </div>
+                </div>
+                """, unsafe_allow_html=True)
+
             st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
             stem = os.path.splitext(st.session_state.uploaded_file_name or "video")[0]
             st.download_button(
@@ -847,6 +952,11 @@ if uploaded_file is not None and st.session_state.input_path:
                     if os.path.exists(out_p) and os.path.getsize(out_p) > 0:
                         with open(out_p, "rb") as f:
                             st.session_state.output_bytes = f.read()
+                        
+                        # Store Analytics
+                        if "analytics" in meta:
+                            st.session_state.analytics_data = meta["analytics"]
+
                         srt_p = meta.get("subtitle_path")
                         if srt_p and os.path.exists(srt_p):
                             with open(srt_p, "rb") as f:
