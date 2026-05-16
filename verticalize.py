@@ -70,27 +70,27 @@ RESOLUTION_PRESETS = {
 }
 
 SUBTITLE_STYLES = {
-    "Bold White (TikTok) ": {
-        "fontsize ": 18,  "primary_color ":  " &H00FFFFFF ",  "outline_color ":  " &H00000000 ",
-        "outline ": 2,  "bold ": 1,  "shadow ": 0,  "back_color ":  " &H00000000 ",  "margin_v ": 80,
+    "Bold White (TikTok)": {
+        "fontsize": 18,  "primary_color":  "&H00FFFFFF",  "outline_color":  "&H00000000",
+        "outline": 2,  "bold": 1,  "shadow": 0,  "back_color":  "&H00000000",  "margin_v": 80,
     },
-    "Yellow (Classic) ": {
-        "fontsize ": 16,  "primary_color ":  " &H0000FFFF ",  "outline_color ":  " &H00000000 ",
-        "outline ": 2,  "bold ": 1,  "shadow ": 1,  "back_color ":  " &H00000000 ",  "margin_v ": 80,
+    "Yellow (Classic)": {
+        "fontsize": 16,  "primary_color":  "&H0000FFFF",  "outline_color":  "&H00000000",
+        "outline": 2,  "bold": 1,  "shadow": 1,  "back_color":  "&H00000000",  "margin_v": 80,
     },
-    "Box (Accessible) ": {
-        "fontsize ": 15,  "primary_color ":  " &H00FFFFFF ",  "outline_color ":  " &H00000000 ",
-        "outline ": 0,  "bold ": 0,  "shadow ": 0,  "back_color ":  " &H80000000 ",  "margin_v ": 80,
+    "Box (Accessible)": {
+        "fontsize": 15,  "primary_color":  "&H00FFFFFF",  "outline_color":  "&H00000000",
+        "outline": 0,  "bold": 0,  "shadow": 0,  "back_color":  "&H80000000",  "margin_v": 80,
     },
 }
 
 TRANSLATION_LANGUAGES = {
-    "None (keep original) ":  " ",  "French ":  "fr ",  "German ":  "de ",  "Spanish ":  "es ",
-    "Italian ":  "it ",  "Portuguese ":  "pt ",  "Dutch ":  "nl ",  "Polish ":  "pl ",  "Russian ":  "ru ",
-    "Japanese ":  "ja ",  "Korean ":  "ko ",  "Chinese (Simplified) ":  "zh-CN ",  "Arabic ":  "ar ",
-    "Hindi ":  "hi ",  "Turkish ":  "tr ",  "Indonesian ":  "id ",  "Swedish ":  "sv ",  "Norwegian ":  "no ",
-    "Danish ":  "da ",  "Finnish ":  "fi ",  "Greek ":  "el ",  "Hebrew ":  "iw ",  "Thai ":  "th ",
-    "Vietnamese ":  "vi ",  "Malay ":  "ms ",  "Ukrainian ":  "uk ",
+    "None (keep original)":  "",  "French":  "fr",  "German":  "de",  "Spanish":  "es",
+    "Italian":  "it",  "Portuguese":  "pt",  "Dutch":  "nl",  "Polish":  "pl",  "Russian":  "ru",
+    "Japanese":  "ja",  "Korean":  "ko",  "Chinese (Simplified)":  "zh-CN",  "Arabic":  "ar",
+    "Hindi":  "hi",  "Turkish":  "tr",  "Indonesian":  "id",  "Swedish":  "sv",  "Norwegian":  "no",
+    "Danish":  "da",  "Finnish":  "fi",  "Greek":  "el",  "Hebrew":  "iw",  "Thai":  "th",
+    "Vietnamese":  "vi",  "Malay":  "ms",  "Ukrainian":  "uk",
 }
 
 # Visual constants
@@ -253,18 +253,18 @@ class DissolveBuffer:
         return self._rem > 0
 
 # ─── FFmpeg post-filter chain ──────────────────────────────────────────────────
-def _build_ffmpeg_vf(color_grade="none ", ffmpeg_sharpen=False):
+def _build_ffmpeg_vf(color_grade="none", ffmpeg_sharpen=False):
     filters = []
     eq_map = {
-        "warm ":     "brightness=0.02:saturation=1.12:gamma_r=1.05:gamma_b=0.95 ",
-        "cool ":     "brightness=0.01:saturation=1.08:gamma_r=0.95:gamma_b=1.05 ",
-        "vibrant ":  "brightness=0.0:saturation=1.25:contrast=1.05 ",
-        "matte ":    "brightness=0.03:saturation=0.85:contrast=0.92 ",
+        "warm":     "brightness=0.02:saturation=1.12:gamma_r=1.05:gamma_b=0.95",
+        "cool":     "brightness=0.01:saturation=1.08:gamma_r=0.95:gamma_b=1.05",
+        "vibrant":  "brightness=0.0:saturation=1.25:contrast=1.05",
+        "matte":    "brightness=0.03:saturation=0.85:contrast=0.92",
     }
     if color_grade in eq_map:
-        filters.append(f"eq={eq_map[color_grade]} ")
+        filters.append(f"eq={eq_map[color_grade]}")
     if ffmpeg_sharpen:
-        filters.append("unsharp=5:5:0.8:3:3:0.0 ")
+        filters.append("unsharp=5:5:0.8:3:3:0.0")
     return filters
 
 # ─── FFmpegVideoReader (software-decode pipe) ──────────────────────────────────
@@ -282,20 +282,20 @@ class FFmpegVideoReader:
         self._leftover = b""
 
     def _candidate_cmds(self):
-        head = ["ffmpeg "]
+        head = ["ffmpeg"]
         if self.seek_sec > 0:
-            head += ["-ss ", str(self.seek_sec)]
+            head += ["-ss", str(self.seek_sec)]
         tail = [
-            "-i ", self.path,
-            "-f ", "rawvideo ", "-pix_fmt ", "bgr24 ",
-            "-vf ", f"scale={self.out_w}:{self.out_h} ",
+            "-i", self.path,
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-vf", f"scale={self.out_w}:{self.out_h}",
         ]
         if self.n_frames is not None:
-            tail += ["-vframes ", str(self.n_frames)]
-        tail += ["pipe:1 "]
+            tail += ["-vframes", str(self.n_frames)]
+        tail += ["pipe:1"]
         return [
-            head + ["-vcodec ", "libdav1d "] + tail,
-            head + ["-hwaccel ", "none "] + tail,
+            head + ["-vcodec", "libdav1d"] + tail,
+            head + ["-hwaccel", "none"] + tail,
         ]
 
     def _open(self):
@@ -317,7 +317,7 @@ class FFmpegVideoReader:
                 proc.wait()
             except Exception:
                 pass
-        raise ProcessingError(f"FFmpeg could not decode: {self.path} ")
+        raise ProcessingError(f"FFmpeg could not decode: {self.path}")
 
     def close(self):
         if self._proc:
@@ -339,7 +339,7 @@ class FFmpegVideoReader:
         if not self._proc:
             self._open()
         buf = self._leftover
-        self._leftover = b" "
+        self._leftover = b""
         while True:
             needed = self._frame_bytes - len(buf)
             while needed > 0:
@@ -371,28 +371,28 @@ def _check_ffmpeg():
 def _has_audio(path):
     try:
         r = subprocess.run(
-            ["ffprobe ", "-v ", "error ", "-select_streams ", "a ",
-             "-show_entries ", "stream=codec_type ", "-of ", "csv=p=0 ", path],
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
             capture_output=True, text=True, timeout=15,
         )
-        return "audio " in r.stdout
+        return "audio" in r.stdout
     except Exception:
         return False
 
 def _extract_audio_wav(vpath, wpath):
     r = subprocess.run(
-        ["ffmpeg ", "-y ", "-i ", vpath, "-ar ", "16000 ", "-ac ", "1 ", "-f ", "wav ", wpath],
+        ["ffmpeg", "-y", "-i", vpath, "-ar", "16000", "-ac", "1", "-f", "wav", wpath],
         capture_output=True,
     )
     return r.returncode == 0 and os.path.exists(wpath)
 
 def _trim_video(inp, out, start, end):
     r = subprocess.run(
-        ["ffmpeg ", "-y ", "-hwaccel ", "none ",
-         "-ss ", str(start), "-to ", str(end), "-i ", inp,
-         "-c:v ", "libx264 ", "-preset ", "ultrafast ", "-crf ", "18 ",
-         "-c:a ", "aac ", "-b:a ", "128k ",
-         "-avoid_negative_ts ", "make_zero ", "-reset_timestamps ", "1 ", out],
+        ["ffmpeg", "-y", "-hwaccel", "none",
+         "-ss", str(start), "-to", str(end), "-i", inp,
+         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+         "-c:a", "aac", "-b:a", "128k",
+         "-avoid_negative_ts", "make_zero", "-reset_timestamps", "1", out],
         capture_output=True,
     )
     return r.returncode == 0 and os.path.exists(out)
@@ -400,43 +400,43 @@ def _trim_video(inp, out, start, end):
 # ─── Encoder (with optional FFmpeg vf chain) ───────────────────────────────────
 def _open_ffmpeg_encoder(
     output_path, width, height, fps, audio_source,
-    crf=23, preset="fast ", audio_bitrate="128k ",
+    crf=23, preset="fast", audio_bitrate="128k",
     subtitle_path=None, subtitle_style=None, extra_vf=None,
 ):
     cmd = [
-        "ffmpeg ", "-y ",
-        "-f ", "rawvideo ", "-vcodec ", "rawvideo ", "-pix_fmt ", "bgr24 ",
-        "-s ", f"{width}x{height} ", "-r ", str(fps), "-i ", "pipe:0 ",
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-vcodec", "rawvideo", "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}", "-r", str(fps), "-i", "pipe:0",
     ]
     has_aud = audio_source and _has_audio(audio_source)
     if has_aud:
-        cmd += ["-hwaccel ", "none ", "-i ", audio_source]
+        cmd += ["-hwaccel", "none", "-i", audio_source]
     vf = []
     if subtitle_path and os.path.exists(subtitle_path):
-        s = subtitle_style or SUBTITLE_STYLES["Bold White (TikTok) "]
-        sesc = subtitle_path.replace("\\ ", "/ ").replace(": ", "\: ")
+        s = subtitle_style or SUBTITLE_STYLES["Bold White (TikTok)"]
+        sesc = subtitle_path.replace("\\", "/").replace(":", "\:")
         force = (
             f"Fontsize={s.get('fontsize', 18)}, "
             f"PrimaryColour={s.get('primary_color', '&H00FFFFFF')}, "
             f"OutlineColour={s.get('outline_color', '&H00000000')}, "
             f"Outline={s.get('outline', 2)},Bold={s.get('bold', 1)}, "
             f"Shadow={s.get('shadow', 0)},BackColour={s.get('back_color', '&H00000000')}, "
-            f"MarginV={s.get('margin_v', 80)},Alignment=2 "
+            f"MarginV={s.get('margin_v', 80)},Alignment=2"
         )
-        vf.append(f"subtitles='{sesc}':force_style='{force}' ")
+        vf.append(f"subtitles='{sesc}':force_style='{force}'")
     if extra_vf:
         vf.extend(extra_vf)
-    cmd += ["-map ", "0:v:0 "]
+    cmd += ["-map", "0:v:0"]
     if has_aud:
-        cmd += ["-map ", "1:a:0? ", "-c:a ", "aac ", "-b:a ", audio_bitrate, "-ac ", "2 "]
+        cmd += ["-map", "1:a:0?", "-c:a", "aac", "-b:a", audio_bitrate, "-ac", "2"]
     else:
-        cmd += ["-an "]
+        cmd += ["-an"]
     if vf:
-        cmd += ["-vf ", ", ".join(vf)]
+        cmd += ["-vf", ", ".join(vf)]
     cmd += [
-        "-c:v ", "libx264 ", "-preset ", preset, "-crf ", str(crf),
-        "-profile:v ", "baseline ", "-level ", "3.1 ", "-pix_fmt ", "yuv420p ",
-        "-shortest ", "-movflags ", "+faststart ", output_path,
+        "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+        "-profile:v", "baseline", "-level", "3.1", "-pix_fmt", "yuv420p",
+        "-shortest", "-movflags", "+faststart", output_path,
     ]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
@@ -458,36 +458,36 @@ def _close_ffmpeg_encoder(proc, output_path):
 # ─── Video metadata ────────────────────────────────────────────────────────────
 def get_video_info(path):
     cmd = [
-        "ffprobe ", "-v ", "error ", "-select_streams ", "v:0 ",
-        "-show_entries ", "stream=width,height,r_frame_rate,nb_frames ",
-        "-show_entries ", "format=duration ",
-        "-of ", "default=noprint_wrappers=1 ", path,
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1", path,
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     kv = {}
     for line in r.stdout.splitlines():
-        if "= " in line:
-            k, v = line.split("= ", 1)
+        if "=" in line:
+            k, v = line.split("=", 1)
             kv[k.strip()] = v.strip()
-    w = int(kv.get("width ", 0) or 0)
-    h = int(kv.get("height ", 0) or 0)
+    w = int(kv.get("width", 0) or 0)
+    h = int(kv.get("height", 0) or 0)
     try:
-        num, den = kv.get("r_frame_rate ", "30/1 ").split("/ ")
+        num, den = kv.get("r_frame_rate", "30/1").split("/")
         fps = float(num) / float(den)
     except Exception:
         fps = 30.0
-    dur = float(kv.get("duration ", 0.0) or 0.0)
+    dur = float(kv.get("duration", 0.0) or 0.0)
     if dur <= 0:
-        nb = int(kv.get("nb_frames ", 0) or 0)
+        nb = int(kv.get("nb_frames", 0) or 0)
         dur = nb / fps if fps > 0 and nb > 0 else 0.0
     if w == 0 or h == 0:
-        raise ProcessingError(f"Cannot read dimensions: {path} ")
+        raise ProcessingError(f"Cannot read dimensions: {path}")
     return {
-        "fps ": fps,
-        "total_frames ": min(int(dur * fps), MAX_FRAMES_GUARD),
-        "width ": w, "height ": h,
-        "duration_seconds ": dur,
-        "is_landscape ": w > h,
+        "fps": fps,
+        "total_frames": min(int(dur * fps), MAX_FRAMES_GUARD),
+        "width": w, "height": h,
+        "duration_seconds": dur,
+        "is_landscape": w > h,
     }
 
 def extract_thumbnail(path, t=1.0):
@@ -574,7 +574,8 @@ def detect_faces(frame, confidence_thresh=0.6):
     return faces
 
 # ─── Subject / person detection ────────────────────────────────────────────────
-DetectionResult = namedtuple("DetectionResult ", ["cx ", "cy ", "ux1 ", "uy1 ", "ux2 ", "uy2 ", "count "])
+# FIXED: Removed trailing spaces in namedtuple definition
+DetectionResult = namedtuple("DetectionResult", ["cx", "cy", "ux1", "uy1", "ux2", "uy2", "count"])
 
 def detect_subjects(frame, model, confidence=0.45):
     if model is None:
@@ -637,13 +638,13 @@ def _apply_lower_third_guard(cy, crop_h, subject_cy_src, orig_h):
     return min(cy, min(max_cy, orig_h - hh))
 
 def _soi_region_label(cx, cy, w, h):
-    col = "left " if cx < w // 3 else ("right " if cx > 2 * w // 3 else "center ")
-    row = "upper " if cy < h // 3 else ("lower " if cy > 2 * h // 3 else "mid ")
-    if row == "mid " and col == "center ":
-        return "center "
-    if row == "mid ":
+    col = "left" if cx < w // 3 else ("right" if cx > 2 * w // 3 else "center")
+    row = "upper" if cy < h // 3 else ("lower" if cy > 2 * h // 3 else "mid")
+    if row == "mid" and col == "center":
+        return "center"
+    if row == "mid":
         return col
-    return f"{row}-{col} "
+    return f"{row}-{col}"
 
 def frame_for_union(ux1, uy1, ux2, uy2, orig_w, orig_h, crop_w, crop_h):
     ucx = (ux1 + ux2) // 2
@@ -1018,7 +1019,7 @@ def transcribe_to_srt(
         return False
     import whisper as _w
     _p(0.0, "Extracting audio... ")
-    wav_fd, wav_path = tempfile.mkstemp(suffix=".wav ")
+    wav_fd, wav_path = tempfile.mkstemp(suffix=".wav")
     os.close(wav_fd)
     try:
         if not _extract_audio_wav(video_path, wav_path):
@@ -1043,9 +1044,9 @@ def transcribe_to_srt(
             if not buf:
                 return
             lines.append(
-                f"{idx}\n "
-                f"{_seconds_to_srt_time(buf[0]['start'])} --> {_seconds_to_srt_time(buf[-1]['end'])}\n "
-                f"{' '.join(x['word'] for x in buf)}\n "
+                f"{idx}\n"
+                f"{_seconds_to_srt_time(buf[0]['start'])} --> {_seconds_to_srt_time(buf[-1]['end'])}\n"
+                f"{' '.join(x['word'] for x in buf)}\n"
             )
             idx += 1
             buf = []
@@ -1262,7 +1263,7 @@ def detect_clips(
                 scx, scy = saliency_center(frame)
                 soi_xs.append(scx)
                 soi_ys.append(scy)
-        sr = "center "
+        sr = "center"
         if soi_xs:
             sr = _soi_region_label(int(np.median(soi_xs)), int(np.median(soi_ys)), orig_w, orig_h)
         ms = int(ss2 // 60)
@@ -1277,7 +1278,7 @@ def detect_clips(
     _p(1.0, f"Found {len(segments)} clips ")
     return segments
 
-# ─── Analytics ────────────────────────────────────────────────────────────────
+# ─── Analytics ───────────────────────────────────────────────────────────────
 def get_analytics_meta(input_path: str, output_path: str) -> dict:
     """
     Return a dict with key metrics about the conversion, ready to feed
@@ -1339,18 +1340,18 @@ def get_analytics_meta(input_path: str, output_path: str) -> dict:
 # ─── process_video — main entry point ─────────────────────────────────────────
 def process_video(
     input_path, output_path,
-    target_preset_label="Match source (no upscale) ",
-    tracking_mode="subject ", talking_head_bias=0.30,
+    target_preset_label="Match source (no upscale)",
+    tracking_mode="subject", talking_head_bias=0.30,
     sample_interval=None, confidence=0.45, use_optical_flow=True,
     smooth_window=33, adaptive_smoothing=True, rule_of_thirds=True,
-    scene_cut_threshold=0.35, output_fps=None, crf=23, encoder_preset="fast ",
-    audio_bitrate="128k ", yolo_weights="yolov8n.pt ",
-    burn_subtitles=False, whisper_model="base ", whisper_language=None,
-    subtitle_style_name="Bold White (TikTok) ", subtitle_max_chars=42,
+    scene_cut_threshold=0.35, output_fps=None, crf=23, encoder_preset="fast",
+    audio_bitrate="128k", yolo_weights="yolov8n.pt",
+    burn_subtitles=False, whisper_model="base", whisper_language=None,
+    subtitle_style_name="Bold White (TikTok)", subtitle_max_chars=42,
     subtitle_translate_to=None,
     vignette_strength=VIGNETTE_STRENGTH,
     sharpen_strength=0.0,
-    color_grade="none ",
+    color_grade="none",
     ken_burns=False,
     dissolve_cuts=True,
     ffmpeg_sharpen=False,
@@ -1369,25 +1370,25 @@ def process_video(
     }
     _check_ffmpeg()
     if not os.path.exists(input_path):
-        raise ProcessingError(f"Input not found: {input_path} ")
+        raise ProcessingError(f"Input not found: {input_path}")
     if os.path.getsize(input_path) / 1024**2 > MAX_FILE_SIZE_MB:
-        raise ProcessingError(f"File exceeds {MAX_FILE_SIZE_MB} MB. ")
+        raise ProcessingError(f"File exceeds {MAX_FILE_SIZE_MB} MB.")
 
     info = get_video_info(input_path)
     fps, total_frames = info["fps"], info["total_frames"]
     orig_w, orig_h = info["width"], info["height"]
     duration = info["duration_seconds"]
     if total_frames <= 0 or orig_w <= 0 or orig_h <= 0:
-        raise ProcessingError("Corrupt or unreadable video. ")
+        raise ProcessingError("Corrupt or unreadable video.")
     if not info["is_landscape"]:
-        raise ProcessingError("Video is already vertical. ")
+        raise ProcessingError("Video is already vertical.")
 
-    lbl = target_preset_label if target_preset_label in RESOLUTION_PRESETS else "Match source (no upscale) "
+    lbl = target_preset_label if target_preset_label in RESOLUTION_PRESETS else "Match source (no upscale)"
     target_w, target_h = resolve_target_size(lbl, orig_w, orig_h)
     req_w, req_h = RESOLUTION_PRESETS.get(lbl, (0, 0))
     clamped = req_h > 0 and (target_h < req_h or target_w < req_w)
     result_meta.update(clamped=clamped, effective_size=(target_w, target_h), duration=duration)
-    _p(0.01, f"Output {target_w}x{target_h} source {orig_w}x{orig_h} ")
+    _p(0.01, f"Output {target_w}x{target_h} source {orig_w}x{orig_h}")
 
     if not sample_interval:
         sample_interval = max(1, int(fps / 5))
@@ -1401,7 +1402,7 @@ def process_video(
     srt_path = None
     if burn_subtitles and _has_audio(input_path):
         _p(0.02, "Transcribing... ")
-        srt_fd, srt_path = tempfile.mkstemp(suffix=".srt ")
+        srt_fd, srt_path = tempfile.mkstemp(suffix=".srt")
         os.close(srt_fd)
         ok = transcribe_to_srt(
             input_path, srt_path,
@@ -1423,32 +1424,32 @@ def process_video(
 
     start_pct = 0.10
     model_obj = None
-    if tracking_mode == "subject ":
+    if tracking_mode == "subject":
         _p(start_pct, "Loading YOLO... ")
         model_obj = _get_model(yolo_weights)
         if model_obj is None:
-            _p(start_pct, "YOLO unavailable - saliency fallback ")
-    elif tracking_mode == "talking_head ":
+            _p(start_pct, "YOLO unavailable - saliency fallback")
+    elif tracking_mode == "talking_head":
         _p(start_pct, "Loading face detector... ")
         if _get_haar() is None:
-            _p(start_pct, "No face detector - saliency fallback ")
+            _p(start_pct, "No face detector - saliency fallback")
 
     is_panel = False
     slot_smoother = None
-    if tracking_mode == "subject " and model_obj is not None:
+    if tracking_mode == "subject" and model_obj is not None:
         _p(start_pct + 0.01, "Checking panel/group shot... ")
         is_panel = _detect_panel_mode(
             input_path, model_obj, fps, total_frames, orig_w, orig_h,
             confidence, n_probe=20,
         )
         if is_panel:
-            _p(start_pct + 0.02, "Panel mode - 2-row vertical split ")
+            _p(start_pct + 0.02, "Panel mode - 2-row vertical split")
             result_meta["panel_mode"] = True
             slot_smoother = PanelSlotSmoother()
 
-    extra_vf = _build_ffmpeg_vf(color_grade="none ", ffmpeg_sharpen=ffmpeg_sharpen)
+    extra_vf = _build_ffmpeg_vf(color_grade="none", ffmpeg_sharpen=ffmpeg_sharpen)
     _p(0.12, f"Single-pass detect+render ({total_frames} frames)... ")
-    style = SUBTITLE_STYLES.get(subtitle_style_name, SUBTITLE_STYLES["Bold White (TikTok) "])
+    style = SUBTITLE_STYLES.get(subtitle_style_name, SUBTITLE_STYLES["Bold White (TikTok)"])
     proc = _open_ffmpeg_encoder(
         output_path, target_w, target_h, render_fps,
         audio_source=input_path,
@@ -1459,7 +1460,7 @@ def process_video(
 
     if vignette_strength > 0:
         _build_vignette(target_w, target_h, vignette_strength)
-    if color_grade and color_grade != "none ":
+    if color_grade and color_grade != "none":
         _build_lut(color_grade)
 
     dissolve_buf = DissolveBuffer(DISSOLVE_FRAMES) if dissolve_cuts else None
@@ -1518,7 +1519,7 @@ def process_video(
                     prev_gray2 = cg
                     anchor_cx = anchor_cy = None
 
-                    if tracking_mode == "talking_head ":
+                    if tracking_mode == "talking_head":
                         faces = detect_faces(det_frame, confidence_thresh=0.5)
                         if faces:
                             faces_orig = [
@@ -1627,7 +1628,7 @@ def process_video(
                     out_frame = apply_ken_burns(out_frame, fi, fps)
                 if sharpen_strength > 0:
                     out_frame = apply_sharpen(out_frame, sharpen_strength)
-                if color_grade and color_grade != "none ":
+                if color_grade and color_grade != "none":
                     out_frame = apply_color_grade(out_frame, color_grade)
                 if vignette_strength > 0:
                     out_frame = apply_vignette(out_frame, vignette_strength)
@@ -1687,7 +1688,7 @@ def process_video(
     analytics = get_analytics_meta(input_path, output_path)
 
     # Inject smoothing metrics if available
-    if smooth_metrics: # Fixed typo: smooth_metrics
+    if smooth_metrics:
         analytics.update(smooth_metrics)
         
     result_meta["analytics"] = analytics
@@ -1695,7 +1696,7 @@ def process_video(
     _p(1.0, "Done! ")
     print(
         f"Output: {output_path} ({os.path.getsize(output_path)/1024**2:.1f} MB) "
-        f" cuts={len(scene_cuts)} panel={is_panel} ",
+        f"cuts={len(scene_cuts)} panel={is_panel}",
         file=sys.stderr,
     )
     return result_meta
@@ -1703,15 +1704,15 @@ def process_video(
 # ─── Batch clip pipeline ───────────────────────────────────────────────────────
 def process_clips_batch(
     input_path, output_dir, clips,
-    target_preset_label="720p   (720x1280  - HD) ",
-    tracking_mode="subject ", talking_head_bias=0.30,
+    target_preset_label="720p   (720x1280  - HD)",
+    tracking_mode="subject", talking_head_bias=0.30,
     confidence=0.45, smooth_window=33, adaptive_smoothing=True,
-    use_optical_flow=True, rule_of_thirds=True, crf=23, encoder_preset="fast ",
-    audio_bitrate="128k ", yolo_weights="yolov8n.pt ",
-    burn_subtitles=False, whisper_model="base ",
-    subtitle_style_name="Bold White (TikTok) ", subtitle_max_chars=42,
+    use_optical_flow=True, rule_of_thirds=True, crf=23, encoder_preset="fast",
+    audio_bitrate="128k", yolo_weights="yolov8n.pt",
+    burn_subtitles=False, whisper_model="base",
+    subtitle_style_name="Bold White (TikTok)", subtitle_max_chars=42,
     vignette_strength=VIGNETTE_STRENGTH, sharpen_strength=0.0,
-    color_grade="none ", ken_burns=False, dissolve_cuts=True, ffmpeg_sharpen=False,
+    color_grade="none", ken_burns=False, dissolve_cuts=True, ffmpeg_sharpen=False,
     progress_callback=None,
 ):
     def _p(v, msg=" "):
@@ -1730,14 +1731,14 @@ def process_clips_batch(
         trimmed_path = None
         out_path = None
         try:
-            fd, trimmed_path = tempfile.mkstemp(suffix=".mp4 ")
+            fd, trimmed_path = tempfile.mkstemp(suffix=".mp4")
             os.close(fd)
             if not _trim_video(input_path, trimmed_path, clip.start_sec, clip.end_sec):
-                results.append({"clip": clip, "output_path": None, "error": "trim failed "})
+                results.append({"clip": clip, "output_path": None, "error": "trim failed"})
                 continue
             out_path = os.path.join(
                 output_dir,
-                f"clip_{i+1:02d}_{int(clip.start_sec)}s_{int(clip.end_sec)}s_vertical.mp4 ",
+                f"clip_{i+1:02d}_{int(clip.start_sec)}s_{int(clip.end_sec)}s_vertical.mp4",
             )
             def clip_cb(v, msg=" ", _b=base_pct, _n=next_pct):
                 _p(_b + v * (_n - _b), msg)
@@ -1766,6 +1767,6 @@ def process_clips_batch(
                 except OSError:
                     pass
 
-    n_ok = sum(1 for r in results if not r.get("error "))
+    n_ok = sum(1 for r in results if not r.get("error"))
     _p(1.0, f"{n_ok}/{len(results)} clips done ")
     return results
