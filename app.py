@@ -20,7 +20,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ─── CSS ────────────────────────────────────────────────────────────────────
+# ─── CSS ─────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=DM+Serif+Display:ital@0;1&display=swap');
@@ -1049,6 +1049,12 @@ if uploaded_file is not None and st.session_state.input_path:
 
     # ─── AUTO-CLIP ACTIONS ────────────────────────────────────────────────
     else:
+        # Ensure we have detected clips if we are in auto-clip mode
+        if not st.session_state.detected_clips:
+            st.session_state.scan_done = False
+            st.warning("Clip data missing. Please scan again.")
+            st.stop()
+
         if not st.session_state.scan_done:
             b1, b2, b3 = st.columns([4, 4, 2])
             with b1:
@@ -1091,6 +1097,8 @@ if uploaded_file is not None and st.session_state.input_path:
                     st.session_state.detected_clips          = clips
                     st.session_state.selected_clip_indices   = set(range(len(clips)))
                     st.session_state.scan_done               = True
+                    # Clear old results when scanning new clips
+                    st.session_state.clip_results            = None 
                     status.success(f"✅ Found {len(clips)} clips!")
                     st.rerun()
                 except Exception as exc:
@@ -1098,7 +1106,12 @@ if uploaded_file is not None and st.session_state.input_path:
 
         else:
             clips = st.session_state.detected_clips or []
-            sel   = st.session_state.selected_clip_indices or set()
+            
+            # Initialize selection if not present
+            if st.session_state.selected_clip_indices is None:
+                st.session_state.selected_clip_indices = set(range(len(clips)))
+            
+            sel   = st.session_state.selected_clip_indices
 
             if not st.session_state.clip_results:
                 p1, p2, p3 = st.columns([4, 3, 2])
@@ -1166,9 +1179,12 @@ if uploaded_file is not None and st.session_state.input_path:
             else:
                 results = st.session_state.clip_results
                 n_ok = sum(1 for r in results if not r.get("error"))
-                st.markdown(
-                    f'<div class="rf-ok">✓ {n_ok} clip{"s" if n_ok!=1 else ""} ready — download from the cards above</div>',
-                    unsafe_allow_html=True)
+                
+                # Only show the "Ready" banner if we actually have clips detected
+                if clips:
+                    st.markdown(
+                        f'<div class="rf-ok">✓ {n_ok} clip{"s" if n_ok!=1 else ""} ready — download from the cards above</div>',
+                        unsafe_allow_html=True)
 
                 rc1, rc2, rc3 = st.columns(3)
                 with rc1:
