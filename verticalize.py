@@ -970,12 +970,8 @@ def _bidir_ema(xs, ys, alpha=0.06):
 
 def smooth_centers(centers, speeds, base_window=33, adaptive=True, scene_cuts=None):
     """
-    SMOOTH-1/2/3: Three-stage pipeline per scene segment:
-      1. Gaussian with velocity-adaptive window
-      2. Bidirectional EMA to kill residual jitter
-    
-    Returns:
-      tuple: (smoothed_centers_list, metrics_dict)
+    SMOOTH-1/2/3: Three-stage pipeline per scene segment.
+    Returns: (smoothed_centers_list, metrics_dict)
     """
     if not centers or len(centers) < 3:
         return list(centers) if centers else [], {"jitter_raw": 0, "jitter_smooth": 0, "smoothness_pct": 0, "max_jump_raw": 0}
