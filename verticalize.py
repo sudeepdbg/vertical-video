@@ -12,22 +12,12 @@ dissolve artefacts don't bleed across cuts.
 SMOOTH-4  Sub-sample interpolation uses monotone cubic (PCHIP) instead of plain
 Hermite so the path never overshoots (no oscillation around subjects).
 PANEL-1   Podcast/news panel detector now uses a majority-vote over speaker-
-region histograms: it counts frames where ≥2 persons occupy stable
-left/right bounding columns, reducing false positives on crowd scenes.
+region histograms AND stability checks to avoid false positives on sports.
 PANEL-2   Per-slot EMA alpha lowered to 0.15 (was 0.25) and clamped to prevent
 a new detection yanking an entire strip across the frame in one frame.
 PANEL-3   Panel transition cross-fade: when the slot assignment changes (e.g.
 speaker swap), a short alpha-blend masks the hard jump.
 PANEL-4   Divider line is drawn last, after blending, so it is always sharp.
-CLEAN-1   Removed unused _face_net / _haar_cascade fallback paths that were
-never reached (talking_head now routes through the same detect_faces
-helper but the prototxt / caffemodel paths are gone from cold start).
-CLEAN-2   Removed dead _read_frame_at wrapper (inlined into callers).
-CLEAN-3   Removed duplicate _build_ffmpeg_vf color-grade branches that were
-never executed in panel mode.
-CLEAN-4   Removed _cubic_hermite / interpolate_centers (replaced by PCHIP).
-CLEAN-5   Removed vel-table look-up duplication between smooth_centers and
-_ema_polish (merged into one smooth_centers call).
 ANALYTICS get_analytics_meta(input_path, output_path) → dict  ready to feed
 the companion analytics player widget.
 ADDED: Jitter/Smoothness metrics calculated during processing.
@@ -53,7 +43,7 @@ MAX_FILE_SIZE_MB  = 2000
 MIN_FRAME_DIM     = 240
 MAX_FRAMES_GUARD  = 1_080_000
 LOWER_THIRD_GUARD = 0.80
-PANEL_MIN_PERSONS = 2
+PANEL_MIN_PERSONS = 3 # Increased to 3 to reduce sports false positives
 
 # Velocity → Gaussian window (frames).  Wider = smoother but more lag.
 VELOCITY_SMOOTH_TABLE = [
@@ -411,6 +401,7 @@ def _open_ffmpeg_encoder(
     has_aud = audio_source and _has_audio(audio_source)
     if has_aud:
         cmd += ["-hwaccel", "none", "-i", audio_source]
+    
     vf = []
     if subtitle_path and os.path.exists(subtitle_path):
         s = subtitle_style or SUBTITLE_STYLES["Bold White (TikTok)"]
@@ -424,18 +415,25 @@ def _open_ffmpeg_encoder(
             f"MarginV={s.get('margin_v', 80)},Alignment=2"
         )
         vf.append(f"subtitles='{sesc}':force_style='{force}'")
+    
     if extra_vf:
         vf.extend(extra_vf)
+        
     cmd += ["-map", "0:v:0"]
     if has_aud:
         cmd += ["-map", "1:a:0?", "-c:a", "aac", "-b:a", audio_bitrate, "-ac", "2"]
     else:
         cmd += ["-an"]
+        
     if vf:
         cmd += ["-vf", ", ".join(vf)]
+        
+    # CRITICAL FIX: Explicitly set Display Aspect Ratio to W:H for vertical videos
+    # This prevents players from stretching or duplicating frames incorrectly
     cmd += [
         "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
         "-profile:v", "baseline", "-level", "3.1", "-pix_fmt", "yuv420p",
+        "-aspect", f"{width}:{height}", 
         "-shortest", "-movflags", "+faststart", output_path,
     ]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -689,34 +687,81 @@ def _detect_panel_mode(
     """
     Returns True only when a majority of probed frames show ≥2 persons whose
     centres are stably split into left / right columns (i.e. podcast / news
-    desk), rather than triggering on fleeting crowd shots.
+    desk), rather than triggering on fleeting crowd scenes or sports.
+    
+    FIX: Increased strictness to avoid false positives on sports videos where
+    players are spread across the court.
     """
     if model is None:
         return False
+    
     probe_ts = np.linspace(1.0, max(1.5, total_frames / fps - 1.0), n_probe)
     multi_hits = 0
     stable_split_hits = 0
+    
     det_w = min(orig_w, 640)
     det_h = max(1, int(det_w * orig_h / orig_w))
-    sx, sy = orig_w / det_w, orig_h / det_h
+    
+    # Store previous centroids to check for stability (low motion)
+    prev_centroids_x = None 
+
     for t in probe_ts:
         frame = _read_frame_at(input_path, orig_w, orig_h, t, scale_w=det_w, scale_h=det_h)
         if frame is None:
             continue
+            
         persons = detect_persons_all(frame, model, confidence)
+        
+        # Require at least 'PANEL_MIN_PERSONS' to consider it a panel
         if len(persons) < PANEL_MIN_PERSONS:
+            prev_centroids_x = None
             continue
+            
         multi_hits += 1
-        # Check stable left/right split: all centroids in distinct columns
-        centres_x = [(p[0] + p[2]) / 2 / det_w for p in persons]  # normalised 0-1
-        left_count  = sum(1 for c in centres_x if c < 0.45)
-        right_count = sum(1 for c in centres_x if c > 0.55)
-        if left_count >= 1 and right_count >= 1:
+        
+        # Calculate normalized centers (0.0 to 1.0)
+        centres_x = [(p[0] + p[2]) / 2 / det_w for p in persons]
+        
+        # Check for distinct Left/Right split
+        # Left: < 0.4, Right: > 0.6, Center: ignored for panel logic
+        left_p = [c for c in centres_x if c < 0.4]
+        right_p = [c for c in centres_x if c > 0.6]
+        
+        # Must have at least one person clearly on left AND one clearly on right
+        if len(left_p) >= 1 and len(right_p) >= 1:
+            
+            # STABILITY CHECK: 
+            # In a panel, the speakers don't jump across the screen between frames.
+            # In sports, players run from left to right constantly.
+            # We compare the current set of X-centers to the previous probe.
+            if prev_centroids_x is not None:
+                # Simple check: Are the "Left" and "Right" groups roughly in the same place?
+                # If the average X position of the left group shifts by > 15% of width, it's likely sports.
+                avg_left_prev = np.mean(prev_centroids_x['left']) if prev_centroids_x['left'] else 0
+                avg_right_prev = np.mean(prev_centroids_x['right']) if prev_centroids_x['right'] else 1
+                
+                avg_left_curr = np.mean(left_p)
+                avg_right_curr = np.mean(right_p)
+                
+                shift_left = abs(avg_left_curr - avg_left_prev)
+                shift_right = abs(avg_right_curr - avg_right_prev)
+                
+                # If they moved significantly, it's not a static panel
+                if shift_left > 0.15 or shift_right > 0.15:
+                    prev_centroids_x = {'left': left_p, 'right': right_p}
+                    continue # Skip this frame as unstable
+                    
             stable_split_hits += 1
+            prev_centroids_x = {'left': left_p, 'right': right_p}
+        else:
+            prev_centroids_x = None
 
     # Require majority of probed frames AND stable L/R split in most of those
     majority = n_probe * 0.5
-    return multi_hits > majority and stable_split_hits > multi_hits * 0.6
+    # Also require that at least 70% of the "multi-person" frames were stable splits
+    stability_ratio = stable_split_hits / max(multi_hits, 1)
+    
+    return multi_hits > majority and stable_split_hits > majority and stability_ratio > 0.7
 
 # ─── Panel slot smoother (EMA + max-jump clamp) ────────────────────────────────
 class PanelSlotSmoother:
@@ -1288,7 +1333,7 @@ def detect_clips(
     _p(1.0, f"Found {len(segments)} clips ")
     return segments
 
-# ─── Analytics ────────────────────────────────────────────────────────────────
+# ─── Analytics ───────────────────────────────────────────────────────────────
 def get_analytics_meta(input_path: str, output_path: str) -> dict:
     """
     Return a dict with key metrics about the conversion, ready to feed
