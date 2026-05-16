@@ -1049,12 +1049,15 @@ if uploaded_file is not None and st.session_state.input_path:
 
     # ─── AUTO-CLIP ACTIONS ────────────────────────────────────────────────
     else:
-        # Ensure we have detected clips if we are in auto-clip mode
-        if not st.session_state.detected_clips:
+        # Check if we have detected clips. 
+        # Note: [] is falsy, so we check specifically for None to distinguish 
+        # between "not scanned yet" and "scanned but found nothing".
+        if st.session_state.detected_clips is None:
             st.session_state.scan_done = False
             st.warning("Clip data missing. Please scan again.")
-            st.stop()
-
+            # Don't stop here, let the flow continue to the "not scan_done" block below
+            # which will render the Scan button.
+        
         if not st.session_state.scan_done:
             b1, b2, b3 = st.columns([4, 4, 2])
             with b1:
@@ -1093,20 +1096,41 @@ if uploaded_file is not None and st.session_state.input_path:
                         confidence=confidence,
                         progress_callback=_scan_cb,
                     )
+                    
                     prog.progress(1.0)
-                    st.session_state.detected_clips          = clips
-                    st.session_state.selected_clip_indices   = set(range(len(clips)))
-                    st.session_state.scan_done               = True
-                    # Clear old results when scanning new clips
-                    st.session_state.clip_results            = None 
-                    status.success(f"✅ Found {len(clips)} clips!")
+                    
+                    # Handle empty results gracefully
+                    if not clips:
+                        status.warning("⚠ No clips detected. Try adjusting clip duration settings.")
+                        st.session_state.detected_clips = []
+                        st.session_state.selected_clip_indices = set()
+                        st.session_state.scan_done = True
+                    else:
+                        st.session_state.detected_clips          = clips
+                        st.session_state.selected_clip_indices   = set(range(len(clips)))
+                        st.session_state.scan_done               = True
+                        # Clear old results when scanning new clips
+                        st.session_state.clip_results            = None 
+                        status.success(f"✅ Found {len(clips)} clips!")
+                    
                     st.rerun()
                 except Exception as exc:
                     status.error(f"Scan error: {exc}")
+                    import traceback
+                    print(traceback.format_exc())
 
         else:
             clips = st.session_state.detected_clips or []
             
+            # If clips list is empty, show a message and allow re-scan
+            if not clips:
+                st.markdown('<div class="rf-warn">⚠ No clips were detected during the last scan. Please adjust settings and scan again.</div>', unsafe_allow_html=True)
+                if st.button("🔄 Adjust Settings & Re-scan", type="secondary"):
+                    st.session_state.scan_done = False
+                    st.session_state.detected_clips = None
+                    st.rerun()
+                st.stop()
+
             # Initialize selection if not present
             if st.session_state.selected_clip_indices is None:
                 st.session_state.selected_clip_indices = set(range(len(clips)))
@@ -1175,6 +1199,8 @@ if uploaded_file is not None and st.session_state.input_path:
                         st.rerun()
                     except Exception as exc:
                         status.error(f"Error: {exc}")
+                        import traceback
+                        print(traceback.format_exc())
 
             else:
                 results = st.session_state.clip_results
