@@ -33,6 +33,7 @@ CHANGES v3.0:
 
   ANALYTICS get_analytics_meta(input_path, output_path) → dict  ready to feed
             the companion analytics player widget.
+            ADDED: Jitter/Smoothness metrics calculated during processing.
 """
 
 from __future__ import annotations
@@ -972,16 +973,26 @@ def smooth_centers(centers, speeds, base_window=33, adaptive=True, scene_cuts=No
     SMOOTH-1/2/3: Three-stage pipeline per scene segment:
       1. Gaussian with velocity-adaptive window
       2. Bidirectional EMA to kill residual jitter
-    Scene cuts hard-reset segment boundaries so no bleed-through.
+    
+    Returns:
+      tuple: (smoothed_centers_list, metrics_dict)
     """
     if not centers or len(centers) < 3:
-        return list(centers) if centers else []
+        return list(centers) if centers else [], {"jitter_raw": 0, "jitter_smooth": 0, "smoothness_pct": 0, "max_jump_raw": 0}
+    
     n = len(centers)
     xs = np.array([c[0] for c in centers], dtype=float)
     ys = np.array([c[1] for c in centers], dtype=float)
     spd = np.array(speeds[:n], dtype=float)
     if len(spd) < n:
         spd = np.pad(spd, (0, n - len(spd)), mode="edge")
+
+    # Calculate Raw Jitter (standard deviation of frame-to-frame delta)
+    dx_raw = np.diff(xs)
+    dy_raw = np.diff(ys)
+    dist_raw = np.sqrt(dx_raw**2 + dy_raw**2)
+    jitter_raw = float(np.mean(dist_raw))
+    max_jump_raw = float(np.max(dist_raw)) if len(dist_raw) > 0 else 0
 
     bounds = [0] + sorted(set(scene_cuts or [])) + [n]
     rx, ry = xs.copy(), ys.copy()
@@ -998,7 +1009,25 @@ def smooth_centers(centers, speeds, base_window=33, adaptive=True, scene_cuts=No
         rx[s:e] = bx
         ry[s:e] = by
 
-    return [(int(x), int(y)) for x, y in zip(rx, ry)]
+    smoothed = [(int(x), int(y)) for x, y in zip(rx, ry)]
+
+    # Calculate Smoothed Jitter
+    dx_s = np.diff(rx)
+    dy_s = np.diff(ry)
+    dist_s = np.sqrt(dx_s**2 + dy_s**2)
+    jitter_smooth = float(np.mean(dist_s))
+    
+    # Smoothness Score: % reduction in jitter
+    smoothness_score = ((jitter_raw - jitter_smooth) / jitter_raw * 100) if jitter_raw > 0 else 0
+
+    metrics = {
+        "jitter_raw": round(jitter_raw, 2),       # Avg pixels moved per frame (raw)
+        "jitter_smooth": round(jitter_smooth, 2), # Avg pixels moved per frame (smoothed)
+        "smoothness_pct": round(smoothness_score, 1), # How much smoother it is
+        "max_jump_raw": round(max_jump_raw, 1)    # Worst case jump
+    }
+
+    return smoothed, metrics
 
 
 # ── Whisper / translate ───────────────────────────────────────────────────────
@@ -1494,6 +1523,9 @@ def process_video(
     last_out_frame = None
     rpt_n = max(1, total_frames // 40)
     fi = 0
+    
+    # Store smoothing metrics here
+    smooth_metrics = {}
 
     # --- Pass 1: detection only (panel skips this) ----------------------------
     # For single-subject/talking-head we collect ALL detection anchors first,
@@ -1590,7 +1622,7 @@ def process_video(
         _p(0.42, "Smoothing camera path...")
         if det_centers_raw:
             # Map detection indices to per-frame centres (linear interp)
-            smoothed_det = smooth_centers(
+            smoothed_det, smooth_metrics = smooth_centers(
                 det_centers_raw, frame_speeds,
                 base_window=smooth_window, adaptive=adaptive_smoothing,
                 scene_cuts=[i for i in scene_cuts if i < len(det_centers_raw)],
@@ -1690,13 +1722,22 @@ def process_video(
 
     _p(0.88, "Encoding...")
     _close_ffmpeg_encoder(proc, output_path)
+    
+    # Get standard analytics
+    analytics = get_analytics_meta(input_path, output_path)
+    
+    # Inject smoothing metrics if available
+    if smooth_metrics:
+        analytics.update(smooth_metrics)
+        
+    result_meta["analytics"] = analytics
+    
     _p(1.0, "Done!")
     print(
         f"Output: {output_path}  ({os.path.getsize(output_path)/1024**2:.1f} MB)"
         f"  cuts={len(scene_cuts)}  panel={is_panel}",
         file=sys.stderr,
     )
-    result_meta["analytics"] = get_analytics_meta(input_path, output_path)
     return result_meta
 
 
