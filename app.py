@@ -10,7 +10,7 @@ from verticalize import (
     process_video, get_video_info, detect_clips, process_clips_batch,
     RESOLUTION_PRESETS, SUBTITLE_STYLES, TRANSLATION_LANGUAGES,
     resolve_target_size, whisper_available, translation_available,
-    ClipSegment,  # Changed from ClipSection to ClipSegment
+    ClipSegment,
 )
 
 st.set_page_config(
@@ -557,13 +557,45 @@ if app_mode == "autoClip" and tab_analytics is not None:
                 
                 for i, r in enumerate(valid_results):
                     a = r["analytics"]
+                    
+                    # Extract smoothness metrics if available
+                    jitter_raw = a.get('jitter_raw', 0)
+                    jitter_smooth = a.get('jitter_smooth', 0)
+                    smoothness_pct = a.get('smoothness_pct', 0)
+                    
+                    # Determine color for smoothness score
+                    smooth_color_var = "var(--grn)" if smoothness_pct > 80 else ("var(--amb)" if smoothness_pct > 50 else "var(--acc)")
+
                     st.markdown(f"""
                  <div style="background:var(--surf);border:1px solid var(--bdr);border-radius:var(--rs);
-                padding:8px 12px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;">
-                   <div style="font-size:11px;font-weight:600;color:var(--ink);">Clip {i+1}</div>
-                   <div style="display:flex;gap:12px;font-size:10px;color:var(--ink2);">
-                     <span>{a['input_size_mb']:.1f} MB → <b>{a['output_size_mb']:.1f} MB</b></span>
-                     <span style="color:var(--grn);">{a['compression_ratio']:.2f}x</span>
+                padding:10px 12px;margin-bottom:8px;">
+                   <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                     <div style="font-size:11px;font-weight:700;color:var(--ink);">Clip {i+1}</div>
+                     <div style="display:flex; gap:10px; font-size:10px;">
+                       <span style="color:var(--ink2);">{a['input_size_mb']:.1f} MB → <b>{a['output_size_mb']:.1f} MB</b></span>
+                       <span style="color:var(--grn); font-weight:600;">{a['compression_ratio']:.2f}x</span>
+                     </div>
+                   </div>
+                   
+                   <!-- Smoothness Metrics Row -->
+                   <div style="margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--bdr);">
+                     <div style="font-size:9px; font-weight:700; color:var(--ink3); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:4px;">
+                       Camera Stability
+                     </div>
+                     <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:8px;">
+                       <div style="text-align:center;">
+                         <div style="font-size:10px; color:var(--ink2);">Smoothness</div>
+                         <div style="font-family:'DM Serif Display',serif; font-size:13px; color:{smooth_color_var}; font-weight:600;">{smoothness_pct:.1f}%</div>
+                       </div>
+                       <div style="text-align:center;">
+                         <div style="font-size:10px; color:var(--ink2);">Raw Jitter</div>
+                         <div style="font-family:'DM Serif Display',serif; font-size:13px; color:var(--ink);">{jitter_raw:.2f}px</div>
+                       </div>
+                       <div style="text-align:center;">
+                         <div style="font-size:10px; color:var(--ink2);">Smoothed</div>
+                         <div style="font-family:'DM Serif Display',serif; font-size:13px; color:var(--ink);">{jitter_smooth:.2f}px</div>
+                       </div>
+                     </div>
                    </div>
                  </div>
                  """, unsafe_allow_html=True)
