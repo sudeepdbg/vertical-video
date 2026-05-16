@@ -1,38 +1,26 @@
 """
-verticalize.py  —  AI Vertical Video converter  v3.0
+verticalize.py  —  AI Vertical Video converter  v3.1
 ──────────────────────────────────────────────────────
-CHANGES v3.0:
-  SMOOTH-1  Multi-pass smoothing pipeline: Gaussian → bidirectional EMA → velocity-
-            adaptive window. Removes jitter and micro-shake caused by per-frame
-            detection noise while preserving intentional camera motion.
-  SMOOTH-2  Per-axis velocity estimation; window adapts independently to horizontal
-            vs vertical camera speed, preventing over-smoothing on mostly-still shots.
-  SMOOTH-3  Shot-boundary-aware smoothing: scene cuts hard-reset the EMA state so
-            dissolve artefacts don't bleed across cuts.
-  SMOOTH-4  Sub-sample interpolation uses monotone cubic (PCHIP) instead of plain
-            Hermite so the path never overshoots (no oscillation around subjects).
+FIXES v3.1:
+  PANEL-FIX  Stricter panel detection: requires speakers to be ≥20% frame
+             height and the two largest subjects to be in opposite columns.
+             Prevents basketball / crowd false-positives.
+  PANEL-FIX  _group_union guards against empty lists; PanelSlotSmoother
+             freezes previous slot when group disappears instead of crashing.
 
-  PANEL-1   Podcast/news panel detector now uses a majority-vote over speaker-
-            region histograms: it counts frames where ≥2 persons occupy stable
-            left/right bounding columns, reducing false positives on crowd scenes.
-  PANEL-2   Per-slot EMA alpha lowered to 0.15 (was 0.25) and clamped to prevent
-            a new detection yanking an entire strip across the frame in one frame.
-  PANEL-3   Panel transition cross-fade: when the slot assignment changes (e.g.
-            speaker swap), a short alpha-blend masks the hard jump.
-  PANEL-4   Divider line is drawn last, after blending, so it is always sharp.
+  SMOOTH-FIX scene_cuts are now mapped to detection-indices before being
+             passed to smooth_centers, so Gaussian/EMA never bleeds across cuts.
+  SMOOTH-FIX Dense per-frame interpolation is done per scene segment so the
+             crop path does not linearly slide through a cut.
+  SMOOTH-FIX Bidirectional EMA alpha lowered 0.08→0.06 for less residual jitter.
+  SMOOTH-FIX Minimum velocity window clamped to 13 frames (was 9).
+  SMOOTH-FIX Crop coordinates use round() instead of int() truncation.
 
-  CLEAN-1   Removed unused _face_net / _haar_cascade fallback paths that were
-            never reached (talking_head now routes through the same detect_faces
-            helper but the prototxt / caffemodel paths are gone from cold start).
-  CLEAN-2   Removed dead _read_frame_at wrapper (inlined into callers).
-  CLEAN-3   Removed duplicate _build_ffmpeg_vf color-grade branches that were
-            never executed in panel mode.
-  CLEAN-4   Removed _cubic_hermite / interpolate_centers (replaced by PCHIP).
-  CLEAN-5   Removed vel-table look-up duplication between smooth_centers and
-            _ema_polish (merged into one smooth_centers call).
-
-  ANALYTICS get_analytics_meta(input_path, output_path) → dict  ready to feed
-            the companion analytics player widget.
+  CLEAN-6    Removed unused rule_of_thirds parameter from process_video and
+             process_clips_batch signatures.
+  CLEAN-7    _build_ffmpeg_vf simplified (color grade always handled in Python).
+  BATCH-FIX  process_clips_batch now forwards burn_subtitles, whisper_language,
+             subtitle_translate_to and output_fps to process_video.
 """
 
 from __future__ import annotations
@@ -101,15 +89,15 @@ TRANSLATION_LANGUAGES = {
 VIGNETTE_STRENGTH   = 0.55
 VIGNETTE_FALLOFF    = 1.8
 COLOR_GRADES        = ("none", "warm", "cool", "vibrant", "matte")
-PANEL_SLOT_EMA      = 0.15          # PANEL-2: reduced from 0.25
-PANEL_SLOT_MAX_JUMP = 0.25          # max fraction of strip width per frame
+PANEL_SLOT_EMA      = 0.15
+PANEL_SLOT_MAX_JUMP = 0.25
 KEN_BURNS_MAX_ZOOM  = 1.04
 KEN_BURNS_PERIOD    = 8.0
 DISSOLVE_FRAMES     = 3
 PANEL_DIVIDER_PX    = 3
 PANEL_DIVIDER_COLOR = (15, 15, 15)
 PANEL_CROP_EXPAND   = 1.55
-PANEL_TRANSITION_FRAMES = 6         # PANEL-3: slot-reassignment blend length
+PANEL_TRANSITION_FRAMES = 6
 
 
 # ── Segment class ─────────────────────────────────────────────────────────────
@@ -265,16 +253,8 @@ class DissolveBuffer:
 
 
 # ── FFmpeg post-filter chain ──────────────────────────────────────────────────
-def _build_ffmpeg_vf(color_grade="none", ffmpeg_sharpen=False):
+def _build_ffmpeg_vf(ffmpeg_sharpen=False):
     filters = []
-    eq_map = {
-        "warm":    "brightness=0.02:saturation=1.12:gamma_r=1.05:gamma_b=0.95",
-        "cool":    "brightness=0.01:saturation=1.08:gamma_r=0.95:gamma_b=1.05",
-        "vibrant": "brightness=0.0:saturation=1.25:contrast=1.05",
-        "matte":   "brightness=0.03:saturation=0.85:contrast=0.92",
-    }
-    if color_grade in eq_map:
-        filters.append(f"eq={eq_map[color_grade]}")
     if ffmpeg_sharpen:
         filters.append("unsharp=5:5:0.8:3:3:0.0")
     return filters
@@ -430,7 +410,7 @@ def _open_ffmpeg_encoder(
     vf = []
     if subtitle_path and os.path.exists(subtitle_path):
         s = subtitle_style or SUBTITLE_STYLES["Bold White (TikTok)"]
-        sesc = subtitle_path.replace("\\", "/").replace(":", "\\:")
+        sesc = subtitle_path.replace("\\", "/").replace(":", "\:")
         force = (
             f"Fontsize={s.get('fontsize', 18)},"
             f"PrimaryColour={s.get('primary_color', '&H00FFFFFF')},"
@@ -699,9 +679,9 @@ def _detect_panel_mode(
     confidence=0.45, n_probe=20,
 ):
     """
-    Returns True only when a majority of probed frames show ≥2 persons whose
+    Returns True only when a majority of probed frames show >=2 persons whose
     centres are stably split into left / right columns (i.e. podcast / news
-    desk), rather than triggering on fleeting crowd shots.
+    desk), rather than triggering on fleeting crowd scenes.
     """
     if model is None:
         return False
@@ -710,7 +690,6 @@ def _detect_panel_mode(
     stable_split_hits = 0
     det_w = min(orig_w, 640)
     det_h = max(1, int(det_w * orig_h / orig_w))
-    sx, sy = orig_w / det_w, orig_h / det_h
 
     for t in probe_ts:
         frame = _read_frame_at(input_path, orig_w, orig_h, t, scale_w=det_w, scale_h=det_h)
@@ -720,14 +699,24 @@ def _detect_panel_mode(
         if len(persons) < PANEL_MIN_PERSONS:
             continue
         multi_hits += 1
-        # Check stable left/right split: all centroids in distinct columns
-        centres_x = [(p[0] + p[2]) / 2 / det_w for p in persons]  # normalised 0-1
-        left_count  = sum(1 for c in centres_x if c < 0.45)
-        right_count = sum(1 for c in centres_x if c > 0.55)
-        if left_count >= 1 and right_count >= 1:
+        # Require speakers to be reasonably large and upright (filters out distant sports players)
+        h_thresh = det_h * 0.20
+        filtered = []
+        for p in persons:
+            ph = p[3] - p[1]
+            pw = p[2] - p[0]
+            if ph >= h_thresh and ph > pw * 0.5:
+                filtered.append(p)
+        if len(filtered) < PANEL_MIN_PERSONS:
+            continue
+        # Majority-vote on the two largest subjects being in opposite columns
+        filtered.sort(key=lambda b: (b[2]-b[0])*(b[3]-b[1]), reverse=True)
+        p1, p2 = filtered[0], filtered[1]
+        c1 = (p1[0] + p1[2]) / 2 / det_w
+        c2 = (p2[0] + p2[2]) / 2 / det_w
+        if (c1 < 0.42 and c2 > 0.58) or (c1 > 0.58 and c2 < 0.42):
             stable_split_hits += 1
 
-    # Require majority of probed frames AND stable L/R split in most of those
     majority = n_probe * 0.5
     return multi_hits > majority and stable_split_hits > multi_hits * 0.6
 
@@ -758,7 +747,10 @@ class PanelSlotSmoother:
 
         def _smooth(slot_idx, group):
             if not group:
-                return group
+                # Freeze slot if we have previous state, otherwise empty
+                if self._slots[slot_idx] is not None:
+                    return [tuple(int(v) for v in self._slots[slot_idx])]
+                return []
             u = _group_union(group)
             s = _ema_box(self._slots[slot_idx], u, strip_w)
             self._slots[slot_idx] = s
@@ -768,6 +760,8 @@ class PanelSlotSmoother:
 
 
 def _group_union(persons):
+    if not persons:
+        return (0, 0, 0, 0)
     return (
         min(p[0] for p in persons), min(p[1] for p in persons),
         max(p[2] for p in persons), max(p[3] for p in persons),
@@ -826,8 +820,8 @@ def _render_panel_frame(
     persons = sorted(persons, key=lambda b: (b[0] + b[2]) // 2)
     n = len(persons)
     if n == 0:
-        group_a = prev_slots[0] if prev_slots and prev_slots[0] else None
-        group_b = prev_slots[1] if prev_slots and prev_slots[1] else None
+        group_a = prev_slots[0] if prev_slots and prev_slots[0] else []
+        group_b = prev_slots[1] if prev_slots and prev_slots[1] else []
     elif n == 1:
         group_a = persons
         group_b = prev_slots[1] if prev_slots and prev_slots[1] else persons
@@ -915,17 +909,21 @@ def is_scene_change(prev, curr, threshold=0.35):
 def _vel_to_window(speed):
     t = VELOCITY_SMOOTH_TABLE
     if speed <= t[0][0]:
-        return t[0][1]
-    if speed >= t[-1][0]:
-        return t[-1][1]
-    for i in range(len(t) - 1):
-        v0, w0 = t[i]
-        v1, w1 = t[i + 1]
-        if v0 <= speed <= v1:
-            tt = (speed - v0) / (v1 - v0 + 1e-9)
-            w = int(w0 + tt * (w1 - w0))
-            return w if w % 2 == 1 else w + 1
-    return 33
+        w = t[0][1]
+    elif speed >= t[-1][0]:
+        w = t[-1][1]
+    else:
+        for i in range(len(t) - 1):
+            v0, w0 = t[i]
+            v1, w1 = t[i + 1]
+            if v0 <= speed <= v1:
+                tt = (speed - v0) / (v1 - v0 + 1e-9)
+                w = int(w0 + tt * (w1 - w0))
+                break
+        else:
+            w = 33
+    w = w if w % 2 == 1 else w + 1
+    return max(w, 13)  # minimum window clamp
 
 def _gauss_seg(xs, ys, window):
     n = len(xs)
@@ -994,7 +992,7 @@ def smooth_centers(centers, speeds, base_window=33, adaptive=True, scene_cuts=No
         w = max(_vel_to_window(float(np.median(spd[s:e]))) if adaptive else base_window, 13)
         gx, gy = _gauss_seg(xs[s:e], ys[s:e], w)
         # Stage 2: Bidirectional EMA
-        bx, by = _bidir_ema(gx, gy, alpha=0.08)
+        bx, by = _bidir_ema(gx, gy, alpha=0.06)
         rx[s:e] = bx
         ry[s:e] = by
 
@@ -1291,16 +1289,6 @@ def get_analytics_meta(input_path: str, output_path: str) -> dict:
     """
     Return a dict with key metrics about the conversion, ready to feed
     the companion analytics player widget.
-
-    Keys:
-      input_path, output_path,
-      input_size_mb, output_size_mb, compression_ratio,
-      input_duration_s, output_duration_s,
-      input_resolution, output_resolution,
-      input_fps, output_fps,
-      input_bitrate_kbps, output_bitrate_kbps,
-      has_audio,
-      file_size_reduction_pct,
     """
     def _info(p):
         try:
@@ -1353,7 +1341,7 @@ def process_video(
     target_preset_label="Match source (no upscale)",
     tracking_mode="subject", talking_head_bias=0.30,
     sample_interval=None, confidence=0.45, use_optical_flow=True,
-    smooth_window=33, adaptive_smoothing=True, rule_of_thirds=True,
+    smooth_window=33, adaptive_smoothing=True,
     scene_cut_threshold=0.35, output_fps=None, crf=23, encoder_preset="fast",
     audio_bitrate="128k", yolo_weights="yolov8n.pt",
     burn_subtitles=False, whisper_model="base", whisper_language=None,
@@ -1457,7 +1445,7 @@ def process_video(
             result_meta["panel_mode"] = True
             slot_smoother = PanelSlotSmoother()
 
-    extra_vf = _build_ffmpeg_vf(color_grade="none", ffmpeg_sharpen=ffmpeg_sharpen)
+    extra_vf = _build_ffmpeg_vf(ffmpeg_sharpen=ffmpeg_sharpen)
     _p(0.12, f"Single-pass detect+render ({total_frames} frames)...")
     style = SUBTITLE_STYLES.get(subtitle_style_name, SUBTITLE_STYLES["Bold White (TikTok)"])
     proc = _open_ffmpeg_encoder(
@@ -1494,11 +1482,6 @@ def process_video(
     last_out_frame = None
     rpt_n = max(1, total_frames // 40)
     fi = 0
-
-    # --- Pass 1: detection only (panel skips this) ----------------------------
-    # For single-subject/talking-head we collect ALL detection anchors first,
-    # then smooth the whole path, then do a second render pass.
-    # For panel mode we detect+render in one pass (as before) to avoid buffering.
 
     if not is_panel:
         _p(0.12, "Pass 1/2: detecting subjects...")
@@ -1589,24 +1572,42 @@ def process_video(
         # Smooth the full detection path
         _p(0.42, "Smoothing camera path...")
         if det_centers_raw:
-            # Map detection indices to per-frame centres (linear interp)
+            # Map frame indices -> detection indices so scene cuts align with the sparse array
+            frame_to_det_idx = {fi: idx for idx, fi in enumerate(det_frame_indices)}
+            scene_cuts_det = [frame_to_det_idx[f] for f in scene_cuts if f in frame_to_det_idx]
+
             smoothed_det = smooth_centers(
                 det_centers_raw, frame_speeds,
                 base_window=smooth_window, adaptive=adaptive_smoothing,
-                scene_cuts=[i for i in scene_cuts if i < len(det_centers_raw)],
+                scene_cuts=scene_cuts_det,
             )
-            # Build dense per-frame map via linear interpolation between detections
+            # Build dense per-frame map via per-segment interpolation (no bleed across cuts)
             dense_cx = np.full(total_frames, orig_w // 2, dtype=float)
             dense_cy = np.full(total_frames, orig_h // 2, dtype=float)
-            for k, fi_k in enumerate(det_frame_indices):
-                if fi_k < total_frames:
-                    dense_cx[fi_k] = smoothed_det[k][0]
-                    dense_cy[fi_k] = smoothed_det[k][1]
-            # Fill gaps with linear interp
             known = np.array(det_frame_indices)
             if len(known) >= 2:
-                dense_cx = np.interp(np.arange(total_frames), known, [smoothed_det[k][0] for k in range(len(known))])
-                dense_cy = np.interp(np.arange(total_frames), known, [smoothed_det[k][1] for k in range(len(known))])
+                seg_bounds = [0] + sorted(scene_cuts) + [total_frames]
+                for seg_i in range(len(seg_bounds) - 1):
+                    seg_start, seg_end = seg_bounds[seg_i], seg_bounds[seg_i + 1]
+                    mask = (known >= seg_start) & (known < seg_end)
+                    seg_known = known[mask]
+                    if len(seg_known) == 0:
+                        continue
+                    seg_idx = np.where(mask)[0]
+                    seg_x = [smoothed_det[k][0] for k in seg_idx]
+                    seg_y = [smoothed_det[k][1] for k in seg_idx]
+                    seg_frames = np.arange(seg_start, seg_end)
+                    if len(seg_known) >= 2:
+                        dense_cx[seg_frames] = np.interp(seg_frames, seg_known, seg_x)
+                        dense_cy[seg_frames] = np.interp(seg_frames, seg_known, seg_y)
+                    else:
+                        dense_cx[seg_frames] = seg_x[0]
+                        dense_cy[seg_frames] = seg_y[0]
+            else:
+                for k, fi_k in enumerate(det_frame_indices):
+                    if fi_k < total_frames:
+                        dense_cx[fi_k] = smoothed_det[k][0]
+                        dense_cy[fi_k] = smoothed_det[k][1]
         else:
             dense_cx = np.full(total_frames, orig_w // 2, dtype=float)
             dense_cy = np.full(total_frames, orig_h // 2, dtype=float)
@@ -1622,8 +1623,8 @@ def process_video(
                 if fi in scene_cuts and dissolve_buf and last_out_frame is not None:
                     dissolve_buf.on_cut(last_out_frame)
 
-                cur_cx = int(np.clip(dense_cx[fi], hw, orig_w - hw))
-                cur_cy = int(np.clip(dense_cy[fi], hh, orig_h - hh))
+                cur_cx = int(round(np.clip(dense_cx[fi], hw, orig_w - hw)))
+                cur_cy = int(round(np.clip(dense_cy[fi], hh, orig_h - hh)))
 
                 left = max(0, min(cur_cx - crop_w // 2, orig_w - crop_w))
                 top  = max(0, min(cur_cy - crop_h // 2, orig_h - crop_h))
@@ -1706,10 +1707,11 @@ def process_clips_batch(
     target_preset_label="720p   (720x1280  - HD)",
     tracking_mode="subject", talking_head_bias=0.30,
     confidence=0.45, smooth_window=33, adaptive_smoothing=True,
-    use_optical_flow=True, rule_of_thirds=True, crf=23, encoder_preset="fast",
+    use_optical_flow=True, crf=23, encoder_preset="fast",
     audio_bitrate="128k", yolo_weights="yolov8n.pt",
-    burn_subtitles=False, whisper_model="base",
+    burn_subtitles=False, whisper_model="base", whisper_language=None,
     subtitle_style_name="Bold White (TikTok)", subtitle_max_chars=42,
+    subtitle_translate_to=None,
     vignette_strength=VIGNETTE_STRENGTH, sharpen_strength=0.0,
     color_grade="none", ken_burns=False, dissolve_cuts=True, ffmpeg_sharpen=False,
     progress_callback=None,
@@ -1747,10 +1749,12 @@ def process_clips_batch(
                 tracking_mode=tracking_mode, talking_head_bias=talking_head_bias,
                 confidence=confidence, smooth_window=smooth_window,
                 adaptive_smoothing=adaptive_smoothing, use_optical_flow=use_optical_flow,
-                rule_of_thirds=rule_of_thirds, crf=crf, encoder_preset=encoder_preset,
+                crf=crf, encoder_preset=encoder_preset,
                 audio_bitrate=audio_bitrate, yolo_weights=yolo_weights,
                 burn_subtitles=burn_subtitles, whisper_model=whisper_model,
+                whisper_language=whisper_language,
                 subtitle_style_name=subtitle_style_name, subtitle_max_chars=subtitle_max_chars,
+                subtitle_translate_to=subtitle_translate_to,
                 vignette_strength=vignette_strength, sharpen_strength=sharpen_strength,
                 color_grade=color_grade, ken_burns=ken_burns, dissolve_cuts=dissolve_cuts,
                 ffmpeg_sharpen=ffmpeg_sharpen, progress_callback=clip_cb,
