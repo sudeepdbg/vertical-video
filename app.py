@@ -849,7 +849,7 @@ with col_out:
                    <div class="rf-an-item">
                      <div class="rf-an-label">Smoothed Jitter</div>
                      <div class="rf-an-val">{jitter_smooth:.2f} px</div>
-                     <div class="rf-an-sub">After processing {f"(Kalman: {a.get("kalman_predictions", 0)})" if a.get("kalman_predictions", 0) else ""}</div>
+                     <div class="rf-an-sub">After processing {f"(Kalman: {a.get('kalman_predictions', 0)})" if a.get('kalman_predictions', 0) else ""}</div>
                    </div>
                  </div>
                </div>
