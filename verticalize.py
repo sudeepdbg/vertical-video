@@ -560,7 +560,7 @@ def _open_ffmpeg_encoder(
     vf: List[str] = []
     if subtitle_path and os.path.exists(subtitle_path):
         s = subtitle_style or SUBTITLE_STYLES["Bold White (TikTok)"]
-        sesc = subtitle_path.replace("\", "/").replace(":", r"\:")
+        sesc = subtitle_path.replace("\\", "/").replace(":", r"\:")
         force = (
             f"Fontsize={s.get('fontsize', 18)},"
             f"PrimaryColour={s.get('primary_color', '&H00FFFFFF')},"
