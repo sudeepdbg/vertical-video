@@ -979,15 +979,22 @@ def is_sports_scene_change(
     Sports-specific scene change detection.
     Uses histogram comparison + pixel diff to catch hard broadcast cuts.
     Ignores brief flickers (scoreboard updates, flash photography).
+    Handles both grayscale and BGR input images.
     """
+    # Ensure image is 3-channel for histogram comparison
+    if len(curr.shape) == 2 or (len(curr.shape) == 3 and curr.shape[2] == 1):
+        curr_bgr = cv2.cvtColor(curr, cv2.COLOR_GRAY2BGR)
+    else:
+        curr_bgr = curr
+
     if prev is None:
-        hist = cv2.calcHist([curr], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+        hist = cv2.calcHist([curr_bgr], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
         hist = cv2.normalize(hist, hist).flatten()
         return False, hist, last_cut_frame
 
     pixel_diff = float(cv2.absdiff(prev, curr).mean()) / 255.0
 
-    curr_hist = cv2.calcHist([curr], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+    curr_hist = cv2.calcHist([curr_bgr], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
     curr_hist = cv2.normalize(curr_hist, curr_hist).flatten()
 
     hist_corr = 0.0
@@ -1616,15 +1623,22 @@ def is_scene_change(
     """
     Adaptive scene change detection.
     mode='sports' uses lower threshold and histogram comparison.
+    Handles both grayscale and BGR input images.
     """
+    # Ensure image is 3-channel for histogram comparison
+    if len(curr.shape) == 2 or curr.shape[2] == 1:
+        curr_bgr = cv2.cvtColor(curr, cv2.COLOR_GRAY2BGR)
+    else:
+        curr_bgr = curr
+
     if prev is None:
-        hist = cv2.calcHist([curr], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+        hist = cv2.calcHist([curr_bgr], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
         hist = cv2.normalize(hist, hist).flatten()
         return False, hist, last_cut_frame
 
     pixel_diff = float(cv2.absdiff(prev, curr).mean()) / 255.0
 
-    curr_hist = cv2.calcHist([curr], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+    curr_hist = cv2.calcHist([curr_bgr], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
     curr_hist = cv2.normalize(curr_hist, curr_hist).flatten()
 
     hist_corr = 0.0
