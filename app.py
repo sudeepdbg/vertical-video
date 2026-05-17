@@ -7,7 +7,7 @@ import tempfile
 import os
 import glob
 from verticalize import (
-    process_video, get_video_info, detect_clips, process_clips_batch,
+    process_video, process_sports_video, get_video_info, detect_clips, process_clips_batch,
     RESOLUTION_PRESETS, SUBTITLE_STYLES, TRANSLATION_LANGUAGES,
     resolve_target_size, whisper_available, translation_available,
     ClipSegment,
@@ -252,6 +252,7 @@ video { border-radius: var(--r) !important; width: 100% !important; }
 _DEFAULTS = dict(
     input_path=None, uploaded_file_name=None, video_info=None,
     app_mode="single", tracking_mode="subject",
+    sport_type="auto",
     # single-clip
     output_path=None, processing_done=False,
     output_bytes=None, srt_bytes=None, last_settings=None,
@@ -375,7 +376,63 @@ with tm2:
     if st.button("👤  Talking Head  ✦", type="secondary", use_container_width=True):
         st.session_state.tracking_mode = "talking_head"
 
+# NEW v4.0: Sports Action mode
+st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+tm3, tm4 = st.columns(2, gap="small")
+with tm3:
+    if st.button("🏀  Sports Action  ✦", type="secondary", use_container_width=True):
+        st.session_state.tracking_mode = "sports_action"
+with tm4:
+    if st.button("⚽  Sports (Ball-aware)", type="secondary", use_container_width=True):
+        st.session_state.tracking_mode = "sports_action"
+
+# Show sport type selector when in sports mode
+if tracking_mode == "sports_action":
+    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+    sport_type = st.selectbox(
+        "Sport Type",
+        ["auto", "basketball", "football", "soccer", "hockey"],
+        index=["auto", "basketball", "football", "soccer", "hockey"].index(
+            st.session_state.get("sport_type", "auto")
+        ),
+        help="Auto-detects playing surface. Select specific sport for better accuracy."
+    )
+    st.session_state.sport_type = sport_type
+else:
+    sport_type = st.session_state.get("sport_type", "auto")
+
 tracking_mode = st.session_state.tracking_mode
+
+# Show active tracking mode badge
+if tracking_mode == "sports_action":
+    sport_display = st.session_state.get("sport_type", "auto").title()
+    st.markdown(f"""
+    <div style="display:flex; align-items:center; gap:8px; margin-top:6px; margin-bottom:4px;">
+        <span style="background:var(--acc);color:#fff;font-size:10px;font-weight:700;
+                    letter-spacing:.1em;text-transform:uppercase;padding:3px 10px;border-radius:99px;">
+            🏀 Sports Action · {sport_display}
+        </span>
+        <span style="font-size:11px;color:var(--ink3);">Ball-aware · Kalman tracking</span>
+    </div>
+    """, unsafe_allow_html=True)
+elif tracking_mode == "talking_head":
+    st.markdown("""
+    <div style="margin-top:6px; margin-bottom:4px;">
+        <span style="background:var(--pur);color:#fff;font-size:10px;font-weight:700;
+                    letter-spacing:.1em;text-transform:uppercase;padding:3px 10px;border-radius:99px;">
+            👤 Talking Head
+        </span>
+    </div>
+    """, unsafe_allow_html=True)
+else:
+    st.markdown("""
+    <div style="margin-top:6px; margin-bottom:4px;">
+        <span style="background:var(--ink);color:#fff;font-size:10px;font-weight:700;
+                    letter-spacing:.1em;text-transform:uppercase;padding:3px 10px;border-radius:99px;">
+            🎯 Subject Tracking
+        </span>
+    </div>
+    """, unsafe_allow_html=True)
 
 # Settings tabs
 tab_list = ["🎞 Output", "🎯 Tracking", "📝 Subtitles", "⚙ Advanced"]
@@ -421,6 +478,30 @@ with tab_trk:
             rule_of_thirds      = st.toggle("Horizontal rule-of-thirds", value=True)
             confidence          = 0.5
             scene_cut_threshold = 0.35
+    elif tracking_mode == "sports_action":
+        # v4.0 SPORTS TRACKING SETTINGS
+        st.markdown("""
+        <div class="rf-info" style="margin-bottom:12px;">
+        🏀 <b>Sports Mode Active</b> — Ball-aware tracking with Kalman predictive smoothing.
+        </div>
+        """, unsafe_allow_html=True)
+        t1, t2 = st.columns(2, gap="medium")
+        with t1:
+            adaptive_smoothing  = st.toggle("Adaptive smoothing", value=True)
+            smooth_window       = st.slider("Smoothness", 3, 15, 5, 1)
+            confidence          = st.slider("Detection confidence", 0.10, 0.95, 0.45, 0.05)
+            use_ball_tracking   = st.toggle("Ball tracking", value=True, help="Prioritize ball carrier")
+        with t2:
+            use_optical_flow    = st.toggle("Optical flow fallback", value=True)
+            rule_of_thirds      = st.toggle("Look-room / Rule-of-thirds", value=True)
+            scene_cut_threshold = st.slider("Scene-cut sensitivity", 0.10, 0.60, 0.22, 0.05)
+            use_kalman          = st.toggle("Kalman prediction", value=True, help="Zero-lag predictive tracking")
+        talking_head_bias = 0.30
+        # Sports-specific defaults
+        ken_burns = False
+        vignette_strength = 0.275
+        sharpen_strength = 0.3
+        ffmpeg_sharpen = True
     else:
         t1, t2 = st.columns(2, gap="medium")
         with t1:
@@ -580,7 +661,7 @@ if app_mode == "autoClip" and tab_analytics is not None:
                    <!-- Smoothness Metrics Row -->
                    <div style="margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--bdr);">
                      <div style="font-size:9px; font-weight:700; color:var(--ink3); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:4px;">
-                       Camera Stability
+                       Camera Stability {sport_type_used.title() + " · " if sport_type_used else ""}Kalman: {kalman_preds}
                      </div>
                      <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:8px;">
                        <div style="text-align:center;">
@@ -609,6 +690,7 @@ st.markdown("</div>", unsafe_allow_html=True)  # close settings div
 # Settings fingerprint for change detection
 current_settings = dict(
     app_mode=app_mode, tracking_mode=tracking_mode,
+    sport_type=st.session_state.get("sport_type", "auto"),
     resolution_label=resolution_label, fps_label=fps_label, crf=crf,
     encoder_preset_label=encoder_preset_label,
     smooth_window=smooth_window, adaptive_smoothing=adaptive_smoothing,
@@ -751,7 +833,7 @@ with col_out:
                <!-- New Smoothness Metrics Row -->
                <div style="margin-top: 12px; border-top: 1px solid var(--bdr); padding-top: 12px;">
                  <div style="font-size: 10px; font-weight: 700; color: var(--ink3); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px;">
-                   Camera Stability
+                   Camera Stability {f"· 🏀 {sport_type_used.title()}" if sport_type_used else ""}
                  </div>
                  <div class="rf-an-grid">
                    <div class="rf-an-item">
@@ -767,7 +849,7 @@ with col_out:
                    <div class="rf-an-item">
                      <div class="rf-an-label">Smoothed Jitter</div>
                      <div class="rf-an-val">{jitter_smooth:.2f} px</div>
-                     <div class="rf-an-sub">After processing</div>
+                     <div class="rf-an-sub">After processing {f"(Kalman: {kalman_preds})" if kalman_preds else ""}</div>
                    </div>
                  </div>
                </div>
@@ -979,31 +1061,51 @@ if uploaded_file is not None and st.session_state.input_path:
                         prog.progress(min(v, 1.0))
                         if msg: status.info(msg)
 
-                    meta = process_video(
-                        st.session_state.input_path,
-                        st.session_state.output_path,
-                        target_preset_label=resolution_label,
-                        tracking_mode=tracking_mode,
-                        talking_head_bias=talking_head_bias,
-                        confidence=confidence,
-                        smooth_window=smooth_window,
-                        adaptive_smoothing=adaptive_smoothing,
-                        use_optical_flow=use_optical_flow,
-                        rule_of_thirds=rule_of_thirds,
-                        scene_cut_threshold=scene_cut_threshold,
-                        output_fps=output_fps,
-                        crf=crf,
-                        encoder_preset=encoder_preset_label,
-                        audio_bitrate=audio_bitrate_label,
-                        yolo_weights=yolo_weights,
-                        burn_subtitles=burn_subtitles,
-                        whisper_model=whisper_model,
-                        whisper_language=whisper_language,
-                        subtitle_style_name=subtitle_style_name,
-                        subtitle_max_chars=subtitle_max_chars,
-                        subtitle_translate_to=subtitle_translate_to,
-                        progress_callback=_cb,
-                    )
+                    # v4.0: Use process_sports_video for sports mode
+                    if tracking_mode == "sports_action":
+                        meta = process_sports_video(
+                            st.session_state.input_path,
+                            st.session_state.output_path,
+                            sport_type=st.session_state.get("sport_type", "auto"),
+                            target_preset_label=resolution_label,
+                            confidence=confidence,
+                            output_fps=output_fps,
+                            crf=crf,
+                            encoder_preset=encoder_preset_label,
+                            audio_bitrate=audio_bitrate_label,
+                            yolo_weights=yolo_weights,
+                            burn_subtitles=burn_subtitles,
+                            whisper_model=whisper_model,
+                            subtitle_style_name=subtitle_style_name,
+                            subtitle_max_chars=subtitle_max_chars,
+                            progress_callback=_cb,
+                        )
+                    else:
+                        meta = process_video(
+                            st.session_state.input_path,
+                            st.session_state.output_path,
+                            target_preset_label=resolution_label,
+                            tracking_mode=tracking_mode,
+                            talking_head_bias=talking_head_bias,
+                            confidence=confidence,
+                            smooth_window=smooth_window,
+                            adaptive_smoothing=adaptive_smoothing,
+                            use_optical_flow=use_optical_flow,
+                            rule_of_thirds=rule_of_thirds,
+                            scene_cut_threshold=scene_cut_threshold,
+                            output_fps=output_fps,
+                            crf=crf,
+                            encoder_preset=encoder_preset_label,
+                            audio_bitrate=audio_bitrate_label,
+                            yolo_weights=yolo_weights,
+                            burn_subtitles=burn_subtitles,
+                            whisper_model=whisper_model,
+                            whisper_language=whisper_language,
+                            subtitle_style_name=subtitle_style_name,
+                            subtitle_max_chars=subtitle_max_chars,
+                            subtitle_translate_to=subtitle_translate_to,
+                            progress_callback=_cb,
+                        )
                     prog.progress(1.0)
                     out_p = st.session_state.output_path
                     if os.path.exists(out_p) and os.path.getsize(out_p) > 0:
@@ -1191,6 +1293,7 @@ if uploaded_file is not None and st.session_state.input_path:
                             subtitle_style_name=subtitle_style_name,
                             subtitle_max_chars=subtitle_max_chars,
                             progress_callback=_batch_cb,
+                            sport_type=st.session_state.get("sport_type", "auto"),
                         )
                         prog.progress(1.0)
                         st.session_state.clip_results = results
