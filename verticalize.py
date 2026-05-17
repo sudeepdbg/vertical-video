@@ -1301,6 +1301,13 @@ def _detect_panel_mode(
     orig_h: int,
     confidence: float = 0.45,
     n_probe: int = PANEL_PROBE_COUNT,
+    # Flexible thresholds (NEW v4.1)
+    max_person_motion: float = PANEL_MAX_PERSON_MOTION,
+    min_person_area_frac: float = PANEL_MIN_PERSON_AREA_FRAC,
+    max_count_variance: float = PANEL_MAX_COUNT_VARIANCE,
+    stability_frac: float = PANEL_STABILITY_FRAC,
+    majority_frac: float = PANEL_MAJORITY_FRAC,
+    min_person_aspect: float = PANEL_MIN_PERSON_ASPECT,
 ) -> bool:
     """
     Return True only for genuine podcast / news-desk / interview layouts.
@@ -1384,15 +1391,15 @@ def _detect_panel_mode(
         return False
 
     majority_threshold = n_probe * PANEL_MAJORITY_FRAC
-    cond_ab = multi_hits > majority_threshold and stable_split_hits > majority_threshold
+    cond_ab = multi_hits > majority_threshold and stable_split_hits > int(n_probe * stability_frac)
     mean_motion = float(np.mean(motion_vals)) if motion_vals else 0.0
-    cond_c = mean_motion < PANEL_MAX_PERSON_MOTION
+    cond_c = mean_motion < max_person_motion
     mean_area = float(np.mean(area_vals)) if area_vals else 0.0
-    cond_d = mean_area >= PANEL_MIN_PERSON_AREA_FRAC
+    cond_d = mean_area >= min_person_area_frac
     count_std = float(np.std(count_vals)) if len(count_vals) > 1 else 0.0
-    cond_e = count_std <= PANEL_MAX_COUNT_VARIANCE
+    cond_e = count_std <= max_count_variance
     mean_aspect = float(np.mean(aspect_vals)) if aspect_vals else 0.0
-    cond_f = mean_aspect >= PANEL_MIN_PERSON_ASPECT
+    cond_f = mean_aspect >= min_person_aspect
 
     is_panel = cond_ab and cond_c and cond_d and cond_e and cond_f
     print(
@@ -2317,6 +2324,12 @@ def process_video(
     use_kalman: bool = False,
     use_ball_tracking: bool = False,
     field_mask_enabled: bool = False,
+    # NEW v4.1 panel mode parameters:
+    panel_mode_override: Optional[str] = None,  # "auto", "force_on", "force_off"
+    panel_max_motion: float = PANEL_MAX_PERSON_MOTION,
+    panel_min_area: float = PANEL_MIN_PERSON_AREA_FRAC,
+    panel_max_variance: float = PANEL_MAX_COUNT_VARIANCE,
+    panel_stability: float = PANEL_STABILITY_FRAC,
 ) -> Dict[str, Any]:
     """
     Convert a landscape video to vertical (9:16) with smart subject tracking.
@@ -2426,16 +2439,31 @@ def process_video(
     # ── Panel detection ────────────────────────────────────────────────────────
     is_panel     = False
     slot_smoother: Optional[PanelSlotSmoother] = None
+    # v4.1: Panel mode with override support
     if tracking_mode == "subject" and model_obj is not None:
-        _p(start_pct + 0.01, "Checking panel/group-shot...")
-        is_panel = _detect_panel_mode(
-            input_path, model_obj, fps, total_frames, orig_w, orig_h,
-            confidence, n_probe=PANEL_PROBE_COUNT,
-        )
-        if is_panel:
-            _p(start_pct + 0.02, "Panel mode - 2-row vertical split")
+        if panel_mode_override == "force_on":
+            _p(start_pct + 0.01, "Panel mode: FORCED ON")
+            is_panel = True
             result_meta["panel_mode"] = True
             slot_smoother = PanelSlotSmoother()
+        elif panel_mode_override == "force_off":
+            _p(start_pct + 0.01, "Panel mode: FORCED OFF")
+            is_panel = False
+        else:
+            # Auto-detect with flexible thresholds
+            _p(start_pct + 0.01, "Checking panel/group-shot...")
+            is_panel = _detect_panel_mode(
+                input_path, model_obj, fps, total_frames, orig_w, orig_h,
+                confidence, n_probe=PANEL_PROBE_COUNT,
+                max_person_motion=panel_max_motion,
+                min_person_area_frac=panel_min_area,
+                max_count_variance=panel_max_variance,
+                stability_frac=panel_stability,
+            )
+            if is_panel:
+                _p(start_pct + 0.02, "Panel mode - 2-row vertical split")
+                result_meta["panel_mode"] = True
+                slot_smoother = PanelSlotSmoother()
 
     # v4.0: Initialize sports-specific components
     kalman_tracker: Optional[SportsKalmanTracker] = None
@@ -2833,6 +2861,8 @@ def process_sports_video(
     dissolve_cuts: bool = True,
     ffmpeg_sharpen: bool = True,
     progress_callback=None,
+    # Panel params (sports doesn't use panel but pass through for consistency)
+    panel_mode_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Sports-optimized vertical video conversion.
@@ -2905,6 +2935,12 @@ def process_clips_batch(
     progress_callback=None,
     # NEW v4.0 sports parameters:
     sport_type: str = "",
+    # NEW v4.1 panel mode parameters:
+    panel_mode_override: Optional[str] = None,
+    panel_max_motion: float = PANEL_MAX_PERSON_MOTION,
+    panel_min_area: float = PANEL_MIN_PERSON_AREA_FRAC,
+    panel_max_variance: float = PANEL_MAX_COUNT_VARIANCE,
+    panel_stability: float = PANEL_STABILITY_FRAC,
 ) -> List[Dict[str, Any]]:
     """Process multiple ClipSegments in sequence; returns one result dict per clip."""
 
@@ -2956,6 +2992,11 @@ def process_clips_batch(
                 sport_type=sport_type,
                 use_kalman=(tracking_mode == "sports_action"),
                 use_ball_tracking=(tracking_mode == "sports_action"),
+                panel_mode_override=panel_mode_override,
+                panel_max_motion=panel_max_motion,
+                panel_min_area=panel_min_area,
+                panel_max_variance=panel_max_variance,
+                panel_stability=panel_stability,
             )
             meta["clip"] = clip
             results.append(meta)
