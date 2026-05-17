@@ -661,7 +661,7 @@ if app_mode == "autoClip" and tab_analytics is not None:
                    <!-- Smoothness Metrics Row -->
                    <div style="margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--bdr);">
                      <div style="font-size:9px; font-weight:700; color:var(--ink3); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:4px;">
-                       Camera Stability {st.session_state.get("sport_type", "").title() + " · " if st.session_state.get("sport_type") else ""}Kalman: {a.get("kalman_predictions", 0)}
+                       Camera Stability {st.session_state.get('sport_type', '').title() + ' · ' if st.session_state.get('sport_type') else ''}Kalman: {a.get('kalman_predictions', 0)}
                      </div>
                      <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:8px;">
                        <div style="text-align:center;">
@@ -833,7 +833,7 @@ with col_out:
                <!-- New Smoothness Metrics Row -->
                <div style="margin-top: 12px; border-top: 1px solid var(--bdr); padding-top: 12px;">
                  <div style="font-size: 10px; font-weight: 700; color: var(--ink3); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px;">
-                   Camera Stability {f"· 🏀 {st.session_state.get("sport_type", "").title()}" if st.session_state.get("sport_type") else ""}
+                   Camera Stability {f"· 🏀 {st.session_state.get('sport_type', '').title()}" if st.session_state.get('sport_type') else ""}
                  </div>
                  <div class="rf-an-grid">
                    <div class="rf-an-item">
