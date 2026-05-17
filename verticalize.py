@@ -981,18 +981,25 @@ def is_sports_scene_change(
     Ignores brief flickers (scoreboard updates, flash photography).
     Handles both grayscale and BGR input images.
     """
-    # Ensure image is 3-channel for histogram comparison
-    if len(curr.shape) == 2 or (len(curr.shape) == 3 and curr.shape[2] == 1):
-        curr_bgr = cv2.cvtColor(curr, cv2.COLOR_GRAY2BGR)
-    else:
-        curr_bgr = curr
+    # BUG-15 FIX: Ensure both images are 3-channel BGR before cv2.calcHist
+    def _ensure_bgr(img: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if img is None:
+            return None
+        if len(img.shape) == 2:
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        if img.shape[2] == 1:
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        return img
 
-    if prev is None:
+    curr_bgr = _ensure_bgr(curr)
+    prev_bgr = _ensure_bgr(prev)
+
+    if prev_bgr is None:
         hist = cv2.calcHist([curr_bgr], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
         hist = cv2.normalize(hist, hist).flatten()
         return False, hist, last_cut_frame
 
-    pixel_diff = float(cv2.absdiff(prev, curr).mean()) / 255.0
+    pixel_diff = float(cv2.absdiff(prev_bgr, curr_bgr).mean()) / 255.0
 
     curr_hist = cv2.calcHist([curr_bgr], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
     curr_hist = cv2.normalize(curr_hist, curr_hist).flatten()
@@ -1625,18 +1632,25 @@ def is_scene_change(
     mode='sports' uses lower threshold and histogram comparison.
     Handles both grayscale and BGR input images.
     """
-    # Ensure image is 3-channel for histogram comparison
-    if len(curr.shape) == 2 or curr.shape[2] == 1:
-        curr_bgr = cv2.cvtColor(curr, cv2.COLOR_GRAY2BGR)
-    else:
-        curr_bgr = curr
+    # BUG-15 FIX: Ensure both images are 3-channel BGR before cv2.calcHist
+    def _ensure_bgr(img: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if img is None:
+            return None
+        if len(img.shape) == 2:
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        if img.shape[2] == 1:
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        return img
 
-    if prev is None:
+    curr_bgr = _ensure_bgr(curr)
+    prev_bgr = _ensure_bgr(prev)
+
+    if prev_bgr is None:
         hist = cv2.calcHist([curr_bgr], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
         hist = cv2.normalize(hist, hist).flatten()
         return False, hist, last_cut_frame
 
-    pixel_diff = float(cv2.absdiff(prev, curr).mean()) / 255.0
+    pixel_diff = float(cv2.absdiff(prev_bgr, curr_bgr).mean()) / 255.0
 
     curr_hist = cv2.calcHist([curr_bgr], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
     curr_hist = cv2.normalize(curr_hist, curr_hist).flatten()
