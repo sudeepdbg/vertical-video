@@ -263,6 +263,12 @@ _DEFAULTS = dict(
     clip_out_dir=None,
     # vertical player: index of the clip currently being previewed (-1 = none)
     playing_clip_idx=-1,
+    # panel mode (v4.1)
+    panel_mode_override="auto",
+    panel_max_motion=20.0,
+    panel_min_area=0.03,
+    panel_max_variance=2.5,
+    panel_stability=0.60,
 )
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -433,6 +439,58 @@ else:
         </span>
     </div>
     """, unsafe_allow_html=True)
+
+# ── v4.1: Panel Mode Controls (only for Subject Tracking) ──
+if tracking_mode == "subject":
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    with st.expander("🎛 Panel Mode Settings", expanded=False):
+        st.caption("For news panels, podcasts, interviews with 2+ people")
+        panel_mode_override = st.radio(
+            "Panel mode",
+            ["auto", "force_on", "force_off"],
+            format_func=lambda x: {
+                "auto": "🤖 Auto-detect (recommended)",
+                "force_on": "✅ Force ON (2-row split)",
+                "force_off": "❌ Force OFF (single crop)",
+            }[x],
+            index=["auto", "force_on", "force_off"].index(
+                st.session_state.get("panel_mode_override", "auto")
+            ),
+            help="Auto = detect panel layout automatically. Force ON = always use 2-row split. Force OFF = never use split.",
+        )
+        st.session_state.panel_mode_override = panel_mode_override
+
+        if panel_mode_override == "auto":
+            st.markdown("<div style='font-size:11px;color:var(--ink3);margin-bottom:8px;'>Adjust detection sensitivity:</div>", unsafe_allow_html=True)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.session_state.panel_max_motion = st.slider(
+                    "Max motion (px)", 5.0, 40.0,
+                    float(st.session_state.get("panel_max_motion", 20.0)), 1.0,
+                    help="Higher = allow more movement (gesturing, leaning)"
+                )
+                st.session_state.panel_min_area = st.slider(
+                    "Min person area (%)", 0.01, 0.10,
+                    float(st.session_state.get("panel_min_area", 0.03)), 0.01,
+                    format="%.2f",
+                    help="Lower = detect smaller people in wide shots"
+                )
+            with c2:
+                st.session_state.panel_max_variance = st.slider(
+                    "Max count variance", 0.5, 5.0,
+                    float(st.session_state.get("panel_max_variance", 2.5)), 0.5,
+                    help="Higher = tolerate people entering/exiting frame"
+                )
+                st.session_state.panel_stability = st.slider(
+                    "Stability fraction", 0.30, 0.90,
+                    float(st.session_state.get("panel_stability", 0.60)), 0.05,
+                    format="%.2f",
+                    help="Lower = require less consistent positioning"
+                )
+        elif panel_mode_override == "force_on":
+            st.markdown('<div class="rf-info">Panel mode will split the frame into top/bottom strips, each cropped to 9:16. Best for 2-4 people seated side-by-side.</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="rf-info">Standard single-crop tracking will be used.</div>', unsafe_allow_html=True)
 
 # Settings tabs
 tab_list = ["🎞 Output", "🎯 Tracking", "📝 Subtitles", "⚙ Advanced"]
@@ -700,6 +758,12 @@ current_settings = dict(
     burn_subtitles=burn_subtitles,
     whisper_model=whisper_model if burn_subtitles else "",
     audio_bitrate_label=audio_bitrate_label,
+    # v4.1 panel settings
+    panel_mode_override=st.session_state.get("panel_mode_override", "auto"),
+    panel_max_motion=st.session_state.get("panel_max_motion", 20.0),
+    panel_min_area=st.session_state.get("panel_min_area", 0.03),
+    panel_max_variance=st.session_state.get("panel_max_variance", 2.5),
+    panel_stability=st.session_state.get("panel_stability", 0.60),
 )
 _invalidate_if_changed(current_settings)
 
@@ -799,6 +863,12 @@ with col_out:
                 a = st.session_state.analytics_data
                 red_pct = a['file_size_reduction_pct']
                 ratio = a['compression_ratio']
+
+                # v4.1: Show panel mode status
+                if a.get('panel_mode'):
+                    st.markdown('<div class="rf-ok">🎛 Panel mode active — 2-row vertical split</div>', unsafe_allow_html=True)
+                elif st.session_state.get('panel_mode_override') == 'force_on':
+                    st.markdown('<div class="rf-warn">🎛 Panel mode forced ON but not detected in output</div>', unsafe_allow_html=True)
                 
                 # Extract smoothness metrics if available
                 jitter_raw = a.get('jitter_raw', 0)
@@ -1079,6 +1149,7 @@ if uploaded_file is not None and st.session_state.input_path:
                             subtitle_style_name=subtitle_style_name,
                             subtitle_max_chars=subtitle_max_chars,
                             progress_callback=_cb,
+                            panel_mode_override=st.session_state.get("panel_mode_override", "auto"),
                         )
                     else:
                         meta = process_video(
@@ -1105,6 +1176,12 @@ if uploaded_file is not None and st.session_state.input_path:
                             subtitle_max_chars=subtitle_max_chars,
                             subtitle_translate_to=subtitle_translate_to,
                             progress_callback=_cb,
+                            # v4.1 panel mode params
+                            panel_mode_override=st.session_state.get("panel_mode_override", "auto"),
+                            panel_max_motion=st.session_state.get("panel_max_motion", 20.0),
+                            panel_min_area=st.session_state.get("panel_min_area", 0.03),
+                            panel_max_variance=st.session_state.get("panel_max_variance", 2.5),
+                            panel_stability=st.session_state.get("panel_stability", 0.60),
                         )
                     prog.progress(1.0)
                     out_p = st.session_state.output_path
@@ -1294,6 +1371,12 @@ if uploaded_file is not None and st.session_state.input_path:
                             subtitle_max_chars=subtitle_max_chars,
                             progress_callback=_batch_cb,
                             sport_type=st.session_state.get("sport_type", "auto"),
+                            # v4.1 panel mode params
+                            panel_mode_override=st.session_state.get("panel_mode_override", "auto"),
+                            panel_max_motion=st.session_state.get("panel_max_motion", 20.0),
+                            panel_min_area=st.session_state.get("panel_min_area", 0.03),
+                            panel_max_variance=st.session_state.get("panel_max_variance", 2.5),
+                            panel_stability=st.session_state.get("panel_stability", 0.60),
                         )
                         prog.progress(1.0)
                         st.session_state.clip_results = results
