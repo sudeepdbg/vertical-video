@@ -2622,10 +2622,10 @@ def process_video(
                             else:
                                 # v4.0: Use temporal saliency for sports
                                 if is_sports_mode:
-                                    sc_, _, prev_saliency = temporal_saliency_center(
+                                    sal_cx, sal_cy, prev_saliency = temporal_saliency_center(
                                         det_frame, prev_saliency
                                     )
-                                    anchor_cx, anchor_cy = int(sc_[0] * sx), int(sc_[1] * sy)
+                                    anchor_cx, anchor_cy = int(sal_cx * sx), int(sal_cy * sy)
                                 else:
                                     sc_ = saliency_center(det_frame)
                                     anchor_cx, anchor_cy = int(sc_[0] * sx), int(sc_[1] * sy)
