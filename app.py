@@ -386,6 +386,8 @@ with tm4:
     if st.button("⚽  Sports (Ball-aware)", type="secondary", use_container_width=True):
         st.session_state.tracking_mode = "sports_action"
 
+tracking_mode = st.session_state.tracking_mode
+
 # Show sport type selector when in sports mode
 if tracking_mode == "sports_action":
     st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
@@ -400,8 +402,6 @@ if tracking_mode == "sports_action":
     st.session_state.sport_type = sport_type
 else:
     sport_type = st.session_state.get("sport_type", "auto")
-
-tracking_mode = st.session_state.tracking_mode
 
 # Show active tracking mode badge
 if tracking_mode == "sports_action":
