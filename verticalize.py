@@ -85,12 +85,16 @@ LOWER_THIRD_GUARD = 0.80
 
 # Panel detection thresholds
 PANEL_MIN_PERSONS            = 2    # minimum persons per probe frame
-PANEL_PROBE_COUNT            = 24   # number of frames probed for panel detection
-PANEL_MAJORITY_FRAC          = 0.50 # fraction of probes that must show stable L/R split
-PANEL_STABILITY_FRAC         = 0.70 # fraction of multi-person frames that must be stable
-PANEL_MAX_PERSON_MOTION      = 12.0 # px/frame normalised to det_w — above this = sports
-PANEL_MIN_PERSON_AREA_FRAC   = 0.04 # person bbox must be ≥ 4 % of frame area (close-up)
-PANEL_MAX_COUNT_VARIANCE     = 2.5  # std-dev of person count across probes
+PANEL_PROBE_COUNT            = 30   # number of frames probed (more = more reliable)
+PANEL_MAJORITY_FRAC          = 0.60 # fraction of probes that must show stable L/R split
+PANEL_STABILITY_FRAC         = 0.75 # fraction of multi-person frames that must be stable
+PANEL_MAX_PERSON_MOTION      = 8.0  # px/frame in det_w space — sports easily exceeds 20+
+PANEL_MIN_PERSON_AREA_FRAC   = 0.06 # person bbox ≥ 6% of frame (panel guests are large/close)
+PANEL_MAX_COUNT_VARIANCE     = 1.5  # std-dev of person count — podcast=~0, sports=3–6
+# Aspect-ratio gate: in a panel, persons are standing/seated → tall bboxes (H/W > 1.3).
+# Sports players mid-action are often wide/crouched (H/W < 1.2). Require the mean
+# H/W ratio of detected persons to be above this threshold.
+PANEL_MIN_PERSON_ASPECT      = 1.3  # mean H/W of person bboxes must exceed this
 
 # Velocity → Gaussian smoothing window (frames). Wider = smoother but more lag.
 VELOCITY_SMOOTH_TABLE: List[Tuple[float, int]] = [
@@ -885,22 +889,53 @@ def _detect_panel_mode(
     det_h = max(1, int(det_w * orig_h / orig_w))
     frame_area = det_w * det_h
 
-    probe_ts = np.linspace(1.0, max(1.5, total_frames / fps - 1.0), n_probe)
+    # Spread probes across the video; skip first and last second (logos/fade)
+    end_t     = max(2.0, total_frames / fps - 1.0)
+    probe_ts  = np.linspace(1.0, end_t, n_probe)
 
-    multi_hits       = 0
+    multi_hits        = 0
     stable_split_hits = 0
-    motion_vals: List[float] = []
-    area_vals:   List[float] = []
-    count_vals:  List[int]   = []
+    motion_vals:  List[float] = []
+    area_vals:    List[float] = []
+    aspect_vals:  List[float] = []   # (f) NEW: H/W ratio of person bboxes
+    count_vals:   List[int]   = []
+    # Per-person centroid tracking across ALL consecutive probe pairs for motion
+    prev_centres_xy: Optional[List[Tuple[float, float]]] = None
     prev_split: Optional[Dict[str, List[float]]] = None
 
     for t in probe_ts:
         frame = _read_frame_at(input_path, orig_w, orig_h, t, scale_w=det_w, scale_h=det_h)
         if frame is None:
+            prev_centres_xy = None
+            prev_split = None
             continue
 
         persons = detect_persons_all(frame, model, confidence)
         count_vals.append(len(persons))
+
+        # (c) Motion: track ALL person centroids across every consecutive probe pair,
+        # not just when L/R split happens to exist. This catches sports reliably
+        # even during close-up two-player shots.
+        curr_centres_xy = [(( p[0] + p[2]) / 2 / det_w, (p[1] + p[3]) / 2 / det_h)
+                           for p in persons]
+        if prev_centres_xy is not None and curr_centres_xy:
+            # Greedy nearest-neighbour matching between prev and curr centroids
+            matched_dists: List[float] = []
+            used_curr = set()
+            for px, py in prev_centres_xy:
+                best_d, best_j = 1e9, -1
+                for j, (cx, cy) in enumerate(curr_centres_xy):
+                    if j in used_curr:
+                        continue
+                    d = math.sqrt((px - cx)**2 + (py - cy)**2)
+                    if d < best_d:
+                        best_d, best_j = d, j
+                if best_j >= 0:
+                    matched_dists.append(best_d * det_w)   # convert to px
+                    used_curr.add(best_j)
+            if matched_dists:
+                motion_vals.append(float(np.mean(matched_dists)))
+        prev_centres_xy = curr_centres_xy if persons else None
 
         if len(persons) < PANEL_MIN_PERSONS:
             prev_split = None
@@ -909,27 +944,23 @@ def _detect_panel_mode(
 
         # (d) average bbox area relative to frame
         areas = [(p[2] - p[0]) * (p[3] - p[1]) for p in persons]
-        mean_area_frac = float(np.mean(areas)) / frame_area
-        area_vals.append(mean_area_frac)
+        area_vals.append(float(np.mean(areas)) / frame_area)
 
-        # Normalised X centres
+        # (f) mean aspect ratio of person bboxes (H/W)
+        aspects = [(p[3] - p[1]) / max(p[2] - p[0], 1) for p in persons]
+        aspect_vals.append(float(np.mean(aspects)))
+
+        # Normalised X centres for L/R split check
         centres_x = [(p[0] + p[2]) / 2 / det_w for p in persons]
         left_x  = [c for c in centres_x if c < 0.40]
         right_x = [c for c in centres_x if c > 0.60]
 
         if left_x and right_x:
             if prev_split is not None:
-                # (b) stability: did the column positions shift?
                 shift_l = abs(np.mean(left_x)  - np.mean(prev_split["left"]))  if prev_split["left"]  else 0.0
                 shift_r = abs(np.mean(right_x) - np.mean(prev_split["right"])) if prev_split["right"] else 0.0
-
-                # (c) motion proxy: normalised movement of column centres
-                motion = (shift_l + shift_r) / 2 * det_w  # convert to px
-                motion_vals.append(motion)
-
-                if shift_l <= 0.12 and shift_r <= 0.12:
+                if shift_l <= 0.10 and shift_r <= 0.10:
                     stable_split_hits += 1
-
             prev_split = {"left": left_x, "right": right_x}
         else:
             prev_split = None
@@ -939,22 +970,34 @@ def _detect_panel_mode(
 
     majority_threshold = n_probe * PANEL_MAJORITY_FRAC
 
-    # (a) + (b): enough frames with stable L/R split
+    # (a)+(b): enough frames AND stable L/R column split
     cond_ab = multi_hits > majority_threshold and stable_split_hits > majority_threshold
 
-    # (c) low motion — mean inter-frame column movement in pixels
+    # (c) low overall person motion across all probes
     mean_motion = float(np.mean(motion_vals)) if motion_vals else 0.0
     cond_c = mean_motion < PANEL_MAX_PERSON_MOTION
 
-    # (d) persons are large in frame (close-up / seated)
+    # (d) persons are large in frame (seated/close-up guests)
     mean_area = float(np.mean(area_vals)) if area_vals else 0.0
     cond_d = mean_area >= PANEL_MIN_PERSON_AREA_FRAC
 
-    # (e) count is stable (not fluctuating like sports)
+    # (e) person count is stable (podcast always has 2; sports varies wildly)
     count_std = float(np.std(count_vals)) if len(count_vals) > 1 else 0.0
     cond_e = count_std <= PANEL_MAX_COUNT_VARIANCE
 
-    return cond_ab and cond_c and cond_d and cond_e
+    # (f) persons have tall bboxes (standing/seated); sports players are often
+    #     crouched, running, or partially cropped → lower H/W ratio
+    mean_aspect = float(np.mean(aspect_vals)) if aspect_vals else 0.0
+    cond_f = mean_aspect >= PANEL_MIN_PERSON_ASPECT
+
+    is_panel = cond_ab and cond_c and cond_d and cond_e and cond_f
+    print(
+        f"[panel_detect] multi={multi_hits} stable={stable_split_hits} "
+        f"motion={mean_motion:.1f}px area={mean_area:.3f} "
+        f"count_std={count_std:.2f} aspect={mean_aspect:.2f} → panel={is_panel}",
+        file=sys.stderr,
+    )
+    return is_panel
 
 
 # ─── Panel slot smoother ───────────────────────────────────────────────────────
