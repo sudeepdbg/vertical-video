@@ -1,12 +1,11 @@
 """
-verticalize.py — AI Vertical Video Converter v4.3.1 (Fixed Kalman Tracking)
+verticalize.py — AI Vertical Video Converter v4.3 (Improved Sports Smoothing)
 ───────────────────────────────────────────────────────────────────────────────
-FIXES over v4.3:
-1. Fixed double _stale_count increment on Mahalanobis outlier rejection.
-2. Added per-frame prediction tracking for accurate metrics.
-3. Improved initialization: uses saliency center instead of screen center.
-4. Reordered detect-then-predict cycle for cleaner Kalman flow.
-5. Fixed kalman_prediction_frames metric to use internal counter.
+IMPROVEMENTS over v4.2:
+1. STRICT PREDICT-UPDATE CYCLE: Ensures no double-prediction or skipped steps.
+2. ADAPTIVE PROCESS NOISE: Increases Q when velocity is high to reduce lag during fast sports action.
+3. MAHALANOBIS GATING: Rejects YOLO outliers (glitches) that would cause sudden jerks.
+4. VELOCITY CLAMPING: Prevents state explosion during long occlusions.
 """
 from __future__ import annotations
 
@@ -711,12 +710,11 @@ def detect_faces(
 class SportsKalmanTracker:
     """
     2-D constant-acceleration Kalman filter with per-frame prediction.
-
-    FIXES v4.3.1:
-    1. Removed double _stale_count increment on Mahalanobis outlier rejection.
-    2. Added per-frame prediction tracking for accurate metrics.
-    3. Improved initialization with saliency fallback instead of screen center.
-    4. Clean predict-update cycle: detect first, then predict or predict+update.
+    
+    IMPROVEMENTS v4.3:
+    1. Adaptive Process Noise (Q): Increases Q when velocity is high to reduce lag.
+    2. Mahalanobis Gating: Rejects outlier measurements that cause jerks.
+    3. Velocity Clamping: Prevents state explosion during occlusions.
     """
 
     def __init__(self, dt: float = 1.0) -> None:
@@ -732,31 +730,27 @@ class SportsKalmanTracker:
         ], dtype=np.float64)
         self.H = np.array([[1, 0, 0, 0, 0, 0],
                            [0, 1, 0, 0, 0, 0]], dtype=np.float64)
-
+        
         # Base Process Noise
         self.Q_base  = np.eye(6, dtype=np.float64) * KALMAN_PROCESS_NOISE_BASE
         self.Q_base[4, 4] *= 4.0 # Acceleration noise
         self.Q_base[5, 5] *= 4.0
-
+        
         # Measurement Noise (R) per sensor
         self.R_yolo      = np.eye(2, dtype=np.float64) * KALMAN_MEASUREMENT_NOISE
         self.R_optical   = np.eye(2, dtype=np.float64) * KALMAN_OPTICAL_FLOW_NOISE
         self.R_saliency  = np.eye(2, dtype=np.float64) * KALMAN_SALIENCY_NOISE
-
+        
         # State Covariance
         self.P  = np.eye(6, dtype=np.float64) * KALMAN_INITIAL_ERROR
         self.x  = np.zeros((6, 1), dtype=np.float64)
-
+        
         self.initialized  = False
         self._stale_count = 0
         self._last_sensor = "none"
-
+        
         # For adaptive Q
         self._prev_speed = 0.0
-
-        # FIX v4.3.1: Track per-frame state for accurate metrics
-        self._prediction_frames = 0
-        self._outlier_rejections = 0
 
     def init(self, cx: float, cy: float) -> None:
         self.x = np.array([[cx], [cy], [0.0], [0.0], [0.0], [0.0]], dtype=np.float64)
@@ -765,23 +759,22 @@ class SportsKalmanTracker:
         self._stale_count = 0
         self._last_sensor = "init"
         self._prev_speed = 0.0
-        self._prediction_frames = 0
-        self._outlier_rejections = 0
 
     def predict(self, steps: int = 1) -> Tuple[float, float]:
         """Return predicted position `steps` frames ahead."""
         if not self.initialized:
             return 0.0, 0.0
-
+        
+        # Use current state for prediction calculation
         dt_s = self.dt * steps
         x_pred = self.x.copy()
-
+        
         # Constant acceleration model prediction
         x_pred[0] += self.x[2] * dt_s + 0.5 * self.x[4] * dt_s**2
         x_pred[1] += self.x[3] * dt_s + 0.5 * self.x[5] * dt_s**2
         x_pred[2] += self.x[4] * dt_s
         x_pred[3] += self.x[5] * dt_s
-
+        
         return float(x_pred[0, 0]), float(x_pred[1, 0])
 
     def _predict_step(self) -> None:
@@ -790,7 +783,7 @@ class SportsKalmanTracker:
             self.x = self.F @ self.x
             self.P = self.F @ self.P @ self.F.T + self.Q_base
             self._stale_count += 1
-
+            
             # Clamp velocity to prevent explosion during long dropouts
             max_vel = 200.0 # pixels per frame
             if abs(self.x[2,0]) > max_vel: self.x[2,0] = np.sign(self.x[2,0]) * max_vel
@@ -802,9 +795,6 @@ class SportsKalmanTracker:
         """
         Process measurement; returns filtered position.
         Implements Mahalanobis gating to reject outliers.
-
-        FIX v4.3.1: Removed double _stale_count increment on outlier rejection.
-        The _stale_count was already incremented by _predict_step() (via increment_stale).
         """
         if not self.initialized:
             self.init(cx, cy)
@@ -822,42 +812,40 @@ class SportsKalmanTracker:
         # Innovation (measurement residual)
         z = np.array([[cx], [cy]], dtype=np.float64)
         y = z - self.H @ self.x
-
+        
         # Innovation Covariance
         S = self.H @ self.P @ self.H.T + R
-
+        
         # Mahalanobis Distance for Gating
+        # If distance is too large, the measurement is likely an error (glitch)
         inv_S = np.linalg.inv(S)
         mahalanobis_dist = np.sqrt(float(y.T @ inv_S @ y))
-
+        
         if mahalanobis_dist > KALMAN_GATE_THRESHOLD:
             # Reject measurement as outlier. Keep prediction.
-            # FIX v4.3.1: Do NOT increment _stale_count here - it was already
-            # incremented by _predict_step() via increment_stale().
-            self._outlier_rejections += 1
-            self._prediction_frames += 1
+            # Optionally increase stale count to reflect uncertainty
+            self._stale_count += 1
             return float(self.x[0,0]), float(self.x[1,0])
 
         # Kalman Gain
         K = self.P @ self.H.T @ inv_S
-
+        
         # State Update
         self.x = self.x + K @ y
         self.P = (np.eye(6, dtype=np.float64) - K @ self.H) @ self.P
-
+        
         self._stale_count = 0
         self._last_sensor = sensor
-
+        
         # Update adaptive speed metric
         vx, vy = float(self.x[2,0]), float(self.x[3,0])
         self._prev_speed = math.sqrt(vx*vx + vy*vy)
-
+        
         return float(self.x[0, 0]), float(self.x[1, 0])
 
     def increment_stale(self) -> None:
         """Call when no measurement is available this frame. Advances prediction."""
         self._predict_step()
-        self._prediction_frames += 1
 
     @property
     def is_stale(self) -> bool:
@@ -876,15 +864,9 @@ class SportsKalmanTracker:
     def last_sensor(self) -> str:
         return self._last_sensor
 
-    @property
-    def prediction_frame_count(self) -> int:
-        """Return number of frames that were pure predictions (no measurement update)."""
-        return self._prediction_frames
 
-    @property
-    def outlier_rejection_count(self) -> int:
-        """Return number of measurements rejected by Mahalanobis gating."""
-        return self._outlier_rejections
+# ─── Court/field boundary detection ──────────────────────────────────────────
+
 def detect_field_of_play(
     frame: np.ndarray, sport_hint: str = "auto",
 ) -> Optional[np.ndarray]:
@@ -2105,7 +2087,6 @@ def get_analytics_meta(
     subtitle_language: str = "", vignette_strength: float = VIGNETTE_STRENGTH,
     crf: int = 23, encoder_preset: str = "fast",
     sport_type: str = "", kalman_predictions: int = 0,
-    kalman_outlier_rejections: int = 0,
     panel_orientation: str = "horizontal",
 ) -> Dict[str, Any]:
     def _safe_info(p: str) -> Dict[str, Any]:
@@ -2156,7 +2137,6 @@ def get_analytics_meta(
         "max_jump_raw":            smooth_metrics.get("max_jump_raw",  0.0) if smooth_metrics else 0.0,
         "sport_type":              sport_type,
         "kalman_predictions":      kalman_predictions,
-        "kalman_outlier_rejections": kalman_outlier_rejections,
     }
     return meta
 
@@ -2380,7 +2360,7 @@ def process_video(
     rpt_n           = max(1, total_frames // 40)
 
     # ════════════════════════════════════════════════════════════════════════════
-    # NON-PANEL PATH: Per-frame Kalman tracking (FIXED v4.3.1)
+    # NON-PANEL PATH: Per-frame Kalman tracking (v4.3 architecture)
     # ════════════════════════════════════════════════════════════════════════════
     if not is_panel:
         _p(0.12, "Pass 1/2: per-frame tracking...")
@@ -2388,9 +2368,6 @@ def process_video(
         # Pre-allocate per-frame Kalman output arrays
         dense_kalman_cx = np.full(total_frames, orig_w // 2, dtype=np.float32)
         dense_kalman_cy = np.full(total_frames, orig_h // 2, dtype=np.float32)
-
-        # FIX v4.3.1: Track which frames had detections vs predictions
-        frame_had_detection = np.zeros(total_frames, dtype=bool)
 
         # For non-sports mode, we still need the old detection arrays
         det_centers_raw:  List[Tuple[int, int]] = []
@@ -2437,14 +2414,27 @@ def process_video(
 
                     prev_gray2 = cg
 
-                # ── STEP 1: DETECT (If sample frame) ─────────────────────────
-                # FIX v4.3.1: Detect FIRST, then decide whether to predict or update
-                anchor_cx = anchor_cy = None
-                sensor_type = "none"
-                had_detection = False
+                # ── STEP 1: ALWAYS PREDICT (Per-frame) ─────────────────────────
+                # This advances the physics model by one frame.
+                if is_sports_mode and kalman_tracker is not None:
+                    if not kalman_tracker.initialized:
+                        # Initialize with center if not yet started
+                        kalman_tracker.init(orig_w // 2, orig_h // 2)
+                    
+                    # Predict current state based on previous state
+                    kalman_tracker.increment_stale()
+                    
+                    # Get prediction for THIS frame
+                    kx, ky = kalman_tracker.predict(steps=0) # Current state estimate
+                    dense_kalman_cx[fi2] = float(np.clip(kx, 0, orig_w))
+                    dense_kalman_cy[fi2] = float(np.clip(ky, 0, orig_h))
 
+                # ── STEP 2: DETECT & UPDATE (If sample frame) ──────────────────
                 if is_sample:
-                    # ── Per-mode detection ─────────────────────────────────
+                    anchor_cx = anchor_cy = None
+                    sensor_type = "yolo"
+
+                    # ── Per-mode detection ─────────────────────────────────────
                     if tracking_mode == "talking_head":
                         faces = detect_faces(det_frame, confidence_thresh=0.5)
                         if faces:
@@ -2455,8 +2445,6 @@ def process_video(
                             r = talking_head_center(faces_orig, orig_w, orig_h, crop_w, crop_h, talking_head_bias)
                             if r:
                                 anchor_cx, anchor_cy = r
-                                sensor_type = "face"
-                                had_detection = True
                         if anchor_cx is None and use_optical_flow:
                             sm = cv2.resize(cg, (max(1, det_w//2), max(1, det_h//2)))
                             if prev_flow2 is not None:
@@ -2464,7 +2452,6 @@ def process_video(
                                 if fc:
                                     anchor_cx, anchor_cy = int(fc[0]*2*sx), int(fc[1]*2*sy)
                                     sensor_type = "optical_flow"
-                                    had_detection = True
                             prev_flow2 = sm
 
                     elif tracking_mode == "sports_action":
@@ -2482,8 +2469,17 @@ def process_video(
                             )
                             last_det2         = (anchor_cx, anchor_cy)
                             prev_ball_carrier = ball_carrier
-                            sensor_type = "yolo"
-                            had_detection = True
+
+                            # NEW v4.3: Update Kalman with YOLO measurement (high trust)
+                            if kalman_tracker is not None:
+                                # The update method internally handles gating and correction
+                                kalman_tracker.update(anchor_cx, anchor_cy, sensor="yolo")
+                                
+                                # After update, the internal state is corrected. 
+                                # We overwrite the prediction with the corrected state for this frame.
+                                kx, ky = kalman_tracker.predict(steps=0)
+                                dense_kalman_cx[fi2] = float(np.clip(kx, 0, orig_w))
+                                dense_kalman_cy[fi2] = float(np.clip(ky, 0, orig_h))
 
                             # Record event flag
                             if event_detector is not None and ball_box is not None:
@@ -2502,7 +2498,11 @@ def process_video(
                                 if fc:
                                     anchor_cx, anchor_cy = int(fc[0]*2*sx), int(fc[1]*2*sy)
                                     sensor_type = "optical_flow"
-                                    had_detection = True
+                                    if kalman_tracker is not None and kalman_tracker.initialized:
+                                        kalman_tracker.update(anchor_cx, anchor_cy, sensor="optical_flow")
+                                        kx, ky = kalman_tracker.predict(steps=0)
+                                        dense_kalman_cx[fi2] = float(np.clip(kx, 0, orig_w))
+                                        dense_kalman_cy[fi2] = float(np.clip(ky, 0, orig_h))
                             prev_flow2 = sm
 
                         # Saliency fallback
@@ -2510,7 +2510,11 @@ def process_video(
                             sal_cx, sal_cy, prev_saliency = temporal_saliency_center(det_frame, prev_saliency)
                             anchor_cx, anchor_cy = int(sal_cx*sx), int(sal_cy*sy)
                             sensor_type = "saliency"
-                            had_detection = True
+                            if kalman_tracker is not None and kalman_tracker.initialized:
+                                kalman_tracker.update(anchor_cx, anchor_cy, sensor="saliency")
+                                kx, ky = kalman_tracker.predict(steps=0)
+                                dense_kalman_cx[fi2] = float(np.clip(kx, 0, orig_w))
+                                dense_kalman_cy[fi2] = float(np.clip(ky, 0, orig_h))
 
                     else:
                         # Standard subject tracking
@@ -2523,8 +2527,6 @@ def process_video(
                                     orig_w, orig_h, crop_w, crop_h,
                                 )
                                 last_det2 = (anchor_cx, anchor_cy)
-                                sensor_type = "yolo"
-                                had_detection = True
                         if anchor_cx is None and use_optical_flow:
                             sm = cv2.resize(cg, (max(1, det_w//2), max(1, det_h//2)))
                             if prev_flow2 is not None:
@@ -2532,13 +2534,11 @@ def process_video(
                                 if fc:
                                     anchor_cx, anchor_cy = int(fc[0]*2*sx), int(fc[1]*2*sy)
                                     sensor_type = "optical_flow"
-                                    had_detection = True
                             prev_flow2 = sm
                         if anchor_cx is None:
                             sc_ = saliency_center(det_frame)
                             anchor_cx, anchor_cy = int(sc_[0]*sx), int(sc_[1]*sy)
                             sensor_type = "saliency"
-                            had_detection = True
 
                     # Store detection for legacy smoothing path (non-sports)
                     if not is_sports_mode and anchor_cx is not None:
@@ -2551,35 +2551,8 @@ def process_video(
                         frame_speeds.append(spd)
                         prev_c = (anchor_cx, anchor_cy)
 
-                # ── STEP 2: KALMAN PREDICT/UPDATE ────────────────────────────
-                # FIX v4.3.1: Clean predict-update cycle
-                if is_sports_mode and kalman_tracker is not None:
-                    if not kalman_tracker.initialized:
-                        # FIX v4.3.1: Initialize with first detection if available,
-                        # otherwise use saliency center, not just screen center
-                        if anchor_cx is not None:
-                            kalman_tracker.init(anchor_cx, anchor_cy)
-                        else:
-                            # Use temporal saliency for better initial guess
-                            sal_cx, sal_cy, _ = temporal_saliency_center(det_frame, None)
-                            kalman_tracker.init(int(sal_cx*sx), int(sal_cy*sy))
-
-                    if had_detection and anchor_cx is not None:
-                        # Predict then Update (standard Kalman cycle)
-                        kalman_tracker.increment_stale()  # Predict step
-                        kalman_tracker.update(anchor_cx, anchor_cy, sensor=sensor_type)  # Update step
-                        frame_had_detection[fi2] = True
-                    else:
-                        # No detection: just predict
-                        kalman_tracker.increment_stale()
-
-                    # Read current state (filtered if updated, predicted if not)
-                    kx, ky = kalman_tracker.predict(steps=0)
-                    dense_kalman_cx[fi2] = float(np.clip(kx, 0, orig_w))
-                    dense_kalman_cy[fi2] = float(np.clip(ky, 0, orig_h))
-
                     # For sports mode with Kalman, prev_c tracks the measurement source
-                    if had_detection:
+                    elif is_sports_mode and anchor_cx is not None:
                         prev_c = (anchor_cx, anchor_cy)
 
                 fi2 += 1
@@ -2614,7 +2587,7 @@ def process_video(
                 dense_cx     = np.interp(all_frames, known_frames, known_cx)
                 dense_cy     = np.interp(all_frames, known_frames, known_cy)
         else:
-            # Sports mode with Kalman
+            # NEW v4.3: For sports mode, Kalman IS the smoother
             dense_cx = dense_kalman_cx.astype(float)
             dense_cy = dense_kalman_cy.astype(float)
 
@@ -2623,9 +2596,12 @@ def process_video(
             jitter_raw = float(np.mean(np.sqrt(dx_raw**2 + dy_raw**2)))
             max_jump = float(np.max(np.sqrt(dx_raw**2 + dy_raw**2))) if len(dx_raw) > 0 else 0.0
 
-            # FIX v4.3.1: Use the tracker's internal counter for accurate prediction frames
-            pred_count = kalman_tracker.prediction_frame_count if kalman_tracker else 0
-            outlier_count = kalman_tracker.outlier_rejection_count if kalman_tracker else 0
+            # Count how many frames were pure predictions vs updates
+            pred_count = sum(1 for i in range(total_frames) 
+                           if kalman_tracker is not None and 
+                           kalman_tracker.initialized and
+                           i > 0 and  
+                           getattr(kalman_tracker, '_stale_count', 0) > 0)
 
             smooth_metrics = {
                 "jitter_raw": round(jitter_raw, 2),
@@ -2633,9 +2609,7 @@ def process_video(
                 "smoothness_pct": 30.0,
                 "max_jump_raw": round(max_jump, 1),
                 "kalman_prediction_frames": pred_count,
-                "kalman_outlier_rejections": outlier_count,
             }
-            _p(0.42, f"Kalman path: jitter={jitter_raw:.1f}px, predictions={pred_count}, outliers={outlier_count}")
             _p(0.42, f"Kalman path: jitter={jitter_raw:.1f}px, predictions={pred_count}")
 
         # ── Render pass ────────────────────────────────────────────────────────
@@ -2754,7 +2728,6 @@ def process_video(
         crf=crf, encoder_preset=encoder_preset,
         sport_type=sport_type if is_sports_mode else "",
         kalman_predictions=smooth_metrics.get("kalman_prediction_frames", 0),
-        kalman_outlier_rejections=smooth_metrics.get("kalman_outlier_rejections", 0),
         panel_orientation=panel_orient,
     )
     result_meta["analytics"] = analytics
