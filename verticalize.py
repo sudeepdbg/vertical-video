@@ -3,11 +3,10 @@ verticalize.py — AI Vertical Video Converter v4.4 (Sports Intelligence Engine)
 ───────────────────────────────────────────────────────────────────────────────
 IMPROVEMENTS over v4.3:
 1. PLAY PHASE DETECTION: Distinguishes Fast Break vs. Half Court to adjust prediction horizon.
-2. ADAPTIVE PREDICTION HORIZON: Looks further ahead during fast breaks (0.8s) vs set plays (0.3s).
+2. BALL TRAJECTORY PHYSICS: Predicts landing spot of high-arcing balls (shots/passses).
 3. COURT-AWARE RESET: Resets tracker to court center-of-mass on scene cuts, not last position.
 4. ADAPTIVE Q (Lightweight IMM): Inflates process noise during high-jerk events to reduce lag.
 5. HIGH-FREQ SAMPLING: Sports mode now samples at ~2Hz (fps/15) instead of 0.2Hz.
-6. BUG FIX: Corrected process_sports_video arguments.
 """
 from __future__ import annotations
 
@@ -2908,32 +2907,20 @@ def process_sports_video(
     - Ken Burns disabled (causes motion sickness on fast-paced content)
     """
     return process_video(
-        input_path=input_path, 
-        output_path=output_path,
+        input_path=input_path, output_path=output_path,
         target_preset_label=target_preset_label,
-        tracking_mode=tracking_mode, 
-        confidence=confidence,
-        output_fps=output_fps, 
-        crf=crf, 
-        encoder_preset=encoder_preset,
-        audio_bitrate=audio_bitrate, 
-        yolo_weights=yolo_weights,
-        burn_subtitles=burn_subtitles, 
-        whisper_model=whisper_model,
-        subtitle_style_name=subtitle_style_name, 
-        subtitle_max_chars=subtitle_max_chars,
-        vignette_strength=vignette_strength, 
-        sharpen_strength=sharpen_strength,
-        color_grade=color_grade, 
-        ken_burns=ken_burns,
-        dissolve_cuts=dissolve_cuts, 
-        ffmpeg_sharpen=ffmpeg_sharpen,
+        tracking_mode=tracking_mode, confidence=confidence,
+        output_fps=output_fps, crf=crf, encoder_preset=encoder_preset,
+        audio_bitrate=audio_bitrate, yolo_weights=yolo_weights,
+        burn_subtitles=burn_subtitles, whisper_model=whisper_model,
+        subtitle_style_name=subtitle_style_name, subtitle_max_chars=subtitle_max_chars,
+        vignette_strength=vignette_strength, sharpen_strength=sharpen_strength,
+        color_grade=color_grade, ken_burns=ken_burns,
+        dissolve_cuts=dissolve_cuts, ffmpeg_sharpen=ffmpeg_sharpen,
         progress_callback=progress_callback,
         sport_type=sport_type,
-        use_kalman=True, 
-        use_ball_tracking=True,
+        use_kalman=True, use_ball_tracking=True,
         field_mask_enabled=(sport_type != "auto"),
-        # FIX: Pass PanelModeConfig object instead of invalid keyword arg
         panel_config=PanelModeConfig(split_mode="force_off"),
     )
 
