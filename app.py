@@ -26,32 +26,32 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=DM+Serif+Display:ital@0;1&display=swap');
 
 :root {
---bg:       #f8f7f4;
---surf:     #ffffff;
---surf2:    #f0ede8;
---surf3:    #e8e4dd;
---ink:      #18150f;
---ink2:     #5c5449;
---ink3:     #9c9080;
---bdr:        #e2ddd6;
---bdr2:     #ccc6bc;
---acc:      #e05a1a;
---acc-l:    #fdf1eb;
---acc-d:    #b84511;
---grn:      #1e7a4f;
---grn-l:    #edf7f1;
---pur:      #5b3fc7;
---pur-l:    #f1eefb;
---amb:      #c87800;
---amb-l:    #fdf6e7;
---r:        12px;
---rs:       8px;
+    --bg:       #f8f7f4;
+    --surf:     #ffffff;
+    --surf2:    #f0ede8;
+    --surf3:    #e8e4dd;
+    --ink:      #18150f;
+    --ink2:     #5c5449;
+    --ink3:     #9c9080;
+    --bdr:       #e2ddd6;
+    --bdr2:     #ccc6bc;
+    --acc:      #e05a1a;
+    --acc-l:    #fdf1eb;
+    --acc-d:    #b84511;
+    --grn:      #1e7a4f;
+    --grn-l:    #edf7f1;
+    --pur:      #5b3fc7;
+    --pur-l:    #f1eefb;
+    --amb:      #c87800;
+    --amb-l:    #fdf6e7;
+    --r:        12px;
+    --rs:       8px;
 }
 *, *::before, *::after { box-sizing: border-box; }
 html, body, [class*="css"] {
-font-family: 'DM Sans', sans-serif !important;
-background: var(--bg) !important;
-color: var(--ink) !important;
+    font-family: 'DM Sans', sans-serif !important;
+    background: var(--bg) !important;
+    color: var(--ink) !important;
 }
 .stApp { background: var(--bg) !important; }
 .main .block-container { padding: 0 !important; max-width: 100% !important; }
@@ -62,17 +62,17 @@ section[data-testid="stSidebar"] { display: none !important; }
 
 /* Topbar */
 .rf-top { height:52px; background:var(--surf); border-bottom:1px solid var(--bdr);
-display:flex; align-items:center; justify-content:space-between;
-padding:0 20px; position:sticky; top:0; z-index:200; }
+    display:flex; align-items:center; justify-content: space-between;
+    padding:0 20px; position:sticky; top:0; z-index:200; }
 .rf-logo { display:flex; align-items:center; gap:9px; }
-.rf-mark { width:28px; height:28px; border-radius:8px; background:var(--ink);
-display:flex; align-items:center; justify-content:center; }
+.rf-mark { width:28px; height:28px; border-radius:8px;  background:var(--ink);
+    display:flex; align-items:center; justify-content:center; }
 .rf-name { font-family:'DM Serif Display',serif; font-size:17px; color:var(--ink); letter-spacing:-0.01em; }
 .rf-tag  { font-size:11px; color:var(--ink3); }
 
 /* Section label */
 .rf-sec { font-size:10px; font-weight:700; letter-spacing:0.13em; text-transform:uppercase;
-color: var(--ink3); margin-bottom:10px; display:flex; align-items:center; gap:8px; }
+    color: var(--ink3); margin-bottom:10px; display:flex; align-items:center; gap:8px; }
 .rf-sec::after { content:''; flex:1; height:1px; background:var(--bdr); }
 
 /* Mode description */
@@ -86,27 +86,27 @@ color: var(--ink3); margin-bottom:10px; display:flex; align-items:center; gap:8p
 
 /* Upload */
 [data-testid="stFileUploader"] {
-background: var(--surf) !important;
-border: 2px dashed var(--bdr2) !important;
-border-radius: var(--r) !important;
+    background: var(--surf) !important;
+    border: 2px dashed var(--bdr2) !important;
+    border-radius: var(--r) !important;
 }
 [data-testid="stFileUploader"]:hover {
-border-color: var(--acc) !important;
-background: var(--acc-l) !important;
+    border-color: var(--acc) !important;
+    background: var(--acc-l) !important;
 }
 [data-testid="stFileUploadDropzone"] { padding: 22px 14px !important; }
 [data-testid="stFileUploadDropzone"] * {
-color: var(--ink3) !important;
-font-family: 'DM Sans', sans-serif !important;
-font-size: 12px !important;
+    color: var(--ink3) !important;
+    font-family: 'DM Sans', sans-serif !important;
+    font-size: 12px !important;
 }
 [data-testid="stVideo"] { border-radius: var(--r) !important; overflow: hidden !important; }
 video { border-radius: var(--r) !important; width: 100% !important; }
 
 /* Metrics */
 .rf-metrics { display:grid; grid-template-columns:repeat(4,1fr);
-gap:1px; background:var(--bdr); border:1px solid var(--bdr);
-border-radius:var(--r); overflow:hidden; }
+    gap:1px; background:var(--bdr); border:1px solid var(--bdr);
+    border-radius:var(--r); overflow:hidden; }
 .rf-m { background:var(--surf); padding:10px 12px; }
 .rf-ml { font-size:9px; font-weight:700; letter-spacing:0.1em; text-transform:uppercase; color:var(--ink3); margin-bottom:3px; }
 .rf-mv { font-family:'DM Serif Display',serif; font-size:16px; color:var(--ink); letter-spacing:-0.02em; }
@@ -114,9 +114,9 @@ border-radius:var(--r); overflow:hidden; }
 
 /* Analytics Card */
 .rf-analytics { background:var(--surf); border:1px solid var(--bdr); border-radius:var(--r);
-padding:16px; margin-top:12px; }
+    padding:16px; margin-top:12px; }
 .rf-an-title { font-size:11px; font-weight:700; color:var(--ink3); text-transform:uppercase;
-letter-spacing:0.1em; margin-bottom:12px; display:flex; align-items:center; gap:6px; }
+    letter-spacing:0.1em; margin-bottom:12px; display:flex; align-items:center; gap:6px; }
 .rf-an-grid { display:grid; grid-template-columns:repeat(3, 1fr); gap:12px; }
 .rf-an-item { background:var(--surf2); padding:10px; border-radius:var(--rs); }
 .rf-an-label { font-size:10px; color:var(--ink2); margin-bottom:4px; }
@@ -127,50 +127,50 @@ letter-spacing:0.1em; margin-bottom:12px; display:flex; align-items:center; gap:
 
 /* Callouts */
 .rf-ok  { background:var(--grn-l); border:1px solid #9fd4b8; border-radius:var(--rs);
-padding:9px 12px; font-size:12px; color:var(--grn); display:flex; align-items:center;
-gap:8px; font-weight:600; margin-bottom:8px; }
+    padding:9px 12px; font-size:12px; color:var(--grn); display:flex; align-items:center;
+    gap:8px; font-weight:600; margin-bottom:8px; }
 .rf-warn { background:#fff8ec; border:1px solid #f5cc80; border-radius:var(--rs);
-padding:9px 12px; font-size:12px; color:#8a5a10; margin-bottom:8px; }
+    padding:9px 12px; font-size:12px; color:#8a5a10; margin-bottom:8px; }
 .rf-info { background:#eef3ff; border:1px solid #b0bef5; border-radius:var(--rs);
-padding:9px 12px; font-size:12px; color:#2a3fa0; margin-bottom:8px; }
-.rf-purp { background:var(--pur-l); border:1px solid #c8b8f0; border-radius:var(--rs);
-padding:9px 12px; font-size:12px; color:var(--pur); margin-bottom:8px; }
+    padding:9px 12px; font-size:12px; color:#2a3fa0; margin-bottom:8px; }
+.rf-purp {  background:var(--pur-l); border:1px solid #c8b8f0; border-radius:var(--rs);
+    padding:9px 12px; font-size:12px; color:var(--pur); margin-bottom:8px; }
 
 /* Empty state */
-.rf-empty { background:var(--surf); border:2px dashed var(--bdr2); border-radius:var(--r);
-padding:40px 20px; text-align:center; display:flex; flex-direction:column;
-align-items:center; gap: 7px; min-height:180px; justify-content:center; }
+.rf-empty {  background:var(--surf); border:2px dashed var(--bdr2); border-radius:var(--r);
+    padding:40px 20px; text-align:center; display:flex; flex-direction:column;
+    align-items:center; gap:7px; min-height:180px; justify-content:center; }
 .rf-empty-icon { width:44px; height:44px; background:var(--surf2); border:1.5px solid var(--bdr);
-border-radius:12px; font-size:20px; display:flex; align-items:center; justify-content:center; margin-bottom:3px; }
+    border-radius:12px; font-size:20px;  display:flex; align-items:center; justify-content:center; margin-bottom:3px; }
 .rf-empty-h { font-family:'DM Serif Display',serif; font-size:15px; color:var(--ink3); }
-.rf-empty-s { font-size:11px; color:var(--ink3); opacity:0.7; }
+.rf-empty-s  { font-size:11px; color:var(--ink3); opacity:0.7; }
 
 /* Clip cards */
 .rf-ccard { background:var(--surf); border:1.5px solid var(--bdr); border-radius:var(--r);
-padding:12px; margin-bottom:8px; position:relative; }
-.rf-ccard.sel { border-color:var(--acc); background:var(--acc-l); }
+    padding:12px; margin-bottom:8px; position:relative; }
+.rf-ccard.sel  { border-color:var(--acc); background:var(--acc-l); }
 .rf-ccard.done { border-color:var(--grn); background:var(--grn-l); }
 .rf-cscore { position:absolute; top:10px; right:10px; font-size:10px; font-weight:700;
-padding:2px 7px; border-radius:99px; color:#fff; background:var(--ink); }
+    padding:2px 7px; border-radius:99px; color:#fff; background:var(--ink); }
 .rf-cscore.h { background:var(--acc); }
 .rf-cscore.m { background:var(--amb); }
 .rf-ctitle { font-size:11px; font-weight:700; color:var(--ink); margin-bottom:4px; padding-right:50px; }
-.rf-cmeta { font-size:10px; color:var(--ink3); line-height:1.5; }
-.rf-cdur { display:inline-block; background:var(--surf2); border:1px solid var(--bdr);
-border-radius:4px; font-size:10px; font-weight:700; color:var(--ink2); padding:1px 6px; margin-top:5px; }
-.rf-csoi { display:inline-block; background:var(--pur-l); border:1px solid #c8b8f0;
-border-radius:4px; font-size:10px; font-weight:600; color:var(--pur); padding:1px 6px; margin-top:5px; margin-left:4px; }
+.rf-cmeta  { font-size:10px; color:var(--ink3); line-height:1.5; }
+.rf-cdur   { display:inline-block; background:var(--surf2); border:1px solid var(--bdr);
+    border-radius:4px; font-size:10px; font-weight:700; color:var(--ink2); padding:1px 6px; margin-top:5px; }
+.rf-csoi   { display:inline-block; background:var(--pur-l); border:1px solid #c8b8f0;
+    border-radius:4px; font-size:10px; font-weight:600; color:var(--pur); padding:1px 6px; margin-top:5px; margin-left:4px; }
 
 /* Buttons */
-.stButton >button { font-family:'DM Sans',sans-serif !important; border-radius:var(--rs) !important; font-weight:600 !important; font-size:13px !important; transition:all 0.15s !important; }  
-.stButton >button[kind="primary"] { background:var(--ink) !important; color:#fff !important; border:none !important; padding:10px 20px !important; }
-.stButton >button[kind="primary"]:hover { background:#000 !important; transform:translateY(-1px) !important; }
+.stButton >button { font-family:'DM Sans',sans-serif !important; border-radius:var(--rs) !important; font-weight:600 !important; font-size:13px !important; transition:all 0.15s !important; } 
+.stButton >button[kind="primary"]   { background:var(--ink) !important; color:#fff !important; border:none !important; padding:10px 20px !important; }
+.stButton >button[kind="primary"]:hover  { background:#000 !important; transform:translateY(-1px) !important; }
 .stButton >button[kind="primary"]:disabled { background:var(--bdr2) !important; color:var(--ink3) !important; transform:none !important; }
 .stButton >button[kind="secondary"] { background:var(--surf) !important; color:var(--ink2) !important; border:1.5px solid var(--bdr2) !important; }
 .stButton >button[kind="secondary"]:hover { border-color:var(--acc) !important; color:var(--acc) !important; }
 .stDownloadButton >button { background:var(--grn) !important; color:#fff !important; border:none !important;
-border-radius:var(--rs) !important; font-family:'DM Sans',sans-serif !important; font-weight:600 !important;
-font-size:13px !important; padding:10px 18px !important; width:100% !important; transition:all 0.15s !important; }
+    border-radius:var(--rs) !important; font-family:'DM Sans',sans-serif !important; font-weight:600 !important;
+    font-size:13px !important; padding:10px 18px !important; width:100% !important; transition:all 0.15s !important; }
 .stDownloadButton >button:hover { background:#165c3a !important; transform:translateY(-1px) !important; }
 
 .stProgress >div >div >div { background:var(--acc) !important; border-radius:99px; }
@@ -197,51 +197,51 @@ font-size:13px !important; padding:10px 18px !important; width:100% !important; 
 
 /* Chip */
 .rf-chip { display:inline-flex; align-items:center; gap:6px; background:var(--surf2);
-border:1px solid var(--bdr); border-radius:6px; padding:4px 9px; font-size:11px; color:var(--ink2); }
+    border:1px solid var(--bdr); border-radius:6px; padding:4px 9px; font-size:11px; color:var(--ink2); }
 .rf-chip strong { color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:200px; }
 
 /* Safe-zone badge */
 .rf-safe { display:inline-flex; align-items:center; gap:4px; background:var(--grn-l);
-border:1px solid #9fd4b8; border-radius:4px; padding:2px 7px;
-font-size: 10px; font-weight:600; color:var(--grn); }
+    border:1px solid #9fd4b8; border-radius:4px; padding:2px 7px;
+    font-size: 10px; font-weight:600; color:var(--grn); }
 
 /* Footer */
 .rf-foot { margin-top:32px; padding:12px 20px; border-top:1px solid var(--bdr);
-display:flex; align-items:center; justify-content:space-between; }
+    display:flex; align-items:center; justify-content:space-between; }
 .rf-tech { display:flex; gap:5px; flex-wrap:wrap; }
 .rf-tech span { font-size:9px; font-weight:700; letter-spacing:0.1em; text-transform:uppercase;
-padding: 3px 7px; border:1px solid var(--bdr); border-radius:4px; color:var(--ink3); }
+    padding: 3px 7px; border:1px solid var(--bdr); border-radius:4px; color:var(--ink3); }
 
 /* Layout panels */
-.rf-panel { padding:14px 20px; }
+.rf-panel  { padding:14px 20px; }
 .rf-panelr { padding:14px 20px 14px 10px; }
 
 @media (max-width:768px) {
-.rf-panel, .rf-panelr { padding:12px 14px; }
-.rf-metrics { grid-template-columns:repeat(2,1fr); }
-.rf-an-grid { grid-template-columns:1fr; }
+    .rf-panel, .rf-panelr { padding:12px 14px; }
+    .rf-metrics { grid-template-columns:repeat(2,1fr); }
+    .rf-an-grid { grid-template-columns:1fr; }
 }
-.stCaption, small { color:var(--ink3) !important; font-size:10px !important; }
+.stCaption,  small { color:var(--ink3) !important; font-size:10px !important; }
 [data-testid="stHorizontalBlock"] { gap:10px !important; }
 
 /* Radio buttons */
 [data-testid="stRadio"] label { font-size:12px !important; color:var(--ink2) !important; }
 [data-testid="stRadio"] [data-testid="stMarkdownContainer"] p { font-size:12px !important; }
-[data-testid="stRadio"] > div { gap:6px !important; }
+[data-testid="stRadio"]  > div { gap:6px !important; }
 
 /* Vertical 9:16 player — height matches landscape player (~360px) so width = 360*9/16 = 202px */
 .rf-vplayer { width:202px; flex-shrink:0; }
 .rf-vplayer [data-testid="stVideo"] {
-border-radius:10px !important;
-overflow:hidden !important;
-height:360px !important;
+    border-radius:10px !important;
+    overflow:hidden !important;
+    height:360px !important;
 }
 .rf-vplayer video {
-width:202px !important;
-height:360px !important;
-object-fit:cover !important;
-border-radius:10px !important;
-display:block !important;
+    width:202px !important;
+    height:360px !important;
+    object-fit:cover !important;
+    border-radius:10px !important;
+    display:block !important;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -339,7 +339,7 @@ app_mode = st.session_state.app_mode
 
 if app_mode == "single":
     st.markdown("""
-<div class="rf-mode-box acc">
+ <div class="rf-mode-box acc">
  <span style="font-size:16px">📱</span>
  <div>
  <div class="rf-mode-h acc">Single Clip</div>
@@ -349,13 +349,13 @@ Subject tracking (YOLOv8) or face-locked Talking Head mode.
  </div>
  </div>
  </div>
-""", unsafe_allow_html=True)
+ """, unsafe_allow_html=True)
 else:
     st.markdown("""
  <div class="rf-mode-box pur">
  <span style="font-size:16px">🎬</span>
  <div>
- <div class="rf-mode-h pur">Auto-Clip    <span style="background:var(--acc);color:#fff;font-size:9px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;padding:2px 6px;border-radius:99px;">AI</span></div>
+ <div class="rf-mode-h pur">Auto-Clip   <span style="background:var(--acc);color:#fff;font-size:9px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;padding:2px 6px;border-radius:99px;">AI</span></div>
  <div class="rf-mode-s">
 Upload a 30–90 min video. AI scans for saliency peaks, detects
 narrative arcs (beginning · middle · end), identifies the SOI
@@ -364,7 +364,8 @@ then verticalizes every selected clip.
  </div>
  </div>
  </div>
-""", unsafe_allow_html=True)
+ """, unsafe_allow_html=True)
+
 st.markdown("</div>", unsafe_allow_html=True)
 st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
 
@@ -412,32 +413,32 @@ else:
 if tracking_mode == "sports_action":
     sport_display = st.session_state.get("sport_type", "auto").title()
     st.markdown(f"""
- <div style="display:flex; align-items:center; gap:8px; margin-top:6px; margin-bottom:4px;">
- <span style="background:var(--acc);color:#fff;font-size:10px;font-weight:700;
-letter-spacing:.1em;text-transform:uppercase;padding:3px 10px;border-radius:99px;">
-🏀 Sports Action · {sport_display}
- </span>
- <span style="font-size:11px;color:var(--ink3);">Ball-aware · Kalman tracking</span>
- </div>
-""", unsafe_allow_html=True)
+    <div style="display:flex; align-items:center; gap:8px; margin-top:6px; margin-bottom:4px;">
+        <span style="background:var(--acc);color:#fff;font-size:10px;font-weight:700;
+                    letter-spacing:.1em;text-transform:uppercase;padding:3px 10px;border-radius:99px;">
+            🏀 Sports Action · {sport_display}
+        </span>
+        <span style="font-size:11px;color:var(--ink3);">Ball-aware · Kalman tracking</span>
+    </div>
+    """, unsafe_allow_html=True)
 elif tracking_mode == "talking_head":
     st.markdown("""
- <div style="margin-top:6px; margin-bottom:4px;">
- <span style="background:var(--pur);color:#fff;font-size:10px;font-weight:700;
-letter-spacing:.1em;text-transform:uppercase;padding:3px 10px;border-radius:99px;">
-👤 Talking Head
- </span>
- </div>
-""", unsafe_allow_html=True)
+    <div style="margin-top:6px; margin-bottom:4px;">
+        <span style="background:var(--pur);color:#fff;font-size:10px;font-weight:700;
+                    letter-spacing:.1em;text-transform:uppercase;padding:3px 10px;border-radius:99px;">
+            👤 Talking Head
+        </span>
+    </div>
+    """, unsafe_allow_html=True)
 else:
     st.markdown("""
- <div style="margin-top:6px; margin-bottom:4px;">
- <span style="background:var(--ink);color:#fff;font-size:10px;font-weight:700;
-letter-spacing:.1em;text-transform:uppercase;padding:3px 10px;border-radius:99px;">
-🎯 Subject Tracking
- </span>
- </div>
-""", unsafe_allow_html=True)
+    <div style="margin-top:6px; margin-bottom:4px;">
+        <span style="background:var(--ink);color:#fff;font-size:10px;font-weight:700;
+                    letter-spacing:.1em;text-transform:uppercase;padding:3px 10px;border-radius:99px;">
+            🎯 Subject Tracking
+        </span>
+    </div>
+    """, unsafe_allow_html=True)
 
 # ── v4.1: Panel Mode Controls (only for Subject Tracking) ──
 if tracking_mode == "subject":
@@ -538,10 +539,10 @@ with tab_trk:
     elif tracking_mode == "sports_action":
         # v4.0 SPORTS TRACKING SETTINGS
         st.markdown("""
- <div class="rf-info" style="margin-bottom:12px;">
-🏀  <b>Sports Mode Active</b> — Ball-aware tracking with Kalman predictive smoothing.
- </div>
-""", unsafe_allow_html=True)
+        <div class="rf-info" style="margin-bottom:12px;">
+        🏀 <b>Sports Mode Active</b> — Ball-aware tracking with Kalman predictive smoothing.
+        </div>
+        """, unsafe_allow_html=True)
         t1, t2 = st.columns(2, gap="medium")
         with t1:
             adaptive_smoothing  = st.toggle("Adaptive smoothing", value=True)
@@ -616,17 +617,17 @@ with tab_adv:
         else:
             yolo_weights = "yolov8n.pt"
         st.markdown("""
-<div class="rf-purp">Talking Head uses OpenCV face detector — YOLO not needed.</div>
-""", unsafe_allow_html=True)
+ <div class="rf-purp">Talking Head uses OpenCV face detector — YOLO not needed.</div>
+ """, unsafe_allow_html=True)
     st.markdown("""
  <div class="rf-safe">✓ Lower-third guard — subjects kept above bottom 20% of frame</div>
-""", unsafe_allow_html=True)
+ """, unsafe_allow_html=True)
 
 # Clip settings (auto-clip mode only)
 _CLIP_PRESETS = {
-    "15 sec (snappy highlight)": (13, 17),
-    "30 sec (short reel)":       (25, 35),
-    "60 sec (full segment)":     (50, 65),
+    "15 sec  (snappy highlight)": (13, 17),
+    "30 sec  (short reel)":       (25, 35),
+    "60 sec  (full segment)":     (50, 65),
 }
 clip_min_dur  = 25
 clip_max_dur  = 60
@@ -650,11 +651,11 @@ if app_mode == "autoClip" and tab_clip is not None:
         with cl2:
             clip_target_n = st.slider("Target # clips", 3, 20, 8, 1)
         st.markdown("""
-<div class="rf-info" style="margin-top:8px;">
+ <div class="rf-info" style="margin-top:8px;">
 💡 AI detects saliency peaks + scene boundaries to find narrative arcs
 (beginning · middle · end) in your video.
-</div>
-""", unsafe_allow_html=True)
+ </div>
+ """, unsafe_allow_html=True)
 
 # Analytics Tab (Auto-Clip Mode)
 if app_mode == "autoClip" and tab_analytics is not None:
@@ -663,79 +664,80 @@ if app_mode == "autoClip" and tab_analytics is not None:
         if st.session_state.clip_results:
             results = st.session_state.clip_results
             valid_results = [r for r in results if not r.get("error") and "analytics" in r]
-
+            
             if valid_results:
                 total_in = sum(r["analytics"]["input_size_mb"] for r in valid_results)
                 total_out = sum(r["analytics"]["output_size_mb"] for r in valid_results)
                 avg_ratio = sum(r["analytics"]["compression_ratio"] for r in valid_results) / len(valid_results)
-
+                
                 st.markdown(f"""
-          <div class="rf-analytics">
-            <div class="rf-an-title">📊 Batch Analytics</div>
-            <div class="rf-an-grid">
-              <div class="rf-an-item">
-                <div class="rf-an-label">Total Input</div>
-                <div class="rf-an-val">{total_in:.1f} MB</div>
-              </div>
-              <div class="rf-an-item">
-                <div class="rf-an-label">Total Output</div>
-                <div class="rf-an-val good">{total_out:.1f} MB</div>
-                <div class="rf-an-sub">{((1 - total_out/total_in)*100):.1f}% smaller</div>
-              </div>
-              <div class="rf-an-item">
-                <div class="rf-an-label">Avg Compression</div>
-                <div class="rf-an-val">{avg_ratio:.2f}x</div>
-              </div>
-            </div>
-          </div>
-""", unsafe_allow_html=True)
-
+             <div class="rf-analytics">
+               <div class="rf-an-title">📊 Batch Analytics</div>
+               <div class="rf-an-grid">
+                 <div class="rf-an-item">
+                   <div class="rf-an-label">Total Input</div>
+                   <div class="rf-an-val">{total_in:.1f} MB</div>
+                 </div>
+                 <div class="rf-an-item">
+                   <div class="rf-an-label">Total Output</div>
+                   <div class="rf-an-val good">{total_out:.1f} MB</div>
+                   <div class="rf-an-sub">{((1 - total_out/total_in)*100):.1f}% smaller</div>
+                 </div>
+                 <div class="rf-an-item">
+                   <div class="rf-an-label">Avg Compression</div>
+                   <div class="rf-an-val">{avg_ratio:.2f}x</div>
+                 </div>
+               </div>
+             </div>
+             """, unsafe_allow_html=True)
+                
                 st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
                 st.markdown("<div style='font-size:11px;font-weight:700;color:var(--ink3);margin-bottom:8px;'>CLIP BREAKDOWN</div>", unsafe_allow_html=True)
-
+                
                 for i, r in enumerate(valid_results):
                     a = r["analytics"]
-
+                    
                     # Extract smoothness metrics if available
                     jitter_raw = a.get('jitter_raw', 0)
                     jitter_smooth = a.get('jitter_smooth', 0)
                     smoothness_pct = a.get('smoothness_pct', 0)
-
+                    
                     # Determine color for smoothness score
                     smooth_color_var = "var(--grn)" if smoothness_pct > 80 else ("var(--amb)" if smoothness_pct > 50 else "var(--acc)")
 
                     st.markdown(f"""
-              <div style="background:var(--surf);border:1px solid var(--bdr);border-radius:var(--rs);
-            padding:10px 12px;margin-bottom:8px;">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-                  <div style="font-size:11px;font-weight:700;color:var(--ink);">Clip {i+1}</div>
-                  <div style="display:flex; gap:10px; font-size:10px;">
-                    <span style="color:var(--ink2);">{a['input_size_mb']:.1f} MB → <b>{a['output_size_mb']:.1f} MB</b></span>
-                    <span style="color:var(--grn); font-weight:600;">{a['compression_ratio']:.2f}x</span>
-                  </div>
-                </div>
-               
-                <!-- Smoothness Metrics Row -->
-                <div style="margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--bdr);">
-                  <div style="font-size:9px; font-weight:700; color:var(--ink3); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:4px;">
-                   Camera Stability {st.session_state.get('sport_type', '').title() + ' · ' if st.session_state.get('sport_type') else ''}Kalman: {a.get('kalman_predictions', 0)}</div>
-                  <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:8px;">
-                    <div style="text-align:center;">
-                      <div style="font-size:10px; color:var(--ink2);">Smoothness</div>
-                      <div style="font-family:'DM Serif Display',serif; font-size:13px; color:{smooth_color_var}; font-weight:600;">{smoothness_pct:.1f}%</div>
-                    </div>
-                    <div style="text-align:center;">
-                      <div style="font-size:10px; color:var(--ink2);">Raw Jitter</div>
-                      <div style="font-family:'DM Serif Display',serif; font-size:13px; color:var(--ink);">{jitter_raw:.2f}px</div>
-                    </div>
-                    <div style="text-align:center;">
-                      <div style="font-size:10px; color:var(--ink2);">Smoothed</div>
-                      <div style="font-family:'DM Serif Display',serif; font-size:13px; color:var(--ink);">{jitter_smooth:.2f}px</div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-""", unsafe_allow_html=True)
+                 <div style="background:var(--surf);border:1px solid var(--bdr);border-radius:var(--rs);
+                padding:10px 12px;margin-bottom:8px;">
+                   <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                     <div style="font-size:11px;font-weight:700;color:var(--ink);">Clip {i+1}</div>
+                     <div style="display:flex; gap:10px; font-size:10px;">
+                       <span style="color:var(--ink2);">{a['input_size_mb']:.1f} MB → <b>{a['output_size_mb']:.1f} MB</b></span>
+                       <span style="color:var(--grn); font-weight:600;">{a['compression_ratio']:.2f}x</span>
+                     </div>
+                   </div>
+                   
+                   <!-- Smoothness Metrics Row -->
+                   <div style="margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--bdr);">
+                     <div style="font-size:9px; font-weight:700; color:var(--ink3); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:4px;">
+                       Camera Stability {st.session_state.get('sport_type', '').title() + ' · ' if st.session_state.get('sport_type') else ''}Kalman: {a.get('kalman_predictions', 0)}
+                     </div>
+                     <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:8px;">
+                       <div style="text-align:center;">
+                         <div style="font-size:10px; color:var(--ink2);">Smoothness</div>
+                         <div style="font-family:'DM Serif Display',serif; font-size:13px; color:{smooth_color_var}; font-weight:600;">{smoothness_pct:.1f}%</div>
+                       </div>
+                       <div style="text-align:center;">
+                         <div style="font-size:10px; color:var(--ink2);">Raw Jitter</div>
+                         <div style="font-family:'DM Serif Display',serif; font-size:13px; color:var(--ink);">{jitter_raw:.2f}px</div>
+                       </div>
+                       <div style="text-align:center;">
+                         <div style="font-size:10px; color:var(--ink2);">Smoothed</div>
+                         <div style="font-family:'DM Serif Display',serif; font-size:13px; color:var(--ink);">{jitter_smooth:.2f}px</div>
+                       </div>
+                     </div>
+                   </div>
+                 </div>
+                 """, unsafe_allow_html=True)
             else:
                 st.markdown('<div class="rf-info">No analytics data available yet. Process clips to see stats.</div>', unsafe_allow_html=True)
         else:
@@ -780,6 +782,7 @@ with col_src:
     max_mb = 2000 if app_mode == "autoClip" else 500
     uploaded_file = st.file_uploader("Drop video",
                                      type=["mp4", "mov", "avi", "mkv"], label_visibility="collapsed")
+
     if uploaded_file is not None:
         mb = len(uploaded_file.getvalue()) / (1024 ** 2)
         if mb > max_mb:
@@ -822,17 +825,17 @@ with col_src:
             eff_w, eff_h = resolve_target_size(
                 resolution_label, info["width"], info["height"])
             st.markdown(f"""
-      <div class='rf-metrics' style='margin-top:10px;'>
-        <div class='rf-m'><div class='rf-ml'>Duration</div>
-          <div class='rf-mv'>{dur_str}</div></div>
-        <div class='rf-m'><div class='rf-ml'>Source</div>
-          <div class='rf-mv'>{info['width']}×{info['height']}</div></div>
-        <div class='rf-m'><div class='rf-ml'>Output</div>
-          <div class='rf-mv a'>{eff_w}×{eff_h}</div></div>
-        <div class='rf-m'><div class='rf-ml'>FPS</div>
-          <div class='rf-mv'>{info['fps']:.0f}</div></div>
-      </div>
-""", unsafe_allow_html=True)
+         <div class='rf-metrics' style='margin-top:10px;'>
+           <div class='rf-m'><div class='rf-ml'>Duration</div>
+             <div class='rf-mv'>{dur_str}</div></div>
+           <div class='rf-m'><div class='rf-ml'>Source</div>
+             <div class='rf-mv'>{info['width']}×{info['height']}</div></div>
+           <div class='rf-m'><div class='rf-ml'>Output</div>
+             <div class='rf-mv a'>{eff_w}×{eff_h}</div></div>
+           <div class='rf-m'><div class='rf-ml'>FPS</div>
+             <div class='rf-mv'>{info['fps']:.0f}</div></div>
+         </div>
+         """, unsafe_allow_html=True)
 
             if app_mode == "autoClip" and dur < 60:
                 st.markdown(
@@ -844,6 +847,7 @@ with col_src:
 # ─── Output column ─────────────────────────────────────────────────────────────
 with col_out:
     st.markdown("<div class='rf-panelr'>", unsafe_allow_html=True)
+    
     # ─── SINGLE CLIP OUTPUT ───────────────────────────────────────────────
     if app_mode == "single":
         st.markdown('<div class="rf-sec">Output · 9:16</div>', unsafe_allow_html=True)
@@ -853,7 +857,7 @@ with col_out:
             st.markdown(f'<div class="rf-ok">✓ Done — {out_mb:.1f} MB</div>',
                         unsafe_allow_html=True)
             st.video(st.session_state.output_bytes, format="video/mp4")
-
+            
             # ANALYTICS SECTION
             if st.session_state.analytics_data:
                 a = st.session_state.analytics_data
@@ -865,86 +869,86 @@ with col_out:
                     st.markdown('<div class="rf-ok">🎛 Panel mode active — 2-row vertical split</div>', unsafe_allow_html=True)
                 elif st.session_state.get('panel_mode_override') == 'force_on':
                     st.markdown('<div class="rf-warn">🎛 Panel mode forced ON but not detected in output</div>', unsafe_allow_html=True)
-
+                
                 # Extract smoothness metrics if available
                 jitter_raw = a.get('jitter_raw', 0)
                 jitter_smooth = a.get('jitter_smooth', 0)
                 smoothness_pct = a.get('smoothness_pct', 0)
-
+                
                 # Determine color for smoothness score
                 smooth_class = "good" if smoothness_pct > 80 else ("amb" if smoothness_pct > 50 else "bad")
                 smooth_color_var = "var(--grn)" if smoothness_pct > 80 else ("var(--amb)" if smoothness_pct > 50 else "var(--acc)")
 
                 st.markdown(f"""
-          <div class="rf-analytics">
-            <div class="rf-an-title">📊 Conversion Analytics</div>
-            <div class="rf-an-grid">
-              <div class="rf-an-item">
-                <div class="rf-an-label">Size Reduction</div>
-                <div class="rf-an-val {'good' if red_pct > 0 else 'bad'}">{red_pct:.1f}%</div>
-                <div class="rf-an-sub">{a['input_size_mb']:.1f} MB → {a['output_size_mb']:.1f} MB</div>
-              </div>
-              <div class="rf-an-item">
-                <div class="rf-an-label">Compression</div>
-                <div class="rf-an-val">{ratio:.2f}x</div>
-                <div class="rf-an-sub">{a['input_bitrate_kbps']} kbps → {a['output_bitrate_kbps']} kbps</div>
-              </div>
-              <div class="rf-an-item">
-                <div class="rf-an-label">Resolution</div>
-                <div class="rf-an-val">{a['output_resolution']}</div>
-                <div class="rf-an-sub">{a['input_resolution']} source</div>
-              </div>
-            </div>
-           
-            <!-- New Smoothness Metrics Row -->
-            <div style="margin-top: 12px; border-top: 1px solid var(--bdr); padding-top: 12px;">
-              <div style="font-size: 10px; font-weight: 700; color: var(--ink3); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px;">
-               Camera Stability {f"· 🏀 {st.session_state.get('sport_type', '').title()}" if st.session_state.get('sport_type') else ""}
-              </div>
-              <div class="rf-an-grid">
-                <div class="rf-an-item">
-                  <div class="rf-an-label">Smoothness Score</div>
-                  <div class="rf-an-val" style="color: {smooth_color_var}">{smoothness_pct:.1f}%</div>
-                  <div class="rf-an-sub">Jitter reduction</div>
-                </div>
-                <div class="rf-an-item">
-                  <div class="rf-an-label">Raw Jitter</div>
-                  <div class="rf-an-val">{jitter_raw:.2f} px</div>
-                  <div class="rf-an-sub">Avg frame-to-frame</div>
-                </div>
-                <div class="rf-an-item">
-                  <div class="rf-an-label">Smoothed Jitter</div>
-                  <div class="rf-an-val">{jitter_smooth:.2f} px</div>
-                  <div class="rf-an-sub">After processing {f"(Kalman: {a.get('kalman_predictions', 0)})" if a.get('kalman_predictions', 0) else ""}</div>
-                </div>
-              </div>
-            </div>
-          </div>
-""", unsafe_allow_html=True)
+             <div class="rf-analytics">
+               <div class="rf-an-title">📊 Conversion Analytics</div>
+               <div class="rf-an-grid">
+                 <div class="rf-an-item">
+                   <div class="rf-an-label">Size Reduction</div>
+                   <div class="rf-an-val {'good' if red_pct > 0 else 'bad'}">{red_pct:.1f}%</div>
+                   <div class="rf-an-sub">{a['input_size_mb']:.1f} MB → {a['output_size_mb']:.1f} MB</div>
+                 </div>
+                 <div class="rf-an-item">
+                   <div class="rf-an-label">Compression</div>
+                   <div class="rf-an-val">{ratio:.2f}x</div>
+                   <div class="rf-an-sub">{a['input_bitrate_kbps']} kbps → {a['output_bitrate_kbps']} kbps</div>
+                 </div>
+                 <div class="rf-an-item">
+                   <div class="rf-an-label">Resolution</div>
+                   <div class="rf-an-val">{a['output_resolution']}</div>
+                   <div class="rf-an-sub">{a['input_resolution']} source</div>
+                 </div>
+               </div>
+               
+               <!-- New Smoothness Metrics Row -->
+               <div style="margin-top: 12px; border-top: 1px solid var(--bdr); padding-top: 12px;">
+                 <div style="font-size: 10px; font-weight: 700; color: var(--ink3); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px;">
+                   Camera Stability {f"· 🏀 {st.session_state.get('sport_type', '').title()}" if st.session_state.get('sport_type') else ""}
+                 </div>
+                 <div class="rf-an-grid">
+                   <div class="rf-an-item">
+                     <div class="rf-an-label">Smoothness Score</div>
+                     <div class="rf-an-val" style="color: {smooth_color_var}">{smoothness_pct:.1f}%</div>
+                     <div class="rf-an-sub">Jitter reduction</div>
+                   </div>
+                   <div class="rf-an-item">
+                     <div class="rf-an-label">Raw Jitter</div>
+                     <div class="rf-an-val">{jitter_raw:.2f} px</div>
+                     <div class="rf-an-sub">Avg frame-to-frame</div>
+                   </div>
+                   <div class="rf-an-item">
+                     <div class="rf-an-label">Smoothed Jitter</div>
+                     <div class="rf-an-val">{jitter_smooth:.2f} px</div>
+                     <div class="rf-an-sub">After processing {f"(Kalman: {a.get('kalman_predictions', 0)})" if a.get('kalman_predictions', 0) else ""}</div>
+                   </div>
+                 </div>
+               </div>
+             </div>
+             """, unsafe_allow_html=True)
 
             st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
             stem = os.path.splitext(st.session_state.uploaded_file_name or "video")[0]
             st.download_button(
-                "↓ Download vertical video",
+                "↓  Download vertical video",
                 data=st.session_state.output_bytes,
                 file_name=f"{stem}_vertical.mp4",
                 mime="video/mp4",
                 use_container_width=True)
             if st.session_state.srt_bytes:
                 st.download_button(
-                    "↓ Download subtitles (.srt)",
+                    "↓  Download subtitles (.srt)",
                     data=st.session_state.srt_bytes,
                     file_name=f"{stem}.srt",
                     mime="text/plain",
                     use_container_width=True)
         else:
             st.markdown("""
-      <div class="rf-empty">
-        <div class="rf-empty-icon">📱</div>
-        <div class="rf-empty-h">Vertical output</div>
-        <div class="rf-empty-s">appears here after conversion</div>
-      </div>
-""", unsafe_allow_html=True)
+         <div class="rf-empty">
+           <div class="rf-empty-icon">📱</div>
+           <div class="rf-empty-h">Vertical output</div>
+           <div class="rf-empty-s">appears here after conversion</div>
+         </div>
+         """, unsafe_allow_html=True)
 
     # ─── AUTO-CLIP PANEL ──────────────────────────────────────────────────
     else:
@@ -952,12 +956,12 @@ with col_out:
 
         if not st.session_state.scan_done:
             st.markdown("""
-      <div class="rf-empty">
-        <div class="rf-empty-icon">🔍</div>
-        <div class="rf-empty-h">Scan first</div>
-        <div class="rf-empty-s">AI will detect high-engagement segments</div>
-      </div>
-""", unsafe_allow_html=True)
+         <div class="rf-empty">
+           <div class="rf-empty-icon">🔍</div>
+           <div class="rf-empty-h">Scan first</div>
+           <div class="rf-empty-s">AI will detect high-engagement segments</div>
+         </div>
+         """, unsafe_allow_html=True)
 
         elif st.session_state.detected_clips:
             clips = st.session_state.detected_clips
@@ -983,7 +987,7 @@ with col_out:
 
             playing_idx = st.session_state.playing_clip_idx
 
-            for ci, clip in enumerate(clips):
+            for ci, clip in enumerate(clips): 
                 score_pct = int(clip.score * 100)
                 score_cls = "h" if clip.score > 0.7 else ("m" if clip.score > 0.4 else "")
                 is_sel    = ci in sel
@@ -1011,15 +1015,15 @@ with col_out:
                             if is_done else "")
 
                 st.markdown(f"""
-          <div class="{card_cls}">
-            <span class="rf-cscore {score_cls}">{score_pct}%</span>
-            <div class="rf-ctitle">Clip {ci+1}</div>
-            <div class="rf-cmeta">{time_str}</div>
-            <span class="rf-cdur">{clip.duration:.0f}s</span>
-            <span class="rf-csoi">SOI: {clip.soi_region}</span>
-          {done_tag}
-          </div>
-""", unsafe_allow_html=True)
+             <div class="{card_cls}">
+               <span class="rf-cscore {score_cls}">{score_pct}%</span>
+               <div class="rf-ctitle">Clip {ci+1}</div>
+               <div class="rf-cmeta">{time_str}</div>
+               <span class="rf-cdur">{clip.duration:.0f}s</span>
+               <span class="rf-csoi">SOI: {clip.soi_region}</span>
+              {done_tag}
+             </div>
+             """, unsafe_allow_html=True)
 
                 if is_done:
                     # Buttons row: Play toggle | Download
@@ -1050,7 +1054,7 @@ with col_out:
                             with open(result_for_clip["output_path"], "rb") as f:
                                 clip_bytes_play = f.read()
                             # Use columns: narrow (9:16 width) | spacer
-                            # 202px ≈ 360px * 9/16 so it matches horizontal player height
+                            # 202px ≈ 360px * 9/16   so it matches horizontal player height
                             vcol, _ = st.columns([202, 400])
                             with vcol:
                                 st.markdown('<div class="rf-vplayer">',
@@ -1075,12 +1079,12 @@ with col_out:
                             st.rerun()
         else:
             st.markdown("""
-      <div class="rf-empty">
-        <div class="rf-empty-icon">🔍</div>
-        <div class="rf-empty-h">No clips found</div>
-        <div class="rf-empty-s">try adjusting clip duration in the Clips tab</div>
-      </div>
-""", unsafe_allow_html=True)
+         <div class="rf-empty">
+           <div class="rf-empty-icon">🔍</div>
+           <div class="rf-empty-h">No clips found</div>
+           <div class="rf-empty-s">try adjusting clip duration in the Clips tab</div>
+         </div>
+         """, unsafe_allow_html=True)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1094,12 +1098,13 @@ if uploaded_file is not None and st.session_state.input_path:
     st.markdown("<div style='height:1px;background:var(--bdr);margin:0 20px'></div>",
                 unsafe_allow_html=True)
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
     # ─── SINGLE CLIP ACTIONS ──────────────────────────────────────────────
     if app_mode == "single":
         if not st.session_state.processing_done:
             a1, a2, a3 = st.columns([4, 5, 2])
             with a1:
-                go = st.button("▶ Convert to Vertical",
+                go = st.button("▶  Convert to Vertical",
                                type="primary", use_container_width=True,
                                disabled=not can_go)
             with a2:
@@ -1184,7 +1189,7 @@ if uploaded_file is not None and st.session_state.input_path:
                     if os.path.exists(out_p) and os.path.getsize(out_p) > 0:
                         with open(out_p, "rb") as f:
                             st.session_state.output_bytes = f.read()
-
+                        
                         # Store Analytics
                         if "analytics" in meta:
                             st.session_state.analytics_data = meta["analytics"]
@@ -1224,19 +1229,19 @@ if uploaded_file is not None and st.session_state.input_path:
 
     # ─── AUTO-CLIP ACTIONS ────────────────────────────────────────────────
     else:
-        # Check if we have detected clips.
-        # Note: [ ] is falsy, so we check specifically for None to distinguish
+        # Check if we have detected clips. 
+        # Note: [] is falsy, so we check specifically for None to distinguish 
         # between "not scanned yet" and "scanned but found nothing".
         if st.session_state.detected_clips is None:
             st.session_state.scan_done = False
             st.warning("Clip data missing. Please scan again.")
             # Don't stop here, let the flow continue to the "not scan_done" block below
             # which will render the Scan button.
-
+        
         if not st.session_state.scan_done:
             b1, b2, b3 = st.columns([4, 4, 2])
             with b1:
-                scan_btn = st.button("🔍 Scan for Clips",
+                scan_btn = st.button("🔍  Scan for Clips",
                                      type="primary", use_container_width=True,
                                      disabled=not can_go)
             with b2:
@@ -1271,9 +1276,9 @@ if uploaded_file is not None and st.session_state.input_path:
                         confidence=confidence,
                         progress_callback=_scan_cb,
                     )
-
+                    
                     prog.progress(1.0)
-
+                    
                     # Handle empty results gracefully
                     if not clips:
                         status.warning("⚠ No clips detected. Try adjusting clip duration settings.")
@@ -1285,9 +1290,9 @@ if uploaded_file is not None and st.session_state.input_path:
                         st.session_state.selected_clip_indices   = set(range(len(clips)))
                         st.session_state.scan_done               = True
                         # Clear old results when scanning new clips
-                        st.session_state.clip_results             = None
+                        st.session_state.clip_results            = None 
                         status.success(f"✅ Found {len(clips)} clips!")
-
+                    
                     st.rerun()
                 except Exception as exc:
                     status.error(f"Scan error: {exc}")
@@ -1296,7 +1301,7 @@ if uploaded_file is not None and st.session_state.input_path:
 
         else:
             clips = st.session_state.detected_clips or []
-
+            
             # If clips list is empty, show a message and allow re-scan
             if not clips:
                 st.markdown('<div class="rf-warn">⚠ No clips were detected during the last scan. Please adjust settings and scan again.</div>', unsafe_allow_html=True)
@@ -1309,7 +1314,7 @@ if uploaded_file is not None and st.session_state.input_path:
             # Initialize selection if not present
             if st.session_state.selected_clip_indices is None:
                 st.session_state.selected_clip_indices = set(range(len(clips)))
-
+            
             sel   = st.session_state.selected_clip_indices
 
             if not st.session_state.clip_results:
@@ -1317,7 +1322,7 @@ if uploaded_file is not None and st.session_state.input_path:
                 with p1:
                     n_sel = len(sel)
                     process_btn = st.button(
-                        f"▶ Verticalize {n_sel} Clip{'s' if n_sel != 1 else ''}",
+                        f"▶  Verticalize {n_sel} Clip{'s' if n_sel != 1 else ''}",
                         type="primary", use_container_width=True,
                         disabled=n_sel == 0)
                 with p2:
@@ -1389,7 +1394,7 @@ if uploaded_file is not None and st.session_state.input_path:
             else:
                 results = st.session_state.clip_results
                 n_ok = sum(1 for r in results if not r.get("error"))
-
+                
                 # Only show the "Ready" banner if we actually have clips detected
                 if clips:
                     st.markdown(
@@ -1418,7 +1423,7 @@ if uploaded_file is not None and st.session_state.input_path:
 else:
     # Welcome / empty state
     st.markdown("""
-<div style='padding:0 20px 44px;margin-top:16px;'>
+ <div style='padding:0 20px 44px;margin-top:16px;'>
  <div style='background:var(--surf);border:2px dashed var(--bdr);
 border-radius:var(--r);padding:48px 28px;text-align:center;'>
  <div style='font-family:"DM Serif Display",serif;
@@ -1442,7 +1447,7 @@ color:var(--ink3);padding:4px 9px;border:1px solid var(--bdr);border-radius:4px;
  </div>
  </div>
  </div>
-""", unsafe_allow_html=True)
+ """, unsafe_allow_html=True)
 
 # Footer
 st.markdown("""
@@ -1453,4 +1458,4 @@ st.markdown("""
  </div>
  <div style='font-size:10px;color:var(--bdr2);'>Reframe · AI Vertical Video</div>
  </div>
-""", unsafe_allow_html=True)
+ """, unsafe_allow_html=True)
