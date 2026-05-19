@@ -6,6 +6,7 @@ IMPROVEMENTS over v4.4:
 2. DENSE TRACKING: Writes Kalman state every frame, not just on detection samples.
 3. POST-SMOOTHING: Lightweight Bidirectional EMA applied to Kalman output to remove jitter.
 4. CUT HANDLING: Aggressive Covariance reset on scene cuts to prevent ghosting.
+5. REAL METRICS: Smoothness score is now calculated from actual smoothed data, not hardcoded.
 """
 from __future__ import annotations
 import math
@@ -28,7 +29,7 @@ except ImportError:
 class ProcessingError(Exception):
     pass
 
-# ─── Constants ─────────────────────────────────────────────────────────────────
+# ─── Constants ────────────────────────────────────────────────────────────────
 PERSON_CLASS_ID      = 0
 SPORTS_BALL_CLASS_ID = 32
 HIGH_PRIO_CLASSES    = {0, 2, 3, 5, 7, 15, 16}
@@ -54,10 +55,10 @@ SPORTS_COURT_COLORS_HSV = [
     { "h ": [90, 130],  "s ": [0,  60],   "v ": [150, 255]},  # Hockey
 ]
 
-# Kalman Constants - TUNED FOR AGILITY (v4.5)
+# Kalman Constants - TUNED FOR AGILITY & SMOOTHNESS (v4.5)
 KALMAN_PROCESS_NOISE_BASE    = 5e-2  # Increased from 1e-2 to reduce lag/stiffness
 KALMAN_PROCESS_NOISE_HIGH    = 1e-1  # For high acceleration/jerk
-KALMAN_MEASUREMENT_NOISE     = 5e-2  # Decreased from 1e-2 to trust detections more (snap)
+KALMAN_MEASUREMENT_NOISE     = 5e-2  # Decreased from 1e-1 to trust detections more (snap)
 KALMAN_OPTICAL_FLOW_NOISE    = 5e-1
 KALMAN_SALIENCY_NOISE        = 2e-0
 KALMAN_INITIAL_ERROR         = 1.0
@@ -458,7 +459,7 @@ def _trim_video(inp: str, out: str, start: float, end: float) -> bool:
     )
     return r.returncode == 0 and os.path.exists(out)
 
-# ─── Encoder ──────────────────────────────────────────────────────────────────
+# ─── Encoder ─────────────────────────────────────────────────────────────────
 def _open_ffmpeg_encoder(
     output_path: str, width: int, height: int, fps: float,
     audio_source: Optional[str], crf: int = 23, preset: str = "fast ",
@@ -2119,7 +2120,7 @@ def detect_clips(
     _p(1.0, f"Found {len(segments)} clips ")
     return segments
 
-# ─── Analytics ────────────────────────────────────────────────────────────────
+# ─── Analytics ───────────────────────────────────────────────────────────────
 def get_analytics_meta(
     input_path: str, output_path: str, *,
     tracking_mode: str = "", panel_mode: bool = False,
@@ -2666,9 +2667,9 @@ def process_video(
                 dense_cx     = np.interp(all_frames, known_frames, known_cx)
                 dense_cy     = np.interp(all_frames, known_frames, known_cy)
         else:
-            # NEW v4.5: For sports mode, Kalman IS the smoother, but we apply post-smoothing
+            # NEW v4.5: For sports mode, apply POST-KALMAN BIDIRECTIONAL EMA to remove residual jitter
             _p(0.42, "Post-smoothing Kalman path... ")
-            
+
             # Apply lightweight Bidirectional EMA to remove residual high-freq noise
             # This respects scene cuts to prevent bleeding
             dense_cx, dense_cy = _smooth_kalman_output(
@@ -2678,12 +2679,19 @@ def process_video(
                 alpha=0.15 # Light smoothing
             )
 
-            # Compute smoothness metrics from Kalman output
-            dx_raw = np.diff(dense_cx); dy_raw = np.diff(dense_cy)
+            # Now compute TRUE smoothness metrics from smoothed output
+            dx_raw = np.diff(dense_kalman_cx.astype(float)); dy_raw = np.diff(dense_kalman_cy.astype(float))
             jitter_raw = float(np.mean(np.sqrt(dx_raw**2 + dy_raw**2)))
-            max_jump = float(np.max(np.sqrt(dx_raw**2 + dy_raw**2))) if len(dx_raw) > 0 else 0.0
+            
+            dx_smooth = np.diff(dense_cx); dy_smooth = np.diff(dense_cy)
+            jitter_smooth = float(np.mean(np.sqrt(dx_smooth**2 + dy_smooth**2)))
+            
+            max_jump_raw = float(np.max(np.sqrt(dx_raw**2 + dy_raw**2))) if len(dx_raw) > 0 else 0.0
+            
+            # Calculate true smoothness percentage
+            smoothness_pct = ((jitter_raw - jitter_smooth) / jitter_raw * 100) if jitter_raw > 0 else 0.0
 
-            # Count how many frames were pure predictions vs updates
+            # Count prediction frames (optional diagnostic)
             pred_count = sum(1 for i in range(total_frames) 
                            if kalman_tracker is not None and 
                            kalman_tracker.initialized and
@@ -2692,12 +2700,12 @@ def process_video(
 
             smooth_metrics = {
                 "jitter_raw ": round(jitter_raw, 2),
-                "jitter_smooth ": round(jitter_raw * 0.7, 2),
-                "smoothness_pct ": 30.0,
-                "max_jump_raw ": round(max_jump, 1),
+                "jitter_smooth ": round(jitter_smooth, 2),
+                "smoothness_pct ": round(smoothness_pct, 1),
+                "max_jump_raw ": round(max_jump_raw, 1),
                 "kalman_prediction_frames ": pred_count,
             }
-            _p(0.42, f"Kalman path: jitter={jitter_raw:.1f}px, predictions={pred_count} ")
+            _p(0.42, f"Kalman path: raw_jitter={jitter_raw:.1f}px, smooth_jitter={jitter_smooth:.1f}px, smoothness={smoothness_pct:.1f}%")
 
         # ── Render pass ────────────────────────────────────────────────────────
         _p(0.44, "Pass 2/2: rendering... ")
