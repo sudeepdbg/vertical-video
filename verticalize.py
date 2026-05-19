@@ -2255,7 +2255,7 @@ def process_video_sports(
     return metrics
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 32: process_video() — unified entry-point  ← NEW v6.1
+# SECTION 32: process_video() — unified entry-point  ← FIXED v6.1.1
 # ═══════════════════════════════════════════════════════════════════════════════
 def process_video(
     input_path: str,
@@ -2351,9 +2351,6 @@ def process_video(
     speeds:  List[float]           = []
     scene_cuts: List[int]          = []
 
-    dense_cx = np.full(total_frames, orig_w // 2, dtype=float)
-    dense_cy = np.full(total_frames, orig_h // 2, dtype=float)
-
     extra_vf = _build_ffmpeg_vf(color_grade, ffmpeg_sharpen=False)
     enc = _open_ffmpeg_encoder(
         output_path, target_w, target_h, fps,
@@ -2402,6 +2399,8 @@ def process_video(
                         out_frame = apply_ken_burns(out_frame, fi, fps)
                     if sharpen:
                         out_frame = apply_sharpen(out_frame)
+                    
+                    # WRITE FRAME
                     enc.stdin.write(out_frame.tobytes())
                     fi += 1
                     continue
@@ -2439,13 +2438,44 @@ def process_video(
 
                 # Kalman filter for general modes
                 kx, ky = kalman.update(float(cx), float(cy))
-                dense_cx[fi] = kx
-                dense_cy[fi] = ky
-                prev_center  = (int(kx), int(ky))
-
-                speed = kalman.speed
+                
+                # Store for metrics calculation
                 centers.append((int(kx), int(ky)))
-                speeds.append(speed)
+                speeds.append(kalman.speed)
+
+                # ── Crop and Write Frame ──────────────────────────────────
+                # Calculate crop based on Kalman center
+                cx_int, cy_int = int(kx), int(ky)
+                left = max(0, min(cx_int - hw, orig_w - crop_w))
+                top  = max(0, min(cy_int - hh, orig_h - crop_h))
+                
+                # Apply lower third guard if needed (simple version)
+                if cy_int > orig_h * LOWER_THIRD_GUARD:
+                    top = max(0, min(int(orig_h * LOWER_THIRD_GUARD) - hh, orig_h - crop_h))
+
+                right  = left + crop_w
+                bottom = top + crop_h
+                
+                crop = frame[top:bottom, left:right]
+                
+                # Resize to target
+                if crop.shape[1] != target_w or crop.shape[0] != target_h:
+                    crop = cv2.resize(crop, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+
+                # Effects
+                if dissolve.active:
+                    crop = dissolve.blend(crop)
+                if ken_burns:
+                    crop = apply_ken_burns(crop, fi, fps)
+                if color_grade and color_grade != "none":
+                    crop = apply_color_grade(crop, color_grade)
+                if sharpen:
+                    crop = apply_sharpen(crop)
+                if vignette_strength > 0:
+                    crop = apply_vignette(crop, vignette_strength)
+
+                # WRITE FRAME TO ENCODER
+                enc.stdin.write(crop.tobytes())
 
                 if fi % report_n == 0:
                     _p(fi / total_frames,
@@ -2458,31 +2488,25 @@ def process_video(
         enc.wait()
         raise ProcessingError(f"Render loop failed at frame {fi}: {exc}") from exc
 
-    # ── if we collected centres (non-panel, non-sports) → post-smooth ─────
-    if centers and not use_panel:
-        _p(0.88, "Post-smoothing camera path…")
-        dense_cx_arr = np.array([c[0] for c in centers], dtype=float)
-        dense_cy_arr = np.array([c[1] for c in centers], dtype=float)
-        dense_cx_arr, dense_cy_arr = _apply_sports_post_smooth(
-            dense_cx_arr, dense_cy_arr, fps, scene_cuts, len(centers))
-        smoothed_centers = [(int(x), int(y))
-                            for x, y in zip(dense_cx_arr, dense_cy_arr)]
+    # Close encoder properly
+    try:
+        _close_ffmpeg_encoder(enc, output_path)
+    except Exception as e:
+        # If it fails, it might be because no frames were written (fi==0)
+        if fi == 0:
+            raise ProcessingError("No frames were processed.")
+        raise e
 
-        # ── second pass: write frames using smoothed centres ──────────────
-        # Re-open encoder
-        _close_ffmpeg_encoder(enc, output_path)   # close first-pass (no frames written yet
-        # Note: in a two-pass architecture the first loop above only collects
-        # centres; the actual encode happens in the second pass below.
-        # For simplicity in this implementation we do a single-pass encode
-        # using the Kalman-filtered centres (already written above), then
-        # apply the post-smooth for the NEXT call. This matches v5/v6.0 behaviour.
-        # A full two-pass refactor is left as an exercise.
-        smooth_metrics = {"note": "post-smooth applied to next invocation centres"}
+    # Calculate metrics on the collected centers (Kalman path)
+    if centers:
+        _p(0.95, "Calculating metrics...")
+        # Use the existing smooth_centers logic to get jitter metrics 
+        # even though we encoded with Kalman. This gives us "post-smooth" quality stats
+        # if we had applied it, or just Kalman stats.
+        _, m = smooth_centers(centers, speeds, scene_cuts=scene_cuts, use_kalman=False)
+        smooth_metrics = m
     else:
-        try:
-            _close_ffmpeg_encoder(enc, output_path)
-        except Exception:
-            pass
+        smooth_metrics = {"jitter_raw": 0.0, "jitter_smooth": 0.0, "smoothness_pct": 0.0}
 
     _p(1.0, "Done")
     return {
