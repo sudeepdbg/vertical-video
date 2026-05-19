@@ -65,7 +65,7 @@ section[data-testid="stSidebar"] { display: none !important; }
 display:flex; align-items:center; justify-content:space-between;
 padding:0 20px; position:sticky; top:0; z-index:200; }
 .rf-logo { display:flex; align-items:center; gap:9px; }
-.rf-mark { width:28px; height:28px; border-radius:8px;  background:var(--ink);
+.rf-mark { width:28px; height:28px; border-radius:8px; background:var(--ink);
 display:flex; align-items:center; justify-content:center; }
 .rf-name { font-family:'DM Serif Display',serif; font-size:17px; color:var(--ink); letter-spacing:-0.01em; }
 .rf-tag  { font-size:11px; color:var(--ink3); }
@@ -80,7 +80,7 @@ color: var(--ink3); margin-bottom:10px; display:flex; align-items:center; gap:8p
 .rf-mode-box.acc { background:var(--surf2); border:1.5px solid var(--bdr); }
 .rf-mode-box.pur { background:var(--pur-l); border:1.5px solid var(--pur); }
 .rf-mode-h { font-size:12px; font-weight:700; margin-bottom:2px; }
-.rf-mode-h.acc {  color:var(--ink); }
+.rf-mode-h.acc { color:var(--ink); }
 .rf-mode-h.pur { color:var(--pur); }
 .rf-mode-s { font-size:11px; color:var(--ink2); line-height:1.5; }
 
@@ -133,38 +133,38 @@ gap:8px; font-weight:600; margin-bottom:8px; }
 padding:9px 12px; font-size:12px; color:#8a5a10; margin-bottom:8px; }
 .rf-info { background:#eef3ff; border:1px solid #b0bef5; border-radius:var(--rs);
 padding:9px 12px; font-size:12px; color:#2a3fa0; margin-bottom:8px; }
-.rf-purp {   background:var(--pur-l); border:1px solid #c8b8f0; border-radius:var(--rs);
+.rf-purp { background:var(--pur-l); border:1px solid #c8b8f0; border-radius:var(--rs);
 padding:9px 12px; font-size:12px; color:var(--pur); margin-bottom:8px; }
 
 /* Empty state */
-.rf-empty {   background:var(--surf); border:2px dashed var(--bdr2); border-radius:var(--r);
+.rf-empty { background:var(--surf); border:2px dashed var(--bdr2); border-radius:var(--r);
 padding:40px 20px; text-align:center; display:flex; flex-direction:column;
 align-items:center; gap: 7px; min-height:180px; justify-content:center; }
 .rf-empty-icon { width:44px; height:44px; background:var(--surf2); border:1.5px solid var(--bdr);
-border-radius:12px; font-size:20px;  display:flex; align-items:center; justify-content:center; margin-bottom:3px; }
+border-radius:12px; font-size:20px; display:flex; align-items:center; justify-content:center; margin-bottom:3px; }
 .rf-empty-h { font-family:'DM Serif Display',serif; font-size:15px; color:var(--ink3); }
-.rf-empty-s  { font-size:11px; color:var(--ink3); opacity:0.7; }
+.rf-empty-s { font-size:11px; color:var(--ink3); opacity:0.7; }
 
 /* Clip cards */
 .rf-ccard { background:var(--surf); border:1.5px solid var(--bdr); border-radius:var(--r);
-padding:12px;  margin-bottom:8px; position:relative; }
-.rf-ccard.sel  { border-color:var(--acc); background:var(--acc-l); }
+padding:12px; margin-bottom:8px; position:relative; }
+.rf-ccard.sel { border-color:var(--acc); background:var(--acc-l); }
 .rf-ccard.done { border-color:var(--grn); background:var(--grn-l); }
 .rf-cscore { position:absolute; top:10px; right:10px; font-size:10px; font-weight:700;
 padding:2px 7px; border-radius:99px; color:#fff; background:var(--ink); }
 .rf-cscore.h { background:var(--acc); }
 .rf-cscore.m { background:var(--amb); }
 .rf-ctitle { font-size:11px; font-weight:700; color:var(--ink); margin-bottom:4px; padding-right:50px; }
-.rf-cmeta  { font-size:10px; color:var(--ink3); line-height:1.5; }
-.rf-cdur   { display:inline-block; background:var(--surf2); border:1px solid var(--bdr);
+.rf-cmeta { font-size:10px; color:var(--ink3); line-height:1.5; }
+.rf-cdur { display:inline-block; background:var(--surf2); border:1px solid var(--bdr);
 border-radius:4px; font-size:10px; font-weight:700; color:var(--ink2); padding:1px 6px; margin-top:5px; }
-.rf-csoi   { display:inline-block; background:var(--pur-l); border:1px solid #c8b8f0;
+.rf-csoi { display:inline-block; background:var(--pur-l); border:1px solid #c8b8f0;
 border-radius:4px; font-size:10px; font-weight:600; color:var(--pur); padding:1px 6px; margin-top:5px; margin-left:4px; }
 
 /* Buttons */
 .stButton >button { font-family:'DM Sans',sans-serif !important; border-radius:var(--rs) !important; font-weight:600 !important; font-size:13px !important; transition:all 0.15s !important; }  
-.stButton >button[kind="primary"]   { background:var(--ink) !important; color:#fff !important; border:none !important; padding:10px 20px !important; }
-.stButton >button[kind="primary"]:hover  { background:#000 !important; transform:translateY(-1px) !important; }
+.stButton >button[kind="primary"] { background:var(--ink) !important; color:#fff !important; border:none !important; padding:10px 20px !important; }
+.stButton >button[kind="primary"]:hover { background:#000 !important; transform:translateY(-1px) !important; }
 .stButton >button[kind="primary"]:disabled { background:var(--bdr2) !important; color:var(--ink3) !important; transform:none !important; }
 .stButton >button[kind="secondary"] { background:var(--surf) !important; color:var(--ink2) !important; border:1.5px solid var(--bdr2) !important; }
 .stButton >button[kind="secondary"]:hover { border-color:var(--acc) !important; color:var(--acc) !important; }
@@ -203,7 +203,7 @@ border:1px solid var(--bdr); border-radius:6px; padding:4px 9px; font-size:11px;
 /* Safe-zone badge */
 .rf-safe { display:inline-flex; align-items:center; gap:4px; background:var(--grn-l);
 border:1px solid #9fd4b8; border-radius:4px; padding:2px 7px;
-font-size:  10px; font-weight:600; color:var(--grn); }
+font-size: 10px; font-weight:600; color:var(--grn); }
 
 /* Footer */
 .rf-foot { margin-top:32px; padding:12px 20px; border-top:1px solid var(--bdr);
@@ -213,7 +213,7 @@ display:flex; align-items:center; justify-content:space-between; }
 padding: 3px 7px; border:1px solid var(--bdr); border-radius:4px; color:var(--ink3); }
 
 /* Layout panels */
-.rf-panel  { padding:14px 20px; }
+.rf-panel { padding:14px 20px; }
 .rf-panelr { padding:14px 20px 14px 10px; }
 
 @media (max-width:768px) {
@@ -227,7 +227,7 @@ padding: 3px 7px; border:1px solid var(--bdr); border-radius:4px; color:var(--in
 /* Radio buttons */
 [data-testid="stRadio"] label { font-size:12px !important; color:var(--ink2) !important; }
 [data-testid="stRadio"] [data-testid="stMarkdownContainer"] p { font-size:12px !important; }
-[data-testid="stRadio"]   > div { gap:6px !important; }
+[data-testid="stRadio"] > div { gap:6px !important; }
 
 /* Vertical 9:16 player — height matches landscape player (~360px) so width = 360*9/16 = 202px */
 .rf-vplayer { width:202px; flex-shrink:0; }
@@ -448,9 +448,9 @@ if tracking_mode == "subject":
             "Panel mode",
             ["auto", "force_on", "force_off"],
             format_func=lambda x: {
-                "auto":  "🤖 Auto-detect (recommended)",
-                "force_on":  "✅ Force ON (2-row split)",
-                "force_off":  "❌ Force OFF (single crop)",
+                "auto": "🤖 Auto-detect (recommended)",
+                "force_on": "✅ Force ON (2-row split)",
+                "force_off": "❌ Force OFF (single crop)",
             }[x],
             index=["auto", "force_on", "force_off"].index(
                 st.session_state.get("panel_mode_override", "auto")
@@ -574,7 +574,7 @@ with tab_trk:
 with tab_sub:
     st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
     if not _whisper_ok:
-        st.markdown('<div class="rf-purp">⚠️ Install  <code>openai-whisper</code> to enable subtitles.</div>',
+        st.markdown('<div class="rf-purp">⚠️ Install <code>openai-whisper</code> to enable subtitles.</div>',
                     unsafe_allow_html=True)
     s1, s2 = st.columns(2, gap="medium")
     with s1:
@@ -624,9 +624,9 @@ with tab_adv:
 
 # Clip settings (auto-clip mode only)
 _CLIP_PRESETS = {
-    "15 sec  (snappy highlight)": (13, 17),
-    "30 sec  (short reel)":       (25, 35),
-    "60 sec  (full segment)":     (50, 65),
+    "15 sec (snappy highlight)": (13, 17),
+    "30 sec (short reel)":       (25, 35),
+    "60 sec (full segment)":     (50, 65),
 }
 clip_min_dur  = 25
 clip_max_dur  = 60
@@ -710,7 +710,7 @@ if app_mode == "autoClip" and tab_analytics is not None:
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
                   <div style="font-size:11px;font-weight:700;color:var(--ink);">Clip {i+1}</div>
                   <div style="display:flex; gap:10px; font-size:10px;">
-                    <span style="color:var(--ink2);">{a['input_size_mb']:.1f} MB →  <b>{a['output_size_mb']:.1f} MB</b></span>
+                    <span style="color:var(--ink2);">{a['input_size_mb']:.1f} MB → <b>{a['output_size_mb']:.1f} MB</b></span>
                     <span style="color:var(--grn); font-weight:600;">{a['compression_ratio']:.2f}x</span>
                   </div>
                 </div>
@@ -925,14 +925,14 @@ with col_out:
             st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
             stem = os.path.splitext(st.session_state.uploaded_file_name or "video")[0]
             st.download_button(
-                "↓  Download vertical video",
+                "↓ Download vertical video",
                 data=st.session_state.output_bytes,
                 file_name=f"{stem}_vertical.mp4",
                 mime="video/mp4",
                 use_container_width=True)
             if st.session_state.srt_bytes:
                 st.download_button(
-                    "↓  Download subtitles (.srt)",
+                    "↓ Download subtitles (.srt)",
                     data=st.session_state.srt_bytes,
                     file_name=f"{stem}.srt",
                     mime="text/plain",
@@ -973,7 +973,7 @@ with col_out:
             # (reliable across reruns unlike id())
             clip_results_map: dict = {}
             if st.session_state.clip_results:
-                # clip_results are stored in  selection order; map by start_sec key
+                # clip_results are stored in selection order; map by start_sec key
                 for r in st.session_state.clip_results:
                     clip_obj = r.get("clip")
                     if clip_obj is not None:
@@ -1044,13 +1044,13 @@ with col_out:
                         except Exception:
                             pass
 
-                    # Vertical player — only for the active  clip, same height as landscape player
+                    # Vertical player — only for the active clip, same height as landscape player
                     if is_playing:
                         try:
                             with open(result_for_clip["output_path"], "rb") as f:
                                 clip_bytes_play = f.read()
                             # Use columns: narrow (9:16 width) | spacer
-                            # 202px ≈ 360px * 9/16    so it matches horizontal player height
+                            # 202px ≈ 360px * 9/16 so it matches horizontal player height
                             vcol, _ = st.columns([202, 400])
                             with vcol:
                                 st.markdown('<div class="rf-vplayer">',
@@ -1099,7 +1099,7 @@ if uploaded_file is not None and st.session_state.input_path:
         if not st.session_state.processing_done:
             a1, a2, a3 = st.columns([4, 5, 2])
             with a1:
-                go = st.button("▶  Convert to Vertical",
+                go = st.button("▶ Convert to Vertical",
                                type="primary", use_container_width=True,
                                disabled=not can_go)
             with a2:
@@ -1218,7 +1218,7 @@ if uploaded_file is not None and st.session_state.input_path:
                     dcol   = "var(--grn)" if delta < 0 else "var(--acc)"
                     st.markdown(
                         f"<p style='color:var(--ink3);font-size:11px;"
-                        f"text-align:right;margin-top:12px;'>{out_mb:.1f} MB  "
+                        f"text-align:right;margin-top:12px;'>{out_mb:.1f} MB "
                         f"<span style='color:{dcol}'>({delta:+.1f} MB)</span></p>",
                         unsafe_allow_html=True)
 
@@ -1236,7 +1236,7 @@ if uploaded_file is not None and st.session_state.input_path:
         if not st.session_state.scan_done:
             b1, b2, b3 = st.columns([4, 4, 2])
             with b1:
-                scan_btn = st.button("🔍  Scan for Clips",
+                scan_btn = st.button("🔍 Scan for Clips",
                                      type="primary", use_container_width=True,
                                      disabled=not can_go)
             with b2:
@@ -1317,7 +1317,7 @@ if uploaded_file is not None and st.session_state.input_path:
                 with p1:
                     n_sel = len(sel)
                     process_btn = st.button(
-                        f"▶  Verticalize {n_sel} Clip{'s' if n_sel != 1 else ''}",
+                        f"▶ Verticalize {n_sel} Clip{'s' if n_sel != 1 else ''}",
                         type="primary", use_container_width=True,
                         disabled=n_sel == 0)
                 with p2:
@@ -1448,8 +1448,8 @@ color:var(--ink3);padding:4px 9px;border:1px solid var(--bdr);border-radius:4px;
 st.markdown("""
 <div class="rf-foot">
  <div class="rf-tech">
- <span>YOLOv8</span>  <span>OpenCV</span>
- <span>Whisper</span>  <span>FFmpeg</span>
+ <span>YOLOv8</span> <span>OpenCV</span>
+ <span>Whisper</span> <span>FFmpeg</span>
  </div>
  <div style='font-size:10px;color:var(--bdr2);'>Reframe · AI Vertical Video</div>
  </div>
