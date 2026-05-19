@@ -816,12 +816,26 @@ class SportsKalmanTracker:
         self._prev_accel_mag = 0.0
 
     def init(self, cx: float, cy: float) -> None:
-        self.x = np.array([[cx], [cy], [0.0], [0.0], [0.0], [0.0]], dtype=np.float64)
+        self.x = np.array([[float(cx)], [float(cy)], [0.0], [0.0], [0.0], [0.0]], dtype=np.float64)
         self.P = np.eye(6, dtype=np.float64) * KALMAN_INITIAL_ERROR
         self.initialized  = True
         self._stale_count = 0
         self._last_sensor = "init"
         self._prev_accel_mag = 0.0
+
+    def predict(self, steps: int = 1) -> Tuple[float, float]:
+        """
+        Predict position steps ahead using constant acceleration model.
+        Returns scalar floats (not numpy arrays).
+        """
+        if not self.initialized:
+            return float(self.x[0, 0]), float(self.x[1, 0])
+
+        dt_s = self.dt * max(1, steps)
+        # x = x0 + v*dt + 0.5*a*dt^2
+        px = float(self.x[0, 0]) + float(self.x[2, 0]) * dt_s + 0.5 * float(self.x[4, 0]) * dt_s**2
+        py = float(self.x[1, 0]) + float(self.x[3, 0]) * dt_s + 0.5 * float(self.x[5, 0]) * dt_s**2
+        return px, py
 
     def predict_adaptive(self, play_phase: str, ball_is_airborne: bool = False, ball_vel: Optional[Tuple[float,float]] = None) -> Tuple[float, float]:
         """
@@ -829,55 +843,38 @@ class SportsKalmanTracker:
         """
         if not self.initialized:
             return 0.0, 0.0
-            
+
         # Determine look-ahead time
         if play_phase == "fast_break":
             steps = int(self.fps * FAST_BREAK_PREDICT_SEC)
         elif play_phase == "rebound":
-            steps = int(self.fps * 0.1) # Very short lookahead for chaotic rebounds
+            steps = int(self.fps * 0.1)
         else: # half_court
             steps = int(self.fps * HALF_COURT_PREDICT_SEC)
-            
-        steps = max(1, steps)
-        
-        # Standard Kinematic Prediction
-        dt_s = self.dt * steps
-        x_pred = self.x.copy()
-        
-        # If ball is airborne, we might want to predict trajectory differently
-        # But for camera centering, following the predicted kinematic path of the 
-        # *player* or *ball carrier* is usually best. 
-        # If we are tracking the ball directly and it's airborne:
-        if ball_is_airborne and ball_vel:
-            # Simple projectile motion adjustment could go here
-            # For now, we rely on the constant acceleration model in self.x
-            pass
-            
-        x_pred[0] += self.x[2] * dt_s + 0.5 * self.x[4] * dt_s**2
-        x_pred[1] += self.x[3] * dt_s + 0.5 * self.x[5] * dt_s**2
-        x_pred[2] += self.x[4] * dt_s
-        x_pred[3] += self.x[5] * dt_s
-        
-        return float(x_pred[0, 0]), float(x_pred[1, 0])
+
+        return self.predict(steps=max(1, steps))
 
     def _predict_step(self) -> None:
         """Internal: advance state by one dt (called every frame)."""
-        if self.initialized:
-            # Adaptive Q: If previous acceleration was high, increase Q temporarily
-            current_accel_mag = math.sqrt(self.x[4,0]**2 + self.x[5,0]**2)
-            if current_accel_mag > 50.0: # High jerk threshold
-                Q_used = self.Q_base * 10 # Inflate Q
-            else:
-                Q_used = self.Q_base
-                
-            self.x = self.F @ self.x
-            self.P = self.F @ self.P @ self.F.T + Q_used
-            self._stale_count += 1
-            
-            # Clamp velocity to prevent explosion during long dropouts
-            max_vel = 200.0 # pixels per frame
-            if abs(self.x[2,0]) > max_vel: self.x[2,0] = np.sign(self.x[2,0]) * max_vel
-            if abs(self.x[3,0]) > max_vel: self.x[3,0] = np.sign(self.x[3,0]) * max_vel
+        if not self.initialized:
+            return
+        # Adaptive Q: If previous acceleration was high, increase Q temporarily
+        current_accel_mag = math.sqrt(float(self.x[4,0])**2 + float(self.x[5,0])**2)
+        if current_accel_mag > 50.0: # High jerk threshold
+            Q_used = self.Q_base * 10 # Inflate Q
+        else:
+            Q_used = self.Q_base
+
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + Q_used
+        self._stale_count += 1
+
+        # Clamp velocity to prevent explosion during long dropouts
+        max_vel = 200.0 # pixels per frame
+        if abs(float(self.x[2,0])) > max_vel: 
+            self.x[2,0] = float(np.sign(self.x[2,0])) * max_vel
+        if abs(float(self.x[3,0])) > max_vel: 
+            self.x[3,0] = float(np.sign(self.x[3,0])) * max_vel
 
     def update(
         self, cx: float, cy: float, sensor: str = "yolo",
@@ -942,7 +939,7 @@ class SportsKalmanTracker:
     @property
     def speed(self) -> float:
         vx, vy = self.velocity
-        return math.sqrt(vx * vx + vy * vy)
+        return math.sqrt(float(vx) * float(vx) + float(vy) * float(vy))
 
     @property
     def last_sensor(self) -> str:
@@ -2553,8 +2550,8 @@ def process_video(
                     
                     # Get prediction for THIS frame
                     kx, ky = kalman_tracker.predict(steps=0) # Current state estimate
-                    dense_kalman_cx[fi2] = float(np.clip(kx, 0, orig_w))
-                    dense_kalman_cy[fi2] = float(np.clip(ky, 0, orig_h))
+                    dense_kalman_cx[fi2] = float(np.clip(float(kx), 0, orig_w))
+                    dense_kalman_cy[fi2] = float(np.clip(float(ky), 0, orig_h))
 
                 # ── STEP 2: DETECT & UPDATE (If sample frame) ──────────────────
                 if is_sample:
@@ -2621,8 +2618,8 @@ def process_video(
                                 # After update, the internal state is corrected. 
                                 # We overwrite the prediction with the corrected state for this frame.
                                 kx, ky = kalman_tracker.predict(steps=0)
-                                dense_kalman_cx[fi2] = float(np.clip(kx, 0, orig_w))
-                                dense_kalman_cy[fi2] = float(np.clip(ky, 0, orig_h))
+                                dense_kalman_cx[fi2] = float(np.clip(float(kx), 0, orig_w))
+                                dense_kalman_cy[fi2] = float(np.clip(float(ky), 0, orig_h))
 
                             # Record event flag
                             if event_detector is not None and ball_box is not None:
@@ -2649,8 +2646,8 @@ def process_video(
                                     if kalman_tracker is not None and kalman_tracker.initialized:
                                         kalman_tracker.update(anchor_cx, anchor_cy, sensor="optical_flow")
                                         kx, ky = kalman_tracker.predict(steps=0)
-                                        dense_kalman_cx[fi2] = float(np.clip(kx, 0, orig_w))
-                                        dense_kalman_cy[fi2] = float(np.clip(ky, 0, orig_h))
+                                        dense_kalman_cx[fi2] = float(np.clip(float(kx), 0, orig_w))
+                                        dense_kalman_cy[fi2] = float(np.clip(float(ky), 0, orig_h))
                             prev_flow2 = sm
 
                         # Saliency fallback
@@ -2661,8 +2658,8 @@ def process_video(
                             if kalman_tracker is not None and kalman_tracker.initialized:
                                 kalman_tracker.update(anchor_cx, anchor_cy, sensor="saliency")
                                 kx, ky = kalman_tracker.predict(steps=0)
-                                dense_kalman_cx[fi2] = float(np.clip(kx, 0, orig_w))
-                                dense_kalman_cy[fi2] = float(np.clip(ky, 0, orig_h))
+                                dense_kalman_cx[fi2] = float(np.clip(float(kx), 0, orig_w))
+                                dense_kalman_cy[fi2] = float(np.clip(float(ky), 0, orig_h))
 
                     else:
                         # Standard subject tracking
@@ -2760,7 +2757,7 @@ def process_video(
                            if kalman_tracker is not None and 
                            kalman_tracker.initialized and
                            i > 0 and  
-                           getattr(kalman_tracker, '_stale_count', 0) > 0)
+                           int(getattr(kalman_tracker, '_stale_count', 0)) > 0)
 
             smooth_metrics = {
                 "jitter_raw": round(jitter_raw, 2),
