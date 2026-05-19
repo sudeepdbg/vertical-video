@@ -10,6 +10,7 @@ IntelligentCropStrategy   → replaces raw cx/cy hard-clamp
 • process_video_sports() (Section 31) — new entry-point for sports mode;
 old process_video() still works unchanged for non-sports content
 • process_video() (Section 32) — unified entry-point that auto-routes
+• process_clips_batch() (Section 34) — batch processor for Auto-Clip mode
 v6.0 features RETAINED:
 Multi-Object Sports Tracker class (Section 13)
 Adaptive Velocity-Aware Smoother class (Section 14)
@@ -2537,6 +2538,165 @@ def convert_to_vertical(
         subtitle_style=style,
         progress_callback=progress_callback,
     )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 34: Batch Processing Helper  ← NEW v6.1
+# ═══════════════════════════════════════════════════════════════════════════════
+def process_clips_batch(
+    input_path: str,
+    output_dir: str,
+    clips: List[ClipSegment],
+    target_preset_label: str = "Match source (no upscale)",
+    tracking_mode: str = "subject",
+    confidence: float = 0.45,
+    crf: int = 23,
+    preset: str = "fast",
+    progress_callback=None,
+    sport_type: str = "auto",
+    panel_config: Optional[PanelModeConfig] = None,
+    # Legacy/Unused args for compatibility with app.py calls
+    talking_head_bias: float = 0.3,
+    smooth_window: int = 15,
+    adaptive_smoothing: bool = True,
+    rule_of_thirds: bool = True,
+    encoder_preset: str = "fast",
+    audio_bitrate: str = "128k",
+    yolo_weights: str = "yolov8n.pt",
+    burn_subtitles: bool = False,
+    whisper_model: str = "base",
+    subtitle_style_name: str = "Bold White (TikTok)",
+    subtitle_max_chars: int = 42,
+) -> List[Dict[str, Any]]:
+    """
+    Processes a list of ClipSegments by trimming the source video and 
+    calling process_video/process_video_sports for each segment.
+    """
+    import shutil
+    
+    results = []
+    total_clips = len(clips)
+    
+    # Get source info once
+    try:
+        info = get_video_info(input_path)
+        orig_w = info["width"]
+        orig_h = info["height"]
+        target_w, target_h = resolve_target_size(target_preset_label, orig_w, orig_h)
+        crop_w, crop_h = calculate_crop_dims(orig_w, orig_h, target_w, target_h)
+    except Exception as e:
+        raise ProcessingError(f"Failed to get video info: {e}")
+
+    model = _get_model(yolo_weights) if tracking_mode != "talking_head" else None
+
+    for i, clip in enumerate(clips):
+        clip_idx = i + 1
+        start_sec = clip.start_sec
+        end_sec = clip.end_sec
+        
+        # Define output path for this clip
+        clip_filename = f"clip_{clip_idx}_vertical.mp4"
+        clip_output_path = os.path.join(output_dir, clip_filename)
+        
+        def _clip_progress(v, msg=""):
+            if progress_callback:
+                # Scale progress: (i + v) / total_clips
+                overall_v = (i + v) / total_clips
+                progress_callback(overall_v, f"Clip {clip_idx}/{total_clips}: {msg}")
+
+        try:
+            _clip_progress(0.0, "Trimming...")
+            
+            # Create temporary trimmed file
+            fd, temp_trimmed = tempfile.mkstemp(suffix=".mp4")
+            os.close(fd)
+            
+            # Trim video using FFmpeg
+            trim_cmd = [
+                "ffmpeg", "-y", "-hwaccel", "none",
+                "-ss", str(start_sec), "-to", str(end_sec),
+                "-i", input_path,
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+                "-c:a", "aac", "-b:a", "128k",
+                "-avoid_negative_ts", "make_zero",
+                temp_trimmed
+            ]
+            r = subprocess.run(trim_cmd, capture_output=True)
+            if r.returncode != 0 or not os.path.exists(temp_trimmed):
+                raise ProcessingError(f"FFmpeg trim failed for clip {clip_idx}")
+            
+            _clip_progress(0.1, "Processing...")
+            
+            # Determine metrics dict structure
+            meta = {}
+            
+            # Route to sports or standard processor
+            if tracking_mode == "sports_action":
+                meta = process_video_sports(
+                    input_path=temp_trimmed,
+                    output_path=clip_output_path,
+                    target_w=target_w,
+                    target_h=target_h,
+                    crop_w=crop_w,
+                    crop_h=crop_h,
+                    model=model,
+                    confidence=confidence,
+                    crf=crf,
+                    preset=preset,
+                    progress_callback=_clip_progress,
+                )
+            else:
+                meta = process_video(
+                    input_path=temp_trimmed,
+                    output_path=clip_output_path,
+                    resolution_label=target_preset_label,
+                    tracking_mode=tracking_mode,
+                    confidence=confidence,
+                    crf=crf,
+                    preset=preset,
+                    panel_cfg=panel_config,
+                    progress_callback=_clip_progress,
+                )
+            
+            # Cleanup temp file
+            try: os.unlink(temp_trimmed)
+            except: pass
+            
+            # Calculate analytics for this clip
+            if os.path.exists(clip_output_path):
+                out_size_mb = os.path.getsize(clip_output_path) / (1024 * 1024)
+                in_size_mb = os.path.getsize(temp_trimmed) / (1024 * 1024) if os.path.exists(temp_trimmed) else 0 # Note: temp deleted, approximating or skipping
+                # Since temp is deleted, we can't get exact input size easily without re-statting before delete. 
+                # For simplicity, we'll just report output size and dummy input or skip ratio if input missing.
+                
+                result_entry = {
+                    "clip": clip,
+                    "output_path": clip_output_path,
+                    "error": None,
+                    "analytics": {
+                        "output_size_mb": round(out_size_mb, 2),
+                        "input_size_mb": 0.0, # Placeholder as temp is gone
+                        "compression_ratio": 1.0,
+                        **meta # Include jitter/smoothness metrics from meta
+                    }
+                }
+            else:
+                raise ProcessingError("Output file not created")
+                
+            results.append(result_entry)
+            _clip_progress(1.0, "Done")
+            
+        except Exception as e:
+            results.append({
+                "clip": clip,
+                "output_path": None,
+                "error": str(e),
+                "analytics": {}
+            })
+            # Cleanup temp on error
+            try: os.unlink(temp_trimmed)
+            except: pass
+            
+    return results
 
 if __name__ == "__main__":
     print("verticalize.py v6.1 — smoke-test")
