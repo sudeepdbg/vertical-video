@@ -7,7 +7,7 @@ import tempfile
 import os
 import glob
 from verticalize import (
-    process_video, get_video_info, detect_clips, process_clips_batch,
+    process_video, process_sports_video, get_video_info, detect_clips, process_clips_batch,
     RESOLUTION_PRESETS, SUBTITLE_STYLES, TRANSLATION_LANGUAGES,
     resolve_target_size, whisper_available, translation_available,
     ClipSegment,
@@ -758,6 +758,12 @@ current_settings = dict(
     burn_subtitles=burn_subtitles,
     whisper_model=whisper_model if burn_subtitles else "",
     audio_bitrate_label=audio_bitrate_label,
+    # v4.1 panel settings
+    panel_mode_override=st.session_state.get("panel_mode_override", "auto"),
+    panel_max_motion=st.session_state.get("panel_max_motion", 20.0),
+    panel_min_area=st.session_state.get("panel_min_area", 0.03),
+    panel_max_variance=st.session_state.get("panel_max_variance", 2.5),
+    panel_stability=st.session_state.get("panel_stability", 0.60),
 )
 _invalidate_if_changed(current_settings)
 
@@ -1125,20 +1131,14 @@ if uploaded_file is not None and st.session_state.input_path:
                         prog.progress(min(v, 1.0))
                         if msg: status.info(msg)
 
-                    # Sports action uses process_video with subject tracking
-                    # (panel detection will reject high-motion sports and fall back to standard tracking)
+                    # v4.0: Use process_sports_video for sports mode
                     if tracking_mode == "sports_action":
-                        meta = process_video(
+                        meta = process_sports_video(
                             st.session_state.input_path,
                             st.session_state.output_path,
+                            sport_type=st.session_state.get("sport_type", "auto"),
                             target_preset_label=resolution_label,
-                            tracking_mode="subject",  # Use subject tracking for sports
                             confidence=confidence,
-                            smooth_window=smooth_window,
-                            adaptive_smoothing=adaptive_smoothing,
-                            use_optical_flow=use_optical_flow,
-                            rule_of_thirds=rule_of_thirds,
-                            scene_cut_threshold=scene_cut_threshold,
                             output_fps=output_fps,
                             crf=crf,
                             encoder_preset=encoder_preset_label,
@@ -1146,10 +1146,8 @@ if uploaded_file is not None and st.session_state.input_path:
                             yolo_weights=yolo_weights,
                             burn_subtitles=burn_subtitles,
                             whisper_model=whisper_model,
-                            whisper_language=whisper_language,
                             subtitle_style_name=subtitle_style_name,
                             subtitle_max_chars=subtitle_max_chars,
-                            subtitle_translate_to=subtitle_translate_to,
                             progress_callback=_cb,
                         )
                     else:
@@ -1177,6 +1175,12 @@ if uploaded_file is not None and st.session_state.input_path:
                             subtitle_max_chars=subtitle_max_chars,
                             subtitle_translate_to=subtitle_translate_to,
                             progress_callback=_cb,
+                            # v4.1 panel mode params
+                            panel_mode_override=st.session_state.get("panel_mode_override", "auto"),
+                            panel_max_motion=st.session_state.get("panel_max_motion", 20.0),
+                            panel_min_area=st.session_state.get("panel_min_area", 0.03),
+                            panel_max_variance=st.session_state.get("panel_max_variance", 2.5),
+                            panel_stability=st.session_state.get("panel_stability", 0.60),
                         )
                     prog.progress(1.0)
                     out_p = st.session_state.output_path
@@ -1365,6 +1369,13 @@ if uploaded_file is not None and st.session_state.input_path:
                             subtitle_style_name=subtitle_style_name,
                             subtitle_max_chars=subtitle_max_chars,
                             progress_callback=_batch_cb,
+                            sport_type=st.session_state.get("sport_type", "auto"),
+                            # v4.1 panel mode params
+                            panel_mode_override=st.session_state.get("panel_mode_override", "auto"),
+                            panel_max_motion=st.session_state.get("panel_max_motion", 20.0),
+                            panel_min_area=st.session_state.get("panel_min_area", 0.03),
+                            panel_max_variance=st.session_state.get("panel_max_variance", 2.5),
+                            panel_stability=st.session_state.get("panel_stability", 0.60),
                         )
                         prog.progress(1.0)
                         st.session_state.clip_results = results
