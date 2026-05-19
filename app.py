@@ -9,13 +9,14 @@ import glob
 from verticalize import (
     process_video, 
     process_video_sports,  # FIXED: Changed from process_sports_video
-    process_clips_batch,   # ADDED: Import the new batch function
     get_video_info, 
     detect_clips, 
+    process_clips_batch,
     RESOLUTION_PRESETS, 
     SUBTITLE_STYLES, 
     TRANSLATION_LANGUAGES,
     resolve_target_size, 
+    calculate_crop_dims,   # ADDED: Required for sports mode calculation
     whisper_available, 
     translation_available,
     ClipSegment, 
