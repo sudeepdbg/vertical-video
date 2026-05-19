@@ -9,9 +9,9 @@ import glob
 from verticalize import (
     process_video, 
     process_video_sports,  # FIXED: Changed from process_sports_video
+    process_clips_batch,   # ADDED: Import the new batch function
     get_video_info, 
     detect_clips, 
-    process_clips_batch,
     RESOLUTION_PRESETS, 
     SUBTITLE_STYLES, 
     TRANSLATION_LANGUAGES,
@@ -879,8 +879,8 @@ with col_out:
             # ANALYTICS SECTION
             if st.session_state.analytics_data:
                 a = st.session_state.analytics_data
-                red_pct = a['file_size_reduction_pct']
-                ratio = a['compression_ratio']
+                red_pct = a.get('file_size_reduction_pct', 0)
+                ratio = a.get('compression_ratio', 1.0)
 
                 # v4.1: Show panel mode status
                 if a.get('panel_mode'):
@@ -904,17 +904,17 @@ with col_out:
               <div class="rf-an-item">
                 <div class="rf-an-label">Size Reduction</div>
                 <div class="rf-an-val {'good' if red_pct > 0 else 'bad'}">{red_pct:.1f}%</div>
-                <div class="rf-an-sub">{a['input_size_mb']:.1f} MB → {a['output_size_mb']:.1f} MB</div>
+                <div class="rf-an-sub">{a.get('input_size_mb', 0):.1f} MB → {a.get('output_size_mb', 0):.1f} MB</div>
               </div>
               <div class="rf-an-item">
                 <div class="rf-an-label">Compression</div>
                 <div class="rf-an-val">{ratio:.2f}x</div>
-                <div class="rf-an-sub">{a['input_bitrate_kbps']} kbps → {a['output_bitrate_kbps']} kbps</div>
+                <div class="rf-an-sub">{a.get('input_bitrate_kbps', 0)} kbps → {a.get('output_bitrate_kbps', 0)} kbps</div>
               </div>
               <div class="rf-an-item">
                 <div class="rf-an-label">Resolution</div>
-                <div class="rf-an-val">{a['output_resolution']}</div>
-                <div class="rf-an-sub">{a['input_resolution']} source</div>
+                <div class="rf-an-val">{a.get('output_resolution', 'N/A')}</div>
+                <div class="rf-an-sub">{a.get('input_resolution', 'N/A')} source</div>
               </div>
             </div>
            
@@ -1385,19 +1385,9 @@ if uploaded_file is not None and st.session_state.input_path:
                             clips=selected_clips,
                             target_preset_label=resolution_label,
                             tracking_mode=tracking_mode,
-                            talking_head_bias=talking_head_bias,
                             confidence=confidence,
-                            smooth_window=smooth_window,
-                            adaptive_smoothing=adaptive_smoothing,
-                            rule_of_thirds=rule_of_thirds, 
                             crf=crf,
-                            encoder_preset=encoder_preset_label,
-                            audio_bitrate=audio_bitrate_label,
-                            yolo_weights=yolo_weights,
-                            burn_subtitles=burn_subtitles,
-                            whisper_model=whisper_model,
-                            subtitle_style_name=subtitle_style_name,
-                            subtitle_max_chars=subtitle_max_chars,
+                            preset=encoder_preset_label,
                             progress_callback=_batch_cb,
                             sport_type=st.session_state.get("sport_type", "auto"),
                             # v4.1 panel mode params
