@@ -905,7 +905,7 @@ class SportsKalmanTracker:
         
         # Mahalanobis Distance for Gating
         inv_S = np.linalg.inv(S)
-        mahalanobis_dist = np.sqrt(float(y.T @ inv_S @ y))
+        mahalanobis_dist = float(np.sqrt((y.T @ inv_S @ y).item()))
         
         if mahalanobis_dist > KALMAN_GATE_THRESHOLD:
             # Reject measurement as outlier. Keep prediction.
