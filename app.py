@@ -10,7 +10,7 @@ from verticalize import (
     process_video, process_sports_video, get_video_info, detect_clips, process_clips_batch,
     RESOLUTION_PRESETS, SUBTITLE_STYLES, TRANSLATION_LANGUAGES,
     resolve_target_size, whisper_available, translation_available,
-    ClipSegment,
+    ClipSegment, PanelModeConfig,
 )
 
 st.set_page_config(
@@ -1176,11 +1176,13 @@ if uploaded_file is not None and st.session_state.input_path:
                             subtitle_translate_to=subtitle_translate_to,
                             progress_callback=_cb,
                             # v4.1 panel mode params
-                            panel_mode_override=st.session_state.get("panel_mode_override", "auto"),
-                            panel_max_motion=st.session_state.get("panel_max_motion", 20.0),
-                            panel_min_area=st.session_state.get("panel_min_area", 0.03),
-                            panel_max_variance=st.session_state.get("panel_max_variance", 2.5),
-                            panel_stability=st.session_state.get("panel_stability", 0.60),
+                            panel_config=PanelModeConfig(
+                                split_mode=st.session_state.get("panel_mode_override", "auto"),
+                                max_person_motion=st.session_state.get("panel_max_motion", 20.0),
+                                min_person_area_frac=st.session_state.get("panel_min_area", 0.03),
+                                max_count_variance=st.session_state.get("panel_max_variance", 2.5),
+                                stability_frac=st.session_state.get("panel_stability", 0.60),
+                            ),
                         )
                     prog.progress(1.0)
                     out_p = st.session_state.output_path
@@ -1371,11 +1373,13 @@ if uploaded_file is not None and st.session_state.input_path:
                             progress_callback=_batch_cb,
                             sport_type=st.session_state.get("sport_type", "auto"),
                             # v4.1 panel mode params
-                            panel_mode_override=st.session_state.get("panel_mode_override", "auto"),
-                            panel_max_motion=st.session_state.get("panel_max_motion", 20.0),
-                            panel_min_area=st.session_state.get("panel_min_area", 0.03),
-                            panel_max_variance=st.session_state.get("panel_max_variance", 2.5),
-                            panel_stability=st.session_state.get("panel_stability", 0.60),
+                            panel_config=PanelModeConfig(
+                                split_mode=st.session_state.get("panel_mode_override", "auto"),
+                                max_person_motion=st.session_state.get("panel_max_motion", 20.0),
+                                min_person_area_frac=st.session_state.get("panel_min_area", 0.03),
+                                max_count_variance=st.session_state.get("panel_max_variance", 2.5),
+                                stability_frac=st.session_state.get("panel_stability", 0.60),
+                            ),
                         )
                         prog.progress(1.0)
                         st.session_state.clip_results = results
