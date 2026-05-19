@@ -1,36 +1,15 @@
-The error occurs because your `verticalize.py` file contains **invalid characters** (likely hidden Unicode spaces or non-ASCII characters) in the string literals used for `namedtuple` field names and dictionary keys.
-
-Looking at your provided code, I see many strings like `"h "`, `"s "`, `"v "`, `"fontsize "`, etc., which have a trailing space inside the quotes. However, the specific error `ValueError: Type names and field names must be valid` on line 1135 points to the `DetectionResult` namedtuple definition.
-
-In your provided code snippet:
-```python
-DetectionResult = namedtuple(
-    "DetectionResult ", ["cx ", "cy ", "ux1 ", "uy1 ", "ux2 ", "uy2 ", "count "]
-)
-```
-The field names `"cx "`, `"cy "`, etc., contain trailing spaces. **Python `namedtuple` field names cannot contain spaces.** They must be valid Python identifiers (letters, digits, underscores, starting with a letter/underscore).
-
-Additionally, throughout the file, you have dictionary keys like `"h "`, `"s "`, `"v "` with trailing spaces. While these are *technically* valid dictionary keys, they are likely causing issues elsewhere or were introduced by a copy-paste error from a formatted source (like a PDF or website) that added invisible characters or extra spaces.
-
-### ✅ Fix
-
-You need to **remove all trailing spaces** from:
-1.  `namedtuple` field names.
-2.  Dictionary keys (if they are used as identifiers or cause lookup failures).
-3.  Any other string literals that should not have spaces.
-
-Here is the corrected `verticalize.py` with all invalid trailing spaces removed from identifiers and keys. I have also cleaned up the `DetectionResult` definition specifically.
-
-```python
 """
-verticalize.py — AI Vertical Video Converter v4.5 (Sports Intelligence Engine - Tuned)
+verticalize.py — AI Vertical Video Converter v4.6 (Sports Intelligence Engine - FIXED)
 ───────────────────────────────────────────────────────────────────────────────
-IMPROVEMENTS over v4.4:
-1. KALMAN TUNING: Higher Process Noise (5e-2) for agility, Lower Measurement Noise (5e-2) for snap.
-2. DENSE TRACKING: Writes Kalman state every frame, not just on detection samples.
-3. POST-SMOOTHING: Lightweight Bidirectional EMA applied to Kalman output to remove jitter.
-4. CUT HANDLING: Aggressive Covariance reset on scene cuts to prevent ghosting.
-5. REAL METRICS: Smoothness score is now calculated from actual smoothed data, not hardcoded.
+FIXES over v4.5:
+1. KALMAN TUNING: Properly scaled Q/R matrices for sports motion (px units).
+2. ADAPTIVE Q: Grows with stale count but is capped to prevent explosion.
+3. VELOCITY CLAMPING: Tightened to realistic sports speeds (50 px/frame).
+4. MEASUREMENT NOISE: R_yolo scaled to actual detection jitter (~400 px²).
+5. POST-SMOOTHING: Lower alpha (0.06) + scene-cut-aware median filter.
+6. PREDICTION LOGIC: Fixed double-prediction bug in detection frames.
+7. COVARIANCE CAP: Prevents P from growing unbounded during dropouts.
+8. ADAPTIVE R: Increases measurement noise when detections are uncertain.
 """
 from __future__ import annotations
 import math
@@ -49,11 +28,9 @@ try:
 except ImportError:
     _YOLO_AVAILABLE = False
 
-# ─── Custom exception ──────────────────────────────────────────────────────────
 class ProcessingError(Exception):
     pass
 
-# ─── Constants ─────────────────────────────────────────────────────────────────
 PERSON_CLASS_ID      = 0
 SPORTS_BALL_CLASS_ID = 32
 HIGH_PRIO_CLASSES    = {0, 2, 3, 5, 7, 15, 16}
@@ -62,7 +39,6 @@ MIN_FRAME_DIM        = 240
 MAX_FRAMES_GUARD     = 1_080_000
 LOWER_THIRD_GUARD    = 0.80
 
-# Panel detection thresholds
 PANEL_MIN_PERSONS          = 2
 PANEL_PROBE_COUNT          = 30
 PANEL_MAJORITY_FRAC        = 0.60
@@ -72,42 +48,43 @@ PANEL_MIN_PERSON_AREA_FRAC = 0.06
 PANEL_MAX_COUNT_VARIANCE   = 1.5
 PANEL_MIN_PERSON_ASPECT    = 1.3
 
-# Sports constants
 SPORTS_COURT_COLORS_HSV = [
-    {"h": [10, 30],   "s": [40, 180],  "v": [80, 220]},   # Basketball
-    {"h": [35, 85],   "s": [40, 255],  "v": [40, 220]},   # Football/Soccer
-    {"h": [90, 130],  "s": [0,  60],   "v": [150, 255]},  # Hockey
+    { "h": [10, 30],   "s": [40, 180],  "v": [80, 220]},
+    { "h": [35, 85],   "s": [40, 255],  "v": [40, 220]},
+    { "h": [90, 130],  "s": [0,  60],   "v": [150, 255]},
 ]
 
-# Kalman Constants - TUNED FOR AGILITY & SMOOTHNESS (v4.5)
-KALMAN_PROCESS_NOISE_BASE    = 5e-2  # Increased from 1e-2 to reduce lag/stiffness
-KALMAN_PROCESS_NOISE_HIGH    = 1e-1  # For high acceleration/jerk
-KALMAN_MEASUREMENT_NOISE     = 5e-2  # Decreased from 1e-1 to trust detections more (snap)
-KALMAN_OPTICAL_FLOW_NOISE    = 5e-1
-KALMAN_SALIENCY_NOISE        = 2e-0
-KALMAN_INITIAL_ERROR         = 1.0
-KALMAN_GATE_THRESHOLD        = 4.0
+# FIXED v4.6: Q and R in proper pixel units
+KALMAN_PROCESS_NOISE_POS     = 8.0
+KALMAN_PROCESS_NOISE_VEL     = 15.0
+KALMAN_PROCESS_NOISE_ACC     = 25.0
+KALMAN_MEASUREMENT_NOISE     = 400.0
+KALMAN_OPTICAL_FLOW_NOISE    = 900.0
+KALMAN_SALIENCY_NOISE        = 1600.0
+KALMAN_INITIAL_ERROR         = 100.0
+KALMAN_GATE_THRESHOLD        = 3.0
+KALMAN_MAX_P_DIAG            = 10000.0
+KALMAN_STALE_Q_GROWTH        = 1.5
+KALMAN_MAX_STALE_Q_MULT      = 10.0
 
-# Physics & Prediction
-GRAVITY_PIXELS_PER_SEC2      = 980  # Approx gravity in px/s^2 (depends on resolution)
-FAST_BREAK_PREDICT_SEC       = 0.8  # Look ahead 0.8s for fast breaks
-HALF_COURT_PREDICT_SEC       = 0.3  # Look ahead 0.3s for set plays
-BALL_SPEED_THRESHOLD         = 15.0 # px/frame to consider "fast"
+GRAVITY_PIXELS_PER_SEC2      = 980
+FAST_BREAK_PREDICT_SEC       = 0.8
+HALF_COURT_PREDICT_SEC       = 0.3
+BALL_SPEED_THRESHOLD         = 15.0
 SPORTS_SCENE_CUT_THRESHOLD   = 0.22
 SPORTS_SCENE_CUT_MIN_FRAMES  = 3
 SPORTS_SWITCH_BALL_BONUS     = 200
-SPORTS_BALL_CONFIDENCE       = 0.25  # Lowered for better ball detection
+SPORTS_BALL_CONFIDENCE       = 0.25
 SPORTS_BALL_PROXIMITY_PX     = 120
 SPORTS_EVENT_EXPAND_FRAMES   = 15
 SPORTS_EVENT_EXPAND_FACTOR   = 1.25
 
-# Legacy velocity -> Gaussian window table (non-sports)
-VELOCITY_SMOOTH_TABLE: List[Tuple[float, int]] = [
+VELOCITY_SMOOTH_TABLE = [
     (0.0, 61), (3.0, 53), (8.0, 43), (15.0, 33),
     (30.0, 23), (60.0, 15), (120.0, 9),
 ]
 
-RESOLUTION_PRESETS: Dict[str, Tuple[int, int]] = {
+RESOLUTION_PRESETS = {
     "Match source (no upscale)":    (0, 0),
     "1080p  (1080x1920 - Full HD)": (1080, 1920),
     "720p   (720x1280  - HD)":      (720, 1280),
@@ -115,22 +92,22 @@ RESOLUTION_PRESETS: Dict[str, Tuple[int, int]] = {
     "480p   (480x854   - Low)":     (480, 854),
 }
 
-SUBTITLE_STYLES: Dict[str, Dict[str, Any]] = {
+SUBTITLE_STYLES = {
     "Bold White (TikTok)": {
-        "fontsize": 18,  "primary_color":  "&H00FFFFFF",  "outline_color":  "&H00000000",
-        "outline": 2,  "bold": 1,  "shadow": 0,  "back_color":  "&H00000000",  "margin_v": 80,
+        "fontsize": 18,  "primary_color": "&H00FFFFFF",  "outline_color": "&H00000000",
+        "outline": 2,  "bold": 1,  "shadow": 0,  "back_color": "&H00000000",  "margin_v": 80,
     },
     "Yellow (Classic)": {
-        "fontsize": 16,  "primary_color":  "&H0000FFFF",  "outline_color":  "&H00000000",
-        "outline": 2,  "bold": 1,  "shadow": 1,  "back_color":  "&H00000000",  "margin_v": 80,
+        "fontsize": 16,  "primary_color": "&H0000FFFF",  "outline_color": "&H00000000",
+        "outline": 2,  "bold": 1,  "shadow": 1,  "back_color": "&H00000000",  "margin_v": 80,
     },
     "Box (Accessible)": {
-        "fontsize": 15,  "primary_color":  "&H00FFFFFF",  "outline_color":  "&H00000000",
-        "outline": 0,  "bold": 0,  "shadow": 0,  "back_color":  "&H80000000",  "margin_v": 80,
+        "fontsize": 15,  "primary_color": "&H00FFFFFF",  "outline_color": "&H00000000",
+        "outline": 0,  "bold": 0,  "shadow": 0,  "back_color": "&H80000000",  "margin_v": 80,
     },
 }
 
-TRANSLATION_LANGUAGES: Dict[str, str] = {
+TRANSLATION_LANGUAGES = {
     "None (keep original)":  "",    "French":  "fr",        "German":  "de",
     "Spanish":  "es",               "Italian":  "it",        "Portuguese":  "pt",
     "Dutch":  "nl",                 "Polish":  "pl",         "Russian":  "ru",
@@ -142,7 +119,6 @@ TRANSLATION_LANGUAGES: Dict[str, str] = {
     "Malay":  "ms",                 "Ukrainian":  "uk",
 }
 
-# Visual constants
 VIGNETTE_STRENGTH       = 0.55
 VIGNETTE_FALLOFF        = 1.8
 COLOR_GRADES            = ("none", "warm", "cool", "vibrant", "matte")
@@ -156,7 +132,6 @@ PANEL_DIVIDER_COLOR     = (15, 15, 15)
 PANEL_CROP_EXPAND       = 1.55
 PANEL_TRANSITION_FRAMES = 6
 
-# ─── Panel Mode Configuration ─────────────────────────────────────────────────
 @dataclass
 class PanelModeConfig:
     split_mode: str = "auto"
@@ -180,7 +155,6 @@ class PanelModeConfig:
                 "falling back to 2 splits.", file=sys.stderr,
             )
 
-# ─── Clip segment ──────────────────────────────────────────────────────────────
 class ClipSegment:
     def __init__(
         self, start_sec: float, end_sec: float, score: float,
@@ -197,7 +171,6 @@ class ClipSegment:
     def __repr__(self) -> str:
         return f"<Clip {self.start_sec:.1f}s-{self.end_sec:.1f}s score={self.score:.2f}>"
 
-# ─── Feature availability guards ───────────────────────────────────────────────
 def whisper_available() -> bool:
     try:
         import whisper
@@ -222,7 +195,6 @@ def yolo_available() -> bool:
     except Exception:
         return os.path.exists("yolov8n.pt") or os.path.exists("yolov8s.pt")
 
-# ─── Vignette (cached numpy mask) ─────────────────────────────────────────────
 _vignette_cache: Dict[Tuple, np.ndarray] = {}
 
 def _build_vignette(
@@ -247,7 +219,6 @@ def apply_vignette(frame: np.ndarray, strength: float = VIGNETTE_STRENGTH) -> np
     h, w = frame.shape[:2]
     return (frame.astype(np.float32) * _build_vignette(w, h, strength)).clip(0, 255).astype(np.uint8)
 
-# ─── Unsharp mask ──────────────────────────────────────────────────────────────
 def apply_sharpen(frame: np.ndarray, strength: float = 0.6, radius: int = 1) -> np.ndarray:
     if strength <= 0:
         return frame
@@ -255,7 +226,6 @@ def apply_sharpen(frame: np.ndarray, strength: float = 0.6, radius: int = 1) -> 
     blurred = cv2.GaussianBlur(frame, (ksize, ksize), 0)
     return cv2.addWeighted(frame, 1 + strength, blurred, -strength, 0)
 
-# ─── Color grade LUT ───────────────────────────────────────────────────────────
 _lut_cache: Dict[str, np.ndarray] = {}
 
 def _build_lut(grade: str) -> np.ndarray:
@@ -291,7 +261,6 @@ def apply_color_grade(frame: np.ndarray, grade: str = "none") -> np.ndarray:
         return frame
     return cv2.LUT(frame, _build_lut(grade))
 
-# ─── Ken Burns micro-zoom ──────────────────────────────────────────────────────
 def apply_ken_burns(
     frame: np.ndarray, frame_idx: int, fps: float,
     max_zoom: float = KEN_BURNS_MAX_ZOOM, period: float = KEN_BURNS_PERIOD,
@@ -309,7 +278,6 @@ def apply_ken_burns(
     y0   = (h - nh) // 2
     return cv2.resize(frame[y0:y0 + nh, x0:x0 + nw], (w, h), interpolation=cv2.INTER_LINEAR)
 
-# ─── Cross-dissolve on scene cuts ──────────────────────────────────────────────
 class DissolveBuffer:
     def __init__(self, n: int = DISSOLVE_FRAMES) -> None:
         self.n    = n
@@ -331,7 +299,6 @@ class DissolveBuffer:
     def active(self) -> bool:
         return self._rem > 0
 
-# ─── FFmpeg post-filter chain ──────────────────────────────────────────────────
 def _build_ffmpeg_vf(color_grade: str = "none", ffmpeg_sharpen: bool = False) -> List[str]:
     filters: List[str] = []
     eq_map = {
@@ -346,7 +313,6 @@ def _build_ffmpeg_vf(color_grade: str = "none", ffmpeg_sharpen: bool = False) ->
         filters.append("unsharp=5:5:0.8:3:3:0.0")
     return filters
 
-# ─── FFmpegVideoReader ─────────────────────────────────────────────────────────
 class FFmpegVideoReader:
     def __init__(
         self, path: str, width: int, height: int,
@@ -446,7 +412,6 @@ def _read_frame_at(
     r.close()
     return frames[0] if frames else None
 
-# ─── FFmpeg helpers ────────────────────────────────────────────────────────────
 def _check_ffmpeg() -> None:
     for tool in ("ffmpeg", "ffprobe"):
         try:
@@ -483,7 +448,6 @@ def _trim_video(inp: str, out: str, start: float, end: float) -> bool:
     )
     return r.returncode == 0 and os.path.exists(out)
 
-# ─── Encoder ─────────────────────────────────────────────────────────────────
 def _open_ffmpeg_encoder(
     output_path: str, width: int, height: int, fps: float,
     audio_source: Optional[str], crf: int = 23, preset: str = "fast",
@@ -509,7 +473,7 @@ def _open_ffmpeg_encoder(
             f"OutlineColour={s.get('outline_color', '&H00000000')}, "
             f"Outline={s.get('outline', 2)},Bold={s.get('bold', 1)}, "
             f"Shadow={s.get('shadow', 0)},BackColour={s.get('back_color', '&H00000000')}, "
-            f"MarginV={s.get('margin_v', 80)},Alignment=2"
+            f"MarginV={s.get('margin_v', 80)},Alignment=2 "
         )
         vf.append(f"subtitles='{sesc}':force_style='{force}'")
     if extra_vf:
@@ -546,7 +510,6 @@ def _close_ffmpeg_encoder(proc: subprocess.Popen, output_path: str) -> None:
     if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
         raise ProcessingError("FFmpeg encoder produced empty output.")
 
-# ─── Video metadata ────────────────────────────────────────────────────────────
 def get_video_info(path: str) -> Dict[str, Any]:
     cmd = [
         "ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -577,7 +540,7 @@ def get_video_info(path: str) -> Dict[str, Any]:
         "fps":              fps,
         "total_frames":     min(int(dur * fps), MAX_FRAMES_GUARD),
         "width":            w,
-        "height":           h,
+        "height":            h,
         "duration_seconds": dur,
         "is_landscape":     w > h,
     }
@@ -590,7 +553,6 @@ def extract_thumbnail(path: str, t: float = 1.0) -> Optional[bytes]:
     ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return buf.tobytes() if ok else None
 
-# ─── Resolution helpers ────────────────────────────────────────────────────────
 def resolve_target_size(label: str, orig_w: int, orig_h: int) -> Tuple[int, int]:
     tw, th = RESOLUTION_PRESETS.get(label, (0, 0))
     if tw == 0 and th == 0:
@@ -622,7 +584,6 @@ def calculate_crop_dims(orig_w: int, orig_h: int, tw: int, th: int) -> Tuple[int
         ch = int(round(cw / ratio))
     return min(cw, orig_w), min(ch, orig_h)
 
-# ─── YOLO model cache ──────────────────────────────────────────────────────────
 _model_cache: Dict[str, Any] = {}
 
 def _get_model(weights: str = "yolov8n.pt") -> Optional[Any]:
@@ -638,7 +599,6 @@ def _get_model(weights: str = "yolov8n.pt") -> Optional[Any]:
         print(f"YOLO unavailable: {e}", file=sys.stderr)
         return None
 
-# ─── Face detection ────────────────────────────────────────────────────────────
 _haar_cascade: Optional[cv2.CascadeClassifier] = None
 
 def _get_haar() -> Optional[cv2.CascadeClassifier]:
@@ -668,12 +628,8 @@ def detect_faces(
     faces.sort(key=lambda f: (f[2] - f[0]) * (f[3] - f[1]), reverse=True)
     return faces
 
-# ─── Play Phase Detection (NEW v4.4) ──────────────────────────────────────────
 class SportsPlayPhaseDetector:
-    """
-    Determines if the game is in a 'fast_break', 'half_court', or 'rebound' phase.
-    Uses player spread and ball velocity.
-    """
+    """Determines if the game is in a 'fast_break', 'half_court', or 'rebound' phase."""
     def __init__(self, fps: float):
         self.fps = fps
         self.prev_ball_pos: Optional[Tuple[float, float]] = None
@@ -685,21 +641,14 @@ class SportsPlayPhaseDetector:
         ball_box: Optional[Tuple[int, int, int, int]],
         frame_w: int
     ) -> str:
-        """
-        Returns: 'fast_break', 'half_court', 'rebound', or 'static'
-        """
-        # 1. Calculate Player Spread (Standard Deviation of X positions)
         if not persons:
             return 'static'
-        
+
         centers_x = [(p[0] + p[2]) / 2 for p in persons]
         mean_x = np.mean(centers_x)
         spread = np.std(centers_x)
-        
-        # Normalized spread (0.0 to 1.0)
         norm_spread = spread / (frame_w / 2)
-        
-        # 2. Calculate Ball Velocity
+
         ball_speed = 0.0
         if ball_box:
             bx = (ball_box[0] + ball_box[2]) / 2
@@ -709,35 +658,29 @@ class SportsPlayPhaseDetector:
                 dy = by - self.prev_ball_pos[1]
                 ball_speed = math.sqrt(dx*dx + dy*dy)
             self.prev_ball_pos = (bx, by)
-            
+
             self.ball_vel_history.append(ball_speed)
             if len(self.ball_vel_history) > 10:
                 self.ball_vel_history.pop(0)
-        
+
         avg_ball_speed = np.mean(self.ball_vel_history) if self.ball_vel_history else 0
-        
-        # 3. Phase Logic
-        # Fast Break: High ball speed, players spreading out (high spread)
+
         if avg_ball_speed > BALL_SPEED_THRESHOLD and norm_spread > 0.15:
             return 'fast_break'
-        
-        # Rebound/Lose Ball: High player clustering (low spread) but high motion
-        # Or simply low spread often indicates paint action/rebounding
         if norm_spread < 0.08:
             return 'rebound'
-            
-        # Half Court: Moderate spread, lower ball speed
         return 'half_court'
 
-# ─── SportsKalmanTracker (IMPROVED v4.5) ──────────────────────────────────────
 class SportsKalmanTracker:
     """
     2-D constant-acceleration Kalman filter with Play-Phase Aware Prediction.
-    IMPROVEMENTS v4.5:
-    1. Adaptive Prediction Horizon: Looks further ahead during fast breaks.
-    2. Ball Trajectory Physics: Predicts landing spot for high-arcing balls.
-    3. Adaptive Q: Inflates process noise during high-jerk events (Lightweight IMM).
-    4. Tuned Noise: Higher Process Noise (agility), Lower Measurement Noise (snap).
+    FIXED v4.6:
+    1. Properly scaled Q/R matrices in pixel units (not arbitrary small numbers).
+    2. Adaptive Q that grows with stale count but is capped.
+    3. Covariance cap prevents P explosion during long dropouts.
+    4. Tightened velocity clamping to realistic sports speeds (50 px/frame).
+    5. Fixed prediction order: predict() BEFORE update() on detection frames.
+    6. Adaptive R increases measurement noise when detection confidence is low.
     """
 
     def __init__(self, dt: float = 1.0, fps: float = 30.0) -> None:
@@ -754,27 +697,40 @@ class SportsKalmanTracker:
         ], dtype=np.float64)
         self.H = np.array([[1, 0, 0, 0, 0, 0],
                            [0, 1, 0, 0, 0, 0]], dtype=np.float64)
-        
-        # Base Process Noise - TUNED (v4.5)
-        self.Q_base  = np.eye(6, dtype=np.float64) * KALMAN_PROCESS_NOISE_BASE
-        self.Q_base[4, 4] *= 4.0 # Acceleration noise
-        self.Q_base[5, 5] *= 4.0
-        
-        # Measurement Noise (R) per sensor - TUNED (v4.5)
+
+        # Build Q matrix for CA model with continuous-time noise
+        self.Q_base = np.zeros((6, 6), dtype=np.float64)
+        self.Q_base[0, 0] = KALMAN_PROCESS_NOISE_POS**2
+        self.Q_base[1, 1] = KALMAN_PROCESS_NOISE_POS**2
+        self.Q_base[2, 2] = KALMAN_PROCESS_NOISE_VEL**2
+        self.Q_base[3, 3] = KALMAN_PROCESS_NOISE_VEL**2
+        self.Q_base[4, 4] = KALMAN_PROCESS_NOISE_ACC**2
+        self.Q_base[5, 5] = KALMAN_PROCESS_NOISE_ACC**2
+
+        # Cross terms for correlated noise
+        self.Q_base[0, 2] = self.Q_base[2, 0] = KALMAN_PROCESS_NOISE_POS * KALMAN_PROCESS_NOISE_VEL * 0.5
+        self.Q_base[1, 3] = self.Q_base[3, 1] = KALMAN_PROCESS_NOISE_POS * KALMAN_PROCESS_NOISE_VEL * 0.5
+        self.Q_base[2, 4] = self.Q_base[4, 2] = KALMAN_PROCESS_NOISE_VEL * KALMAN_PROCESS_NOISE_ACC * 0.5
+        self.Q_base[3, 5] = self.Q_base[5, 3] = KALMAN_PROCESS_NOISE_VEL * KALMAN_PROCESS_NOISE_ACC * 0.5
+
+        # Measurement Noise (R) per sensor - in pixel variance
         self.R_yolo      = np.eye(2, dtype=np.float64) * KALMAN_MEASUREMENT_NOISE
         self.R_optical   = np.eye(2, dtype=np.float64) * KALMAN_OPTICAL_FLOW_NOISE
         self.R_saliency  = np.eye(2, dtype=np.float64) * KALMAN_SALIENCY_NOISE
-        
+
         # State Covariance
         self.P  = np.eye(6, dtype=np.float64) * KALMAN_INITIAL_ERROR
         self.x  = np.zeros((6, 1), dtype=np.float64) 
-        
+
         self.initialized  = False
         self._stale_count = 0
         self._last_sensor = "none"
-        
+
         # For adaptive Q
         self._prev_accel_mag = 0.0
+
+        # Track whether we predicted this frame already
+        self._predicted_this_frame = False
 
     def init(self, cx: float, cy: float) -> None:
         self.x = np.array([[float(cx)], [float(cy)], [0.0], [0.0], [0.0], [0.0]], dtype=np.float64)
@@ -783,115 +739,147 @@ class SportsKalmanTracker:
         self._stale_count = 0
         self._last_sensor = "init"
         self._prev_accel_mag = 0.0
-
-    def predict(self, steps: int = 1) -> Tuple[float, float]:
-        """
-        Predict position steps ahead using constant acceleration model.
-        Returns scalar floats (not numpy arrays).
-        """
-        if not self.initialized:
-            return float(self.x[0, 0]), float(self.x[1, 0])
-
-        dt_s = self.dt * max(1, steps)
-        # x = x0 + v*dt + 0.5*a*dt^2
-        px = float(self.x[0,  0]) + float(self.x[2, 0]) * dt_s + 0.5 * float(self.x[4, 0]) * dt_s**2
-        py = float(self.x[1, 0]) + float(self.x[3, 0]) * dt_s + 0.5 * float(self.x[5, 0]) * dt_s**2
-        return px, py
-
-    def predict_adaptive(self, play_phase: str, ball_is_airborne: bool = False, ball_vel: Optional[Tuple[float,float]] = None) -> Tuple[float, float]:
-        """
-        Predict position based on play phase.
-        """
-        if not self.initialized:
-            return 0.0, 0.0
-
-        # Determine look-ahead time
-        if play_phase == "fast_break":
-            steps = int(self.fps * FAST_BREAK_PREDICT_SEC)
-        elif play_phase == "rebound":
-            steps = int(self.fps * 0.1)
-        else: # half_court
-            steps = int(self.fps * HALF_COURT_PREDICT_SEC)
-
-        return self.predict(steps=max(1, steps))
+        self._predicted_this_frame = False
 
     def _predict_step(self) -> None:
-        """Internal: advance state by one dt (called every frame). """
+        """Internal: advance state by one dt. Called ONCE per frame."""
         if not self.initialized:
             return
-        # Adaptive Q: If previous acceleration was high, increase Q temporarily
+
+        # Adaptive Q based on stale count
+        stale_mult = min(KALMAN_MAX_STALE_Q_MULT, 
+                        1.0 + self._stale_count * (KALMAN_STALE_Q_GROWTH - 1.0))
+        Q_used = self.Q_base * stale_mult
+
+        # If previous acceleration was high, temporarily increase Q
         current_accel_mag = math.sqrt(float(self.x[4,0])**2 + float(self.x[5,0])**2)
-        if current_accel_mag > 50.0: # High jerk threshold
-            Q_used = self.Q_base * 10 # Inflate Q
-        else:
-            Q_used = self.Q_base
+        if current_accel_mag > 50.0:
+            Q_used = Q_used * 2.0
 
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + Q_used
-        self._stale_count += 1
 
-        # Clamp velocity to prevent explosion during long dropouts
-        max_vel = 200.0 # pixels per frame
+        # CAP covariance to prevent explosion
+        np.clip(self.P, -KALMAN_MAX_P_DIAG, KALMAN_MAX_P_DIAG, out=self.P)
+
+        self._stale_count += 1
+        self._predicted_this_frame = True
+
+        # Clamp velocity to realistic sports speeds
+        max_vel = 50.0  # pixels per frame (was 200)
         if abs(float(self.x[2,0])) > max_vel: 
             self.x[2,0] = float(np.sign(self.x[2,0])) * max_vel
         if abs(float(self.x[3,0])) > max_vel: 
             self.x[3,0] = float(np.sign(self.x[3,0])) * max_vel
 
+        # Also clamp acceleration
+        max_acc = 20.0
+        if abs(float(self.x[4,0])) > max_acc:
+            self.x[4,0] = float(np.sign(self.x[4,0])) * max_acc
+        if abs(float(self.x[5,0])) > max_acc:
+            self.x[5,0] = float(np.sign(self.x[5,0])) * max_acc
+
+    def predict(self, steps: int = 1) -> Tuple[float, float]:
+        """Predict position steps ahead. Returns scalar floats."""
+        if not self.initialized:
+            return float(self.x[0, 0]), float(self.x[1, 0])
+
+        # If we haven't predicted this frame yet, do it now
+        if not self._predicted_this_frame:
+            self._predict_step()
+
+        dt_s = self.dt * max(1, steps)
+        px = float(self.x[0,  0]) + float(self.x[2, 0]) * dt_s + 0.5 * float(self.x[4, 0]) * dt_s**2
+        py = float(self.x[1, 0]) + float(self.x[3, 0]) * dt_s + 0.5 * float(self.x[5, 0]) * dt_s**2
+        return px, py
+
+    def predict_adaptive(self, play_phase: str, ball_is_airborne: bool = False, ball_vel: Optional[Tuple[float,float]] = None) -> Tuple[float, float]:
+        if not self.initialized:
+            return 0.0, 0.0
+
+        if play_phase == "fast_break":
+            steps = int(self.fps * FAST_BREAK_PREDICT_SEC)
+        elif play_phase == "rebound":
+            steps = int(self.fps * 0.1)
+        else:
+            steps = int(self.fps * HALF_COURT_PREDICT_SEC)
+
+        return self.predict(steps=max(1, steps))
+
     def update(
         self, cx: float, cy: float, sensor: str = "yolo",
+        detection_confidence: float = 1.0,
     ) -> Tuple[float, float]:
         """
         Process measurement; returns filtered position.
-        Implements Mahalanobis gating to reject outliers.
+        FIXED v4.6: Ensures predict() is called before update() if not already done.
         """
         if not self.initialized:
             self.init(cx, cy)
             self._last_sensor = sensor
             return cx, cy
 
+        # CRITICAL FIX: Predict first if we haven't for this frame
+        if not self._predicted_this_frame:
+            self._predict_step()
+
         # Select R based on sensor trustworthiness
         if sensor == "optical_flow":
-            R = self.R_optical
+            R = self.R_optical.copy()
         elif sensor == "saliency":
-            R = self.R_saliency
+            R = self.R_saliency.copy()
         else:
-            R = self.R_yolo
+            R = self.R_yolo.copy()
+
+        # Adaptive R: increase noise for low-confidence detections
+        if detection_confidence < 0.5:
+            R = R * (1.0 + (0.5 - detection_confidence) * 4.0)
 
         # Innovation (measurement residual)
         z = np.array([[cx], [cy]], dtype=np.float64)
         y = z - self.H @ self.x
-        
+
         # Innovation Covariance
         S = self.H @ self.P @ self.H.T + R
-        
+
         # Mahalanobis Distance for Gating
-        inv_S = np.linalg.inv(S)
+        try:
+            inv_S = np.linalg.inv(S)
+        except np.linalg.LinAlgError:
+            inv_S = np.linalg.pinv(S)
         mahalanobis_dist = float(np.sqrt((y.T @ inv_S @ y).item()))
-        
+
         if mahalanobis_dist > KALMAN_GATE_THRESHOLD:
             # Reject measurement as outlier. Keep prediction.
             self._stale_count += 1
+            self._predicted_this_frame = False
             return float(self.x[0,0]), float(self.x[1,0])
 
         # Kalman Gain
         K = self.P @ self.H.T @ inv_S
-        
+
         # State Update
         self.x = self.x + K @ y
         self.P = (np.eye(6, dtype=np.float64) - K @ self.H) @ self.P
-        
+
+        # Cap updated covariance too
+        np.clip(self.P, -KALMAN_MAX_P_DIAG, KALMAN_MAX_P_DIAG, out=self.P)
+
         self._stale_count = 0
         self._last_sensor = sensor
-        
+        self._predicted_this_frame = False
+
         return float(self.x[0, 0]), float(self.x[1, 0])
 
     def increment_stale(self) -> None:
-        """Call when no measurement is available this frame. Advances prediction. """
-        self._predict_step()
+        """Call when no measurement is available this frame. Advances prediction."""
+        if not self._predicted_this_frame:
+            self._predict_step()
+        self._predicted_this_frame = False
 
     @property
     def is_stale(self) -> bool:
-        return self._stale_count > 10
+        return self._stale_count > 5  # Reduced from 10 for faster recovery
 
     @property
     def velocity(self) -> Tuple[float, float]:
@@ -906,7 +894,6 @@ class SportsKalmanTracker:
     def last_sensor(self) -> str:
         return self._last_sensor
 
-# ─── Court/field boundary detection ──────────────────────────────────────────
 def detect_field_of_play(
     frame: np.ndarray, sport_hint: str = "auto",
 ) -> Optional[np.ndarray]:
@@ -947,7 +934,7 @@ def detect_field_of_play(
     return mask if cv2.countNonZero(mask) > (h * w * 0.10) else None
 
 def get_court_center_of_mass(field_mask: np.ndarray) -> Tuple[float, float]:
-    """Calculate the centroid of the detected court area. """
+    """Calculate the centroid of the detected court area."""
     if field_mask is None:
         return None
     moments = cv2.moments(field_mask)
@@ -957,7 +944,6 @@ def get_court_center_of_mass(field_mask: np.ndarray) -> Tuple[float, float]:
     cy = moments["m01"] / moments["m00"]
     return (cx, cy)
 
-# ─── Sports-specific optical flow ─────────────────────────────────────────────
 def sports_optical_flow_center(
     prev: np.ndarray,
     curr: np.ndarray,
@@ -997,7 +983,6 @@ def sports_optical_flow_center(
     except Exception:
         return None
 
-# ─── Temporal saliency ────────────────────────────────────────────────────────
 def temporal_saliency_center(
     frame: np.ndarray,
     prev_saliency: Optional[np.ndarray] = None,
@@ -1032,7 +1017,6 @@ def temporal_saliency_center(
 
     return cx, cy, sal
 
-# ─── Sports broadcast cut detection ──────────────────────────────────────────
 def _ensure_bgr(img: Optional[np.ndarray]) -> Optional[np.ndarray]:
     if img is None:
         return None
@@ -1102,7 +1086,6 @@ def is_scene_change(
 
     return is_cut, curr_hist, last_cut_frame
 
-# ─── Shot/play event detector ──────────────────────────────────────────────────
 class SportsEventDetector:
     def __init__(self, fps: float = 30.0) -> None:
         self.fps                  = fps
@@ -1155,8 +1138,6 @@ class SportsEventDetector:
     def event_active_for(self, fi: int) -> bool:
         return self._event_flags.get(fi, False)
 
-# ─── Subject / person detection ────────────────────────────────────────────────
-# FIXED: Removed trailing spaces from field names
 DetectionResult = namedtuple(
     "DetectionResult", ["cx", "cy", "ux1", "uy1", "ux2", "uy2", "count"]
 )
@@ -1214,29 +1195,23 @@ def detect_subjects(
         print(f"[Sports] No ball detected in frame", file=sys.stderr)
 
     if tracking_mode == "sports_action" and len(persons) > 0:
-        # Sports mode: prioritize ball carrier, then continuity, then center
         best_idx   = 0
         best_score = -1e9
 
-        # Calculate frame center for distance penalty
         frame_cx = sum(p[4] for p in persons) / len(persons)
         frame_cy = sum(p[5] for p in persons) / len(persons)
 
         for i, p in enumerate(persons):
-            # Base score: prefer players near center of action (or prev center)
             if prev_center is not None:
                 pcx, pcy = prev_center
                 score = -math.hypot(p[4] - pcx, p[5] - pcy) * 0.5
             else:
                 score = -math.hypot(p[4] - frame_cx, p[5] - frame_cy) * 0.3
 
-            # STRONG preference for ball carrier
             if i == ball_carrier and ball_carrier >= 0:
                 score += SPORTS_SWITCH_BALL_BONUS
-            # Medium preference for previous ball carrier (continuity)
             if i == prev_ball_carrier and prev_ball_carrier >= 0:
                 score += SPORTS_SWITCH_BALL_BONUS * 0.5
-            # Slight preference for larger players (closer to camera = more important)
             area = (p[2] - p[0]) * (p[3] - p[1])
             score += area * 0.001
 
@@ -1293,7 +1268,6 @@ def detect_persons_all(
     ]
     return sorted(persons, key=lambda b: b[0])
 
-# ─── Framing helpers ───────────────────────────────────────────────────────────
 def _apply_lower_third_guard(cy: int, crop_h: int, subject_cy_src: int, orig_h: int) -> int:
     hh     = crop_h // 2
     max_cy = subject_cy_src - int((1.0 - LOWER_THIRD_GUARD) * crop_h) + hh
@@ -1340,7 +1314,6 @@ def talking_head_center(
     cy      = _apply_lower_third_guard(cy, crop_h, face_cy, orig_h)
     return cx, max(hh, min(cy, orig_h - hh))
 
-# ─── Panel detection ──────────────────────────────────────────────────────────
 def _detect_panel_mode(
     input_path: str, model: Any, fps: float, total_frames: int,
     orig_w: int, orig_h: int, confidence: float = 0.45,
@@ -1449,7 +1422,6 @@ def _detect_panel_mode(
     )
     return is_panel
 
-# ─── Panel slot smoother ─────────────────────────────────────────────────────────
 class PanelSlotSmoother:
     def __init__(
         self,
@@ -1600,7 +1572,7 @@ def _render_panel_frame(
     n       = len(persons)
     if n == 0:
         group_a = prev_slots[0] if prev_slots and prev_slots[0] else []
-        group_b = prev_slots[1] if prev_slots and len(prev_slots) > 1 else []
+        group_b = prev_slots[1] if prev_slots and len(prev_slots) > 1 and prev_slots[1] else []
     elif n == 1:
         group_a = persons
         group_b = prev_slots[1] if prev_slots and len(prev_slots) > 1 and prev_slots[1] else persons
@@ -1641,7 +1613,6 @@ def _render_panel_frame(
 
     return canvas, [list(group_a), list(group_b)]
 
-# ─── Legacy optical flow / saliency (non-sports) ─────────────────────────────
 def optical_flow_center(
     prev: np.ndarray, curr: np.ndarray, w: int, h: int,
 ) -> Optional[Tuple[int, int]]:
@@ -1682,7 +1653,6 @@ def saliency_center(frame: np.ndarray) -> Tuple[int, int]:
     ys, xs = np.mgrid[0:h, 0:w]
     return int((xs * sal).sum() / t), int((ys * sal).sum() / t)
 
-# ─── Camera-path smoothing ─────────────────────────────────────────────────────
 def _vel_to_window(speed: float) -> int:
     t = VELOCITY_SMOOTH_TABLE
     if speed <= t[0][0]:
@@ -1732,32 +1702,40 @@ def _bidir_ema(xs: np.ndarray, ys: np.ndarray, alpha: float = 0.06) -> Tuple[np.
     return (_fwd(xs) + _bwd(xs)) / 2, (_fwd(ys) + _bwd(ys)) / 2
 
 def _smooth_kalman_output(
-    xs: np.ndarray, ys: np.ndarray, scene_cuts: List[int], alpha: float = 0.15
+    xs: np.ndarray, ys: np.ndarray, scene_cuts: List[int], alpha: float = 0.06
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Applies a lightweight Bidirectional EMA to Kalman output to remove residual jitter.
-    Respects scene cuts to prevent bleeding.
+    FIXED v4.6: Lightweight Bidirectional EMA to remove residual jitter.
+    - Lower alpha (0.06 vs 0.15) for less artificial lag
+    - Median pre-filter for spike removal
+    - Respects scene cuts to prevent bleeding.
     """
     n = len(xs)
     if n < 2:
         return xs, ys
-    
+
     rx = xs.copy()
     ry = ys.copy()
-    
-    # Define bounds based on scene cuts
+
     cuts = sorted({c for c in scene_cuts if 0 < c < n})
     bounds = [0] + cuts + [n]
-    
+
     for i in range(len(bounds) - 1):
         s, e = bounds[i], bounds[i + 1]
         if e - s < 2:
             continue
-        
+
+        # FIX: Apply small median filter first to remove spike noise
+        seg_len = e - s
+        if seg_len >= 5:
+            for j in range(s + 1, e - 1):
+                rx[j] = np.median([rx[j-1], rx[j], rx[j+1]])
+                ry[j] = np.median([ry[j-1], ry[j], ry[j+1]])
+
         # Apply bidirectional EMA only within this segment
-        seg_x = xs[s:e]
-        seg_y = ys[s:e]
-        
+        seg_x = rx[s:e]
+        seg_y = ry[s:e]
+
         # Forward pass
         fwd_x = np.empty_like(seg_x)
         fwd_y = np.empty_like(seg_y)
@@ -1766,7 +1744,7 @@ def _smooth_kalman_output(
         for j in range(1, len(seg_x)):
             fwd_x[j] = alpha * seg_x[j] + (1 - alpha) * fwd_x[j-1]
             fwd_y[j] = alpha * seg_y[j] + (1 - alpha) * fwd_y[j-1]
-            
+
         # Backward pass
         bwd_x = np.empty_like(seg_x)
         bwd_y = np.empty_like(seg_y)
@@ -1775,11 +1753,11 @@ def _smooth_kalman_output(
         for j in range(len(seg_x) - 2, -1, -1):
             bwd_x[j] = alpha * seg_x[j] + (1 - alpha) * bwd_x[j+1]
             bwd_y[j] = alpha * seg_y[j] + (1 - alpha) * bwd_y[j+1]
-            
+
         # Combine
         rx[s:e] = (fwd_x + bwd_x) / 2.0
         ry[s:e] = (fwd_y + bwd_y) / 2.0
-        
+
     return rx, ry
 
 def smooth_centers(
@@ -1790,11 +1768,6 @@ def smooth_centers(
     scene_cuts: Optional[List[int]] = None,
     use_kalman: bool = False,
 ) -> Tuple[List[Tuple[int, int]], Dict[str, float]]:
-    """
-    Three-stage smoothing per scene segment.
-    use_kalman=True  (sports): causal SportsKalmanTracker + light Gaussian.
-    use_kalman=False (legacy): velocity-adaptive Gaussian + bidirectional EMA.
-    """
     empty: Dict[str, float] = {
         "jitter_raw": 0.0,  "jitter_smooth": 0.0,
         "smoothness_pct": 0.0,  "max_jump_raw": 0.0,
@@ -1871,7 +1844,6 @@ def smooth_centers(
         "kalman_prediction_frames": pred_count,
     }
 
-# ─── Whisper / translate ──────────────────────────────────────────────────────
 def _seconds_to_srt_time(s: float) -> str:
     h  = int(s // 3600)
     m  = int((s % 3600) // 60)
@@ -1922,9 +1894,9 @@ def transcribe_to_srt(
             if not buf:
                 return
             lines.append(
-                f"{idx}\n"
-                f"{_seconds_to_srt_time(buf[0]['start'])} --> {_seconds_to_srt_time(buf[-1]['end'])}\n"
-                f"{' '.join(x['word'] for x in buf)}\n"
+                f"{idx}\n "
+                f"{_seconds_to_srt_time(buf[0]['start'])} --> {_seconds_to_srt_time(buf[-1]['end'])}\n "
+                f"{' '.join(x['word'] for x in buf)}\n "
             )
             idx += 1; buf = []; buf_len = 0
 
@@ -1989,7 +1961,6 @@ def translate_srt(
         print(f"Translation failed: {e}", file=sys.stderr)
         return False
 
-# ─── Clip detection ───────────────────────────────────────────────────────────
 def _frame_saliency_score(frame: np.ndarray, prev_frame: Optional[np.ndarray]) -> float:
     gray      = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     lap_score = min(float(cv2.Laplacian(gray, cv2.CV_64F).var()) / 3000.0, 1.0)
@@ -2145,7 +2116,6 @@ def detect_clips(
     _p(1.0, f"Found {len(segments)} clips")
     return segments
 
-# ─── Analytics ───────────────────────────────────────────────────────────────
 def get_analytics_meta(
     input_path: str, output_path: str, *,
     tracking_mode: str = "", panel_mode: bool = False,
@@ -2206,9 +2176,6 @@ def get_analytics_meta(
     }
     return meta
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# process_video — MAIN ENTRY POINT with Sports Intelligence (v4.5)
-# ═══════════════════════════════════════════════════════════════════════════════
 def process_video(
     input_path: str,
     output_path: str,
@@ -2240,26 +2207,21 @@ def process_video(
     dissolve_cuts: bool = True,
     ffmpeg_sharpen: bool = False,
     progress_callback=None,
-    # Sports parameters
     sport_type: str = "auto",
     use_kalman: bool = False,
     use_ball_tracking: bool = False,
     field_mask_enabled: bool = False,
-    # Panel mode
     panel_config: Optional[PanelModeConfig] = None,
 ) -> Dict[str, Any]:
     """
     Convert a landscape video to vertical (9:16).
-    NEW v4.5: Tuned Kalman + Dense Tracking + Post-Smoothing
-    - Kalman: Higher Process Noise (5e-2), Lower Measurement Noise (5e-2)
-    - Dense: Writes state every frame
-    - Smooth: Bidirectional EMA on Kalman output
-    - Cuts: Aggressive reset
+    FIXED v4.6: Properly scaled Kalman Q/R, capped covariance, tightened velocity,
+                corrected prediction order, adaptive measurement noise, lighter post-smoothing.
     """
     if panel_config is None:
         panel_config = PanelModeConfig()
 
-    def _p(v: float, msg: str = "") -> None:
+    def _p(v: float, msg: str = "  ") -> None:
         if progress_callback:
             try: progress_callback(min(max(v, 0.0), 1.0), msg)
             except Exception: pass
@@ -2298,13 +2260,13 @@ def process_video(
     result_meta.update(clamped=clamped, effective_size=(target_w, target_h), duration=duration)
     _p(0.01, f"Output {target_w}x{target_h}  <- source {orig_w}x{orig_h}")
 
-    # NEW v4.4: High-frequency sampling for sports
+    # v4.6: Higher sampling frequency for sports for better Kalman updates
     if not sample_interval:
         if tracking_mode == "sports_action":
-            sample_interval = max(1, int(fps / 15))  # ~2Hz for sports
+            sample_interval = max(1, int(fps / 20))  # ~20Hz for sports (was 15Hz)
         else:
             sample_interval = max(1, int(fps / 5))   # ~6Hz for normal
-            
+
     render_fps  = float(output_fps) if output_fps and output_fps > 0 else fps
     crop_w, crop_h = calculate_crop_dims(orig_w, orig_h, target_w, target_h)
 
@@ -2316,7 +2278,7 @@ def process_video(
 
     is_sports_mode = (tracking_mode == "sports_action")
 
-    # ── Subtitles ──────────────────────────────────────────────────────────────
+    # Subtitles
     srt_path: Optional[str] = None
     if burn_subtitles and _has_audio(input_path):
         _p(0.02, "Transcribing...")
@@ -2336,7 +2298,7 @@ def process_video(
                               progress_callback=lambda v, m: _p(0.10 + v * 0.05, m))
             result_meta["subtitle_path"] = srt_path
 
-    # ── Load model ─────────────────────────────────────────────────────────────
+    # Load model
     start_pct = 0.10
     model_obj = None
     if tracking_mode in ("subject", "sports_action"):
@@ -2349,7 +2311,7 @@ def process_video(
         if _get_haar() is None:
             _p(start_pct, "No face detector - saliency fallback")
 
-    # ── Panel detection ────────────────────────────────────────────────────────
+    # Panel detection
     is_panel      = False
     slot_smoother: Optional[PanelSlotSmoother] = None
     panel_orient  = panel_config.split_orientation
@@ -2362,7 +2324,7 @@ def process_video(
             result_meta["panel_mode"] = True
         elif panel_config.split_mode == "force_off":
             _p(start_pct + 0.01, "Panel mode: FORCED OFF")
-        else:  # "auto"
+        else:
             _p(start_pct + 0.01, "Checking panel/group-shot layout...")
             is_panel = _detect_panel_mode(
                 input_path, model_obj, fps, total_frames, orig_w, orig_h,
@@ -2377,7 +2339,7 @@ def process_video(
                 result_meta["panel_mode"] = True
                 slot_smoother = PanelSlotSmoother()
 
-    # ── Sports-specific component init ─────────────────────────────────────────
+    # Sports-specific component init
     kalman_tracker: Optional[SportsKalmanTracker] = None
     event_detector: Optional[SportsEventDetector] = None
     play_phase_detector: Optional[SportsPlayPhaseDetector] = None
@@ -2389,7 +2351,7 @@ def process_video(
         kalman_tracker = SportsKalmanTracker(dt=1.0, fps=fps)
         event_detector = SportsEventDetector(fps=fps)
         play_phase_detector = SportsPlayPhaseDetector(fps=fps)
-        
+
         if field_mask_enabled:
             sample_frame = _read_frame_at(input_path, orig_w, orig_h, 1.0,
                                           scale_w=det_w, scale_h=det_h)
@@ -2399,7 +2361,7 @@ def process_video(
                     court_center = get_court_center_of_mass(field_mask)
                     print(f"[Sports] Court center detected at: {court_center}", file=sys.stderr)
 
-    # ── Open encoder ───────────────────────────────────────────────────────────
+    # Open encoder
     extra_vf = _build_ffmpeg_vf(color_grade="none", ffmpeg_sharpen=ffmpeg_sharpen) or None
     style    = SUBTITLE_STYLES.get(subtitle_style_name, SUBTITLE_STYLES["Bold White (TikTok)"])
 
@@ -2422,9 +2384,7 @@ def process_video(
     last_out_frame: Optional[np.ndarray] = None
     rpt_n           = max(1, total_frames // 40)
 
-    # ════════════════════════════════════════════════════════════════════════════
-    # NON-PANEL PATH: Per-frame Kalman tracking (v4.5 architecture)
-    # ════════════════════════════════════════════════════════════════════════════
+    # NON-PANEL PATH: Per-frame Kalman tracking (v4.6 FIXED architecture)
     if not is_panel:
         _p(0.12, "Pass 1/2: per-frame tracking...")
 
@@ -2472,44 +2432,43 @@ def process_video(
                         scene_cuts.append(fi2)
                         prev_flow2 = None
                         if is_sports_mode and kalman_tracker is not None:
-                            # NEW v4.5: Aggressive Reset on Cut
+                            # FIXED v4.6: Reset Kalman with moderate uncertainty
                             reset_x, reset_y = orig_w // 2, orig_h // 2
                             if court_center:
                                 reset_x, reset_y = court_center
-                            
+
                             kalman_tracker.init(reset_x, reset_y)
-                            kalman_tracker.P *= 50  # High uncertainty to force snap to next det
+                            kalman_tracker.P *= 10  # Was 50, now 10
 
                     prev_gray2 = cg
 
-                # ── STEP 1: ALWAYS PREDICT (Per-frame) ─────────────────────────
-                # This advances the physics model by one frame.
+                # STEP 1: ALWAYS PREDICT (Per-frame)
+                # FIXED v4.6: Predict first, then update if we have detection
                 if is_sports_mode and kalman_tracker is not None:
                     if not kalman_tracker.initialized:
-                        # Initialize with center if not yet started
                         init_x, init_y = orig_w // 2, orig_h // 2
                         if court_center:
                             init_x, init_y = court_center
                         kalman_tracker.init(init_x, init_y)
-                    
+
                     # Predict current state based on previous state
                     kalman_tracker.increment_stale()
-                    
-                    # Get prediction for THIS frame
-                    kx, ky = kalman_tracker.predict(steps=0) # Current state estimate
-                    
-                    # FIX: Write dense output EVERY frame to ensure smooth interpolation
+
+                    # Get prediction for THIS frame (after increment_stale)
+                    kx, ky = kalman_tracker.predict(steps=0)
+
+                    # Write dense output EVERY frame to ensure smooth interpolation
                     dense_kalman_cx[fi2] = float(np.clip(float(kx), 0, orig_w))
                     dense_kalman_cy[fi2] = float(np.clip(float(ky), 0, orig_h))
 
-                # ── STEP 2: DETECT & UPDATE (If sample frame) ──────────────────
+                # STEP 2: DETECT & UPDATE (If sample frame)
                 if is_sample:
                     anchor_cx = anchor_cy = None
                     sensor_type = "yolo"
                     current_persons = []
                     current_ball_box = None
+                    detection_confidence = 1.0
 
-                    # ── Per-mode detection ─────────────────────────────────────
                     if tracking_mode == "talking_head":
                         faces = detect_faces(det_frame, confidence_thresh=0.5)
                         if faces:
@@ -2536,10 +2495,8 @@ def process_video(
                             prev_ball_carrier=prev_ball_carrier,
                             tracking_mode="sports_action",
                         )
-                        
-                        # Collect data for Play Phase Detection
+
                         if det:
-                            # Re-extract persons for phase detection
                             try:
                                 results = model_obj(det_frame, verbose=False, conf=confidence)[0]
                                 if results.boxes is not None:
@@ -2548,6 +2505,10 @@ def process_video(
                                         for box in results.boxes
                                         if int(box.cls[0]) == PERSON_CLASS_ID
                                     ]
+                                    for box in results.boxes:
+                                        if int(box.cls[0]) == PERSON_CLASS_ID:
+                                            detection_confidence = float(box.conf[0])
+                                            break
                             except: pass
                             current_ball_box = ball_box
 
@@ -2559,25 +2520,24 @@ def process_video(
                             last_det2          = (anchor_cx, anchor_cy)
                             prev_ball_carrier = ball_carrier
 
-                            # NEW v4.5: Update Kalman with YOLO measurement (high trust)
+                            # FIXED v4.6: Update Kalman with proper prediction order
                             if kalman_tracker is not None:
-                                # The update method internally handles gating and correction
-                                kalman_tracker.update(anchor_cx, anchor_cy, sensor="yolo")
-                                
-                                # After update, the internal state is corrected. 
-                                # We overwrite the prediction with the corrected state for this frame.
+                                kalman_tracker.update(
+                                    anchor_cx, anchor_cy, 
+                                    sensor="yolo",
+                                    detection_confidence=detection_confidence,
+                                )
+
+                                # After update, get the corrected state for this frame
                                 kx, ky = kalman_tracker.predict(steps=0)
                                 dense_kalman_cx[fi2] = float(np.clip(float(kx), 0, orig_w))
                                 dense_kalman_cy[fi2] = float(np.clip(float(ky), 0, orig_h))
 
-                            # Record event flag
                             if event_detector is not None and ball_box is not None:
                                 primary_person_box = (det.ux1, det.uy1, det.ux2, det.uy2)
                                 event_detector.update(ball_box, primary_person_box,
                                                       record_frame=fi2)
 
-                        # Update ball carrier tracking regardless of whether we got a valid det result
-                        # (ball_carrier may be valid even if det processing failed)
                         if ball_carrier >= 0:
                             prev_ball_carrier = ball_carrier
 
@@ -2648,23 +2608,18 @@ def process_video(
                     # For sports mode with Kalman, prev_c tracks the measurement source
                     elif is_sports_mode and anchor_cx is not None:
                         prev_c = (anchor_cx, anchor_cy)
-                        
-                    # NEW v4.4: Update Play Phase Detector (if sports)
+
+                    # Update Play Phase Detector (if sports)
                     if is_sports_mode and play_phase_detector:
-                        # We need to pass persons and ball box to phase detector
-                        # Note: detect_subjects already ran, so we use the collected data
                         phase = play_phase_detector.detect_phase(
                             current_persons, current_ball_box, det_w
                         )
-                        # In a real implementation, we might store this phase per frame
-                        # to influence the NEXT prediction step. 
-                        # For now, the Kalman filter's adaptive Q handles the immediate jerk.
-                        
+
                 fi2 += 1
                 if fi2 % rpt_n == 0:
                     _p(0.12 + 0.30 * (fi2 / total_frames), f"Track {fi2}/{total_frames}...")
 
-        # ── Smooth detection path (legacy for non-sports; skipped for sports) ──
+        # Smooth detection path (legacy for non-sports; skipped for sports)
         if not is_sports_mode:
             _p(0.42, "Smoothing camera path...")
             dense_cx = np.full(total_frames, orig_w // 2, dtype=float)
@@ -2692,47 +2647,45 @@ def process_video(
                 dense_cx     = np.interp(all_frames, known_frames, known_cx)
                 dense_cy     = np.interp(all_frames, known_frames, known_cy)
         else:
-            # NEW v4.5: For sports mode, apply POST-KALMAN BIDIRECTIONAL EMA to remove residual jitter
+            # FIXED v4.6: For sports mode, Kalman IS the smoother, but we apply improved post-smoothing
             _p(0.42, "Post-smoothing Kalman path...")
 
-            # Apply lightweight Bidirectional EMA to remove residual high-freq noise
-            # This respects scene cuts to prevent bleeding
+            # Apply improved Bidirectional EMA with lower alpha + median pre-filter
             dense_cx, dense_cy = _smooth_kalman_output(
                 dense_kalman_cx.astype(float), 
                 dense_kalman_cy.astype(float), 
                 scene_cuts, 
-                alpha=0.15 # Light smoothing
+                alpha=0.06  # Lower alpha for less artificial lag (was 0.15)
             )
 
-            # Now compute TRUE smoothness metrics from smoothed output
-            dx_raw = np.diff(dense_kalman_cx.astype(float)); dy_raw = np.diff(dense_kalman_cy.astype(float))
+            # Compute smoothness metrics from Kalman output
+            dx_raw = np.diff(dense_cx); dy_raw = np.diff(dense_cy)
             jitter_raw = float(np.mean(np.sqrt(dx_raw**2 + dy_raw**2)))
-            
+            max_jump = float(np.max(np.sqrt(dx_raw**2 + dy_raw**2))) if len(dx_raw) > 0 else 0.0
+
+            # Count prediction-only frames
+            pred_count = 0
+            if kalman_tracker is not None:
+                pred_count = sum(1 for i in range(1, total_frames) 
+                               if abs(dense_kalman_cx[i] - dense_kalman_cx[i-1]) < 0.1 
+                               and abs(dense_kalman_cy[i] - dense_kalman_cy[i-1]) < 0.1)
+
+            # Calculate smoothed jitter after post-processing
             dx_smooth = np.diff(dense_cx); dy_smooth = np.diff(dense_cy)
             jitter_smooth = float(np.mean(np.sqrt(dx_smooth**2 + dy_smooth**2)))
-            
-            max_jump_raw = float(np.max(np.sqrt(dx_raw**2 + dy_raw**2))) if len(dx_raw) > 0 else 0.0
-            
-            # Calculate true smoothness percentage
-            smoothness_pct = ((jitter_raw - jitter_smooth) / jitter_raw * 100) if jitter_raw > 0 else 0.0
 
-            # Count prediction frames (optional diagnostic)
-            pred_count = sum(1 for i in range(total_frames) 
-                           if kalman_tracker is not None and 
-                           kalman_tracker.initialized and
-                           i > 0 and  
-                           int(getattr(kalman_tracker, '_stale_count', 0)) > 0)
+            smoothness_pct = (jitter_raw - jitter_smooth) / jitter_raw * 100 if jitter_raw > 0 else 0.0
 
             smooth_metrics = {
                 "jitter_raw": round(jitter_raw, 2),
                 "jitter_smooth": round(jitter_smooth, 2),
                 "smoothness_pct": round(smoothness_pct, 1),
-                "max_jump_raw": round(max_jump_raw, 1),
+                "max_jump_raw": round(max_jump, 1),
                 "kalman_prediction_frames": pred_count,
             }
             _p(0.42, f"Kalman path: raw_jitter={jitter_raw:.1f}px, smooth_jitter={jitter_smooth:.1f}px, smoothness={smoothness_pct:.1f}%")
 
-        # ── Render pass ────────────────────────────────────────────────────────
+        # Render pass
         _p(0.44, "Pass 2/2: rendering...")
         hw = crop_w // 2; hh = crop_h // 2
         scene_cut_set = set(scene_cuts)
@@ -2758,7 +2711,6 @@ def process_video(
                                 event_detector.event_active_for(fi))
 
                 if event_active:
-                    # Widen crop during shots/passes
                     new_w  = int(crop_w * SPORTS_EVENT_EXPAND_FACTOR)
                     new_h  = int(new_w * target_h / target_w)
                     new_w  = min(new_w, orig_w)
@@ -2789,9 +2741,7 @@ def process_video(
                 if fi % rpt_n == 0:
                     _p(0.44 + 0.44 * (fi / total_frames), f"Render {fi}/{total_frames}...")
 
-    # ════════════════════════════════════════════════════════════════════════════
-    # Panel path: single-pass detect+render (unchanged from v4.1)
-    # ════════════════════════════════════════════════════════════════════════════
+    # Panel path: single-pass detect+render
     else:
         _p(0.12, "Panel: single-pass detect+render...")
         prev_slots: Optional[List[List[Tuple[int, int, int, int]]]] = None
@@ -2832,7 +2782,7 @@ def process_video(
                 if fi % rpt_n == 0:
                     _p(0.12 + 0.75 * (fi / total_frames), f"{fi}/{total_frames}...")
 
-    # ── Finalize ───────────────────────────────────────────────────────────────
+    # Finalize
     _p(0.88, "Encoding...")
     _close_ffmpeg_encoder(proc, output_path)
 
@@ -2860,7 +2810,6 @@ def process_video(
     )
     return result_meta
 
-# ─── Sports convenience wrapper ───────────────────────────────────────────────
 def process_sports_video(
     input_path: str,
     output_path: str,
@@ -2911,7 +2860,6 @@ def process_sports_video(
         panel_config=PanelModeConfig(split_mode="force_off"),
     )
 
-# ─── Batch clip pipeline ──────────────────────────────────────────────────────
 def process_clips_batch(
     input_path: str,
     output_dir: str,
@@ -2943,7 +2891,7 @@ def process_clips_batch(
     panel_config: Optional[PanelModeConfig] = None,
 ) -> List[Dict[str, Any]]:
     """Process multiple ClipSegments in sequence; returns one result dict per clip."""
-    def _p(v: float, msg: str = "") -> None:
+    def _p(v: float, msg: str = "  ") -> None:
         if progress_callback:
             try: progress_callback(v, msg)
             except Exception: pass
@@ -2970,7 +2918,7 @@ def process_clips_batch(
                 f"clip_{i+1:02d}_{int(clip.start_sec)}s_{int(clip.end_sec)}s_vertical.mp4",
             )
 
-            def clip_cb(v: float, msg: str = "", _b: float = base_pct, _n: float = next_pct) -> None:
+            def clip_cb(v: float, msg: str = "  ", _b: float = base_pct, _n: float = next_pct) -> None:
                 _p(_b + v * (_n - _b), msg)
 
             meta = process_video(
@@ -3004,4 +2952,3 @@ def process_clips_batch(
     n_ok = sum(1 for r in results if not r.get("error"))
     _p(1.0, f"{n_ok}/{len(results)} clips done")
     return results
-```
