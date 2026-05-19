@@ -879,11 +879,11 @@ class AdaptiveVelocityAwareSmoother:
         return w if w % 2 == 1 else w + 1
 
     def smooth(self, cx: float, cy: float,
-               confidence: float = 1.0,
+               conf: float = 1.0,
                phase: PlayPhase = PlayPhase.HALF_COURT) -> Tuple[float, float]:
         self.frame_count += 1
         self.buffer_cx.append(cx); self.buffer_cy.append(cy)
-        self.buffer_conf.append(confidence); self.buffer_phase.append(phase)
+        self.buffer_conf.append(conf); self.buffer_phase.append(phase)
         n = len(self.buffer_cx)
         if n < 5:
             if self.prev_smooth_cx is None:
@@ -899,7 +899,7 @@ class AdaptiveVelocityAwareSmoother:
             accel=abs(math.hypot(vcx,vcy)-math.hypot(vpx,vpy))
         else:
             velocity=accel=0.0
-        w = self._compute_adaptive_window(velocity, accel, confidence, phase)
+        w = self._compute_adaptive_window(velocity, accel, conf, phase)
         w = min(w, n); w = max(5, w) if n >=5 else max(w, n)
         if w%2==0: w-=1
         try:
@@ -2749,7 +2749,7 @@ if __name__ == "__main__":
     # ── AVS smoke-test ────────────────────────────────────────────────────
     avs = AdaptiveVelocityAwareSmoother(fps=30)
     for i in range(50):
-        sx, sy = avs.smooth(float(960+i*2), float(540+i), confidence=0.8,
+        sx, sy = avs.smooth(float(960+i*2), float(540+i), conf=0.8,
                             phase=PlayPhase.HALF_COURT)
     print(f"  AVS metrics: {avs.get_metrics()}")
 
