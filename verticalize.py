@@ -49,12 +49,6 @@ except ImportError:
     _YOLO_AVAILABLE = False
 
 
-try:
-    import psutil
-    _PSUTIL_AVAILABLE = True
-except ImportError:
-    _PSUTIL_AVAILABLE = False
-
 # ── Custom exception ──────────────────────────────────────────────────────────
 class ProcessingError(Exception):
     pass
@@ -126,7 +120,7 @@ SPORTS_SCENE_CUT_THRESHOLD        = 0.18
 SPORTS_SCENE_CUT_MIN_FRAMES       = 2
 SPORTS_SWITCH_BALL_BONUS          = 200
 SPORTS_BALL_CONFIDENCE            = 0.25
-SPORTS_BALL_PROXIMITY_PX          = 120  # DEPRECATED: now instance-scaled in MultiObjectSportsTracker
+SPORTS_BALL_PROXIMITY_PX          = 120
 SPORTS_EVENT_EXPAND_FRAMES        = 15
 SPORTS_EVENT_EXPAND_FACTOR        = 1.25
 
@@ -875,9 +869,6 @@ class MultiObjectSportsTracker:
         self.gravity_px = GRAVITY_PIXELS_PER_SEC2_BASE * (frame_h / 1080.0)
         self.track_history: Dict[int, deque] = {}
         self.appearance_gallery: Dict[int, np.ndarray] = {}
-        # ── v6.2: resolution-scaled ball proximity threshold ──
-        # 120px at 1920w baseline; scales linearly with width
-        self.ball_proximity_px = max(60.0, frame_w * (120.0 / 1920.0))
 
     def _compute_iou(self, a: Tuple, b: Tuple) -> float:
         x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
@@ -997,29 +988,10 @@ class MultiObjectSportsTracker:
                        if v.status != TrackingStatus.LOST}
 
     def _update_ball(self, ball_box: Optional[Tuple[int, int, int, int]]) -> None:
-        """Update ball state with velocity gate to reject misdetection jumps."""
         if ball_box is not None:
-            bx = (ball_box[0] + ball_box[2]) / 2
-            by = (ball_box[1] + ball_box[3]) / 2
+            bx = (ball_box[0]+ball_box[2])/2; by = (ball_box[1]+ball_box[3])/2
             if self.ball_state.center is not None:
-                vx = bx - self.ball_state.center[0]
-                vy = by - self.ball_state.center[1]
-                # ── VELOCITY GATE: cap at physics-plausible max per frame ──
-                # A basketball at 30fps travels ~15-20 px/frame at 1080p on a fast pass.
-                # Scale cap by frame height so it works across resolutions.
-                max_v = max(25.0, self.frame_h * 0.025)  # ~27px at 1080p, ~13px at 540p
-                speed = math.hypot(vx, vy)
-                if speed > max_v and self.ball_state.airborne_frames < 3:
-                    # Reject: likely misdetection (unless just launched, where jump is expected)
-                    # Predict instead using current velocity
-                    dt = 1.0 / self.fps
-                    nvy = self.ball_state.velocity[1] + self.gravity_px * dt
-                    ncx = self.ball_state.center[0] + self.ball_state.velocity[0]
-                    ncy = self.ball_state.center[1] + nvy * dt
-                    self.ball_state.center = (ncx, ncy)
-                    self.ball_state.velocity = (self.ball_state.velocity[0], nvy)
-                    return  # Skip updating bbox; let tracker predict
-                # Accepted detection: update velocity and state
+                vx = bx-self.ball_state.center[0]; vy = by-self.ball_state.center[1]
                 self.ball_state.velocity = (vx, vy)
                 if vy < -BALL_AIRBORNE_THRESHOLD_PX:
                     self.ball_state.is_airborne = True
@@ -1027,20 +999,16 @@ class MultiObjectSportsTracker:
                 elif abs(vy) < BALL_AIRBORNE_THRESHOLD_PX and self.ball_state.is_airborne:
                     self.ball_state.is_airborne = False
                     self.ball_state.bounce_count += 1
-                    self.ball_state.velocity = (
-                        self.ball_state.velocity[0],
-                        self.ball_state.velocity[1] * BALL_BOUNCE_VELOCITY_DAMPING
-                    )
+                    self.ball_state.velocity = (self.ball_state.velocity[0],
+                                                self.ball_state.velocity[1]*BALL_BOUNCE_VELOCITY_DAMPING)
                     self.ball_state.airborne_frames = 0
-            self.ball_state.center = (bx, by)
-            self.ball_state.bbox = ball_box
+            self.ball_state.center = (bx, by); self.ball_state.bbox = ball_box
         else:
-            # No detection: predict using physics
             if self.ball_state.center is not None and self.ball_state.is_airborne:
-                dt = 1.0 / self.fps
-                nvy = self.ball_state.velocity[1] + self.gravity_px * dt
+                dt = 1.0/self.fps
+                nvy = self.ball_state.velocity[1] + self.gravity_px*dt
                 ncx = self.ball_state.center[0] + self.ball_state.velocity[0]
-                ncy = self.ball_state.center[1] + nvy * dt
+                ncy = self.ball_state.center[1] + nvy*dt
                 self.ball_state.center = (ncx, ncy)
                 self.ball_state.velocity = (self.ball_state.velocity[0], nvy)
 
@@ -1054,8 +1022,7 @@ class MultiObjectSportsTracker:
                     continue
                 d = math.hypot(t.center[0]-self.ball_state.center[0],
                                t.center[1]-self.ball_state.center[1])
-                # ── v6.2: use instance-scaled proximity threshold ──
-                if d < self.ball_proximity_px and d < min_dist:
+                if d < SPORTS_BALL_PROXIMITY_PX and d < min_dist:
                     min_dist, closest = d, t
             if closest is not None:
                 self.ball_state.is_possessed = True
@@ -1218,8 +1185,6 @@ class AdaptiveVelocityAwareSmoother:
 class IntelligentCropStrategy:
     """
     v6.1 change: caches velocity; skips recompute when center barely moved.
-    v6.2 change: EMA-smoothed ball nudge to prevent per-frame jitter from
-                flickering ball detections.
     """
     def __init__(self, orig_w: int, orig_h: int, crop_w: int, crop_h: int, fps: float) -> None:
         self.orig_w = orig_w; self.orig_h = orig_h
@@ -1232,11 +1197,6 @@ class IntelligentCropStrategy:
         self._cached_vy: float = 0.0
         self._prev_cx: Optional[float] = None
         self._prev_cy: Optional[float] = None
-        # ── v6.2: ball-nudge smoothing state ──
-        self._ball_nudge_x: float = 0.0
-        self._ball_nudge_y: float = 0.0
-        self._ball_nudge_alpha: float = 0.15  # slow EMA for stable nudge
-        self._ball_nudge_max: float = orig_w * 0.08  # cap nudge magnitude
 
     def compute_crop(self, cx: float, cy: float,
                      phase: PlayPhase = PlayPhase.HALF_COURT,
@@ -1276,42 +1236,16 @@ class IntelligentCropStrategy:
         top  = max(0, min(top,  max(0, self.orig_h - self.crop_h)))
         right, bottom = left+self.crop_w, top+self.crop_h
 
-        # ── v6.2: EMA-smoothed ball nudge instead of per-frame snap ──
         if ball_pos is not None:
-            bx, by = ball_pos
-            m = self.crop_w * 0.15
-            # Compute raw desired nudge for this frame
-            raw_nudge_x = 0.0
-            raw_nudge_y = 0.0
-            if bx < left + m:
-                raw_nudge_x = -(left + m - bx)
-            elif bx > right - m:
-                raw_nudge_x = bx - (right - m)
-            if by < top + m:
-                raw_nudge_y = -(top + m - by)
-            elif by > bottom - m:
-                raw_nudge_y = by - (bottom - m)
-            # Smooth the nudge with EMA
-            self._ball_nudge_x = (
-                self._ball_nudge_alpha * raw_nudge_x +
-                (1 - self._ball_nudge_alpha) * self._ball_nudge_x
-            )
-            self._ball_nudge_y = (
-                self._ball_nudge_alpha * raw_nudge_y +
-                (1 - self._ball_nudge_alpha) * self._ball_nudge_y
-            )
-            # Cap nudge magnitude to prevent runaway
-            nx = max(-self._ball_nudge_max, min(self._ball_nudge_max, self._ball_nudge_x))
-            ny = max(-self._ball_nudge_max, min(self._ball_nudge_max, self._ball_nudge_y))
-            # Apply smoothed nudge
-            left  = int(np.clip(left + nx, 0, self.orig_w - self.crop_w))
-            top   = int(np.clip(top  + ny, 0, self.orig_h - self.crop_h))
-            right = left + self.crop_w
-            bottom = top + self.crop_h
-        else:
-            # Decay nudge when ball not visible
-            self._ball_nudge_x *= 0.9
-            self._ball_nudge_y *= 0.9
+            bx, by = ball_pos; m = self.crop_w * 0.15
+            if bx < left+m:
+                left  = max(0, left-int(left+m-bx)); right = left+self.crop_w
+            elif bx > right-m:
+                left  = min(max(0,self.orig_w-self.crop_w), left+int(bx-(right-m))); right=left+self.crop_w
+            if by < top+m:
+                top   = max(0, top-int(top+m-by)); bottom = top+self.crop_h
+            elif by > bottom-m:
+                top   = min(max(0,self.orig_h-self.crop_h), top+int(by-(bottom-m))); bottom=top+self.crop_h
 
         return left, top, right, bottom
 
@@ -1677,11 +1611,9 @@ def detect_subjects(frame: np.ndarray, model: Any, confidence: float = 0.45,
                     prev_ball_carrier: Optional[int] = None,
                     tracking_mode: str = "subject",
                     _cached_result: Optional[DetectionCache] = None,
-                    frame_w: int = 1920,  # ── v6.2: pass frame width for scaled proximity ──
                     ) -> Tuple[Optional[DetectionResult], Optional[Tuple], int]:
     """
     v6.1: accepts optional DetectionCache to skip redundant YOLO calls.
-    v6.2: frame_w parameter for resolution-scaled ball proximity.
     If _cached_result is provided, uses its stored persons/balls.
     """
     if _cached_result is not None:
@@ -1705,15 +1637,13 @@ def detect_subjects(frame: np.ndarray, model: Any, confidence: float = 0.45,
     if not persons_raw: return None, None, -1
 
     ball_box     = None; ball_carrier = -1
-    # ── v6.2: scale proximity to frame width (120px at 1920w) ──
-    proximity_px = max(60.0, frame_w * (120.0 / 1920.0))
     if balls:
         best_ball = max(balls, key=lambda b: b[6])
         ball_box  = (best_ball[0], best_ball[1], best_ball[2], best_ball[3])
         min_dist  = float('inf')
         for i, p in enumerate(persons_raw):
             d = math.hypot(p[4]-best_ball[4], p[5]-best_ball[5])
-            if d < min_dist and d < proximity_px:
+            if d < min_dist and d < SPORTS_BALL_PROXIMITY_PX:
                 min_dist, ball_carrier = d, i
 
     if tracking_mode == "sports_action":
@@ -2331,9 +2261,7 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
 # ── Analytics ─────────────────────────────────────────────────────────────────
 def _build_analytics(input_path: str, output_path: str, orig_w: int, orig_h: int,
                      out_w: int, out_h: int, smooth_metrics: Optional[Dict]=None,
-                     panel_mode: bool=False, kalman_predictions: int=0,
-                     cpu_percent: float = 0.0, ram_mb: float = 0.0,
-                     peak_cpu: float = 0.0, peak_ram_mb: float = 0.0) -> Dict[str,Any]:
+                     panel_mode: bool=False, kalman_predictions: int=0) -> Dict[str,Any]:
     def _sz(p): return os.path.getsize(p)/(1024*1024) if os.path.exists(p) else 0.0
     def _br(p):
         try:
@@ -2351,11 +2279,6 @@ def _build_analytics(input_path: str, output_path: str, orig_w: int, orig_h: int
         "input_bitrate_kbps":_br(input_path),"output_bitrate_kbps":_br(output_path),
         "panel_mode":panel_mode,"kalman_predictions":kalman_predictions,
         "jitter_raw":0.0,"jitter_smooth":0.0,"smoothness_pct":0.0,
-        # ── v6.2: CPU / RAM utilization ──
-        "cpu_percent_avg": round(cpu_percent, 1),
-        "cpu_percent_peak": round(peak_cpu, 1),
-        "ram_mb_avg": round(ram_mb, 1),
-        "ram_mb_peak": round(peak_ram_mb, 1),
     }
     if smooth_metrics:
         a.update({k:smooth_metrics.get(k,0.0) for k in ("jitter_raw","jitter_smooth","smoothness_pct")})
@@ -2656,14 +2579,6 @@ def _sports_tracking_pass_optimized(
                                             int(tracked_bb[1]/det_scale),
                                             int(tracked_bb[2]/det_scale),
                                             int(tracked_bb[3]/det_scale))
-                    # ── v6.2: On skip frames, do NOT reuse stale ball_carrier index.
-                    # The det_cache.ball_carrier was computed for a *previous* YOLO
-                    # frame with a different persons_orig list. MOT tracks have
-                    # since been updated/predicted. Pass ball_carrier=-1 so
-                    # get_primary_track() uses track-to-ball distance instead
-                    # of the stale index.
-                    det_cache.ball_carrier = -1
-                    det_cache.det_result = None  # Also clear stale fallback coords
                     # Update MOT with stale person list (predicts via velocity)
                     mot_tracker.update(det_cache.persons, tracked_ball,
                                         det_frame, det_cache.confidences)
@@ -2777,28 +2692,6 @@ def process_video(input_path: str, output_path: str,
                                            min_person_area_frac=panel_cfg.min_person_area_frac,
                                            max_count_variance=panel_cfg.max_count_variance,
                                            stability_frac=panel_cfg.stability_frac)
-
-    # ── v6.2: CPU / RAM monitoring ──
-    cpu_samples: List[float] = []
-    ram_samples: List[float] = []
-    peak_cpu: float = 0.0
-    peak_ram: float = 0.0
-    proc = psutil.Process() if _PSUTIL_AVAILABLE else None
-
-    def _sample_resources() -> None:
-        if proc is None:
-            return
-        try:
-            cpu = proc.cpu_percent(interval=None)
-            mem = proc.memory_info().rss / (1024 * 1024)  # MB
-            cpu_samples.append(cpu)
-            ram_samples.append(mem)
-            nonlocal peak_cpu, peak_ram
-            peak_cpu = max(peak_cpu, cpu)
-            peak_ram = max(peak_ram, mem)
-        except Exception:
-            pass
-
     _p(0.05,"Tracking subjects...")
     raw_centers,speeds,scene_cuts,persons_map,kalman_preds=_tracking_pass(
         input_path=input_path,orig_w=orig_w,orig_h=orig_h,crop_w=crop_w,crop_h=crop_h,
@@ -2807,14 +2700,12 @@ def process_video(input_path: str, output_path: str,
         use_optical_flow=use_optical_flow,rule_of_thirds=rule_of_thirds,
         scene_cut_threshold=scene_cut_threshold,talking_head_bias=talking_head_bias,
         use_kalman=use_kalman,panel_mode_active=use_panel_mode,
-        progress_callback=lambda v,m: (_p(0.05+v*0.45,m), _sample_resources()))
+        progress_callback=lambda v,m:_p(0.05+v*0.45,m))
     _p(0.50,"Smoothing camera path...")
-    _sample_resources()
     smoothed,smooth_metrics=smooth_centers(raw_centers,speeds,base_window=smooth_window,
                                             adaptive=adaptive_smoothing,scene_cuts=scene_cuts,
                                             use_kalman=use_kalman)
     _p(0.55,"Rendering...")
-    _sample_resources()
     render_meta=_render_video(input_path=input_path,output_path=output_path,
                                out_w=out_w,out_h=out_h,crop_w=crop_w,crop_h=crop_h,
                                orig_w=orig_w,orig_h=orig_h,fps=fps,total_frames=total_frames,
@@ -2830,20 +2721,12 @@ def process_video(input_path: str, output_path: str,
                                ffmpeg_sharpen=ffmpeg_sharpen,scene_cuts=scene_cuts,
                                use_panel_mode=use_panel_mode,panel_config=panel_cfg,
                                panel_persons_map=persons_map,
-                               progress_callback=lambda v,m: (_p(0.55+v*0.43,m), _sample_resources()))
+                               progress_callback=lambda v,m:_p(0.55+v*0.43,m))
     _p(1.0,"Done!")
-    _sample_resources()
-
-    # Compute averages
-    avg_cpu = float(np.mean(cpu_samples)) if cpu_samples else 0.0
-    avg_ram = float(np.mean(ram_samples)) if ram_samples else 0.0
-
     analytics=_build_analytics(input_path,output_path,orig_w=orig_w,orig_h=orig_h,
                                 out_w=out_w,out_h=out_h,smooth_metrics=smooth_metrics,
                                 panel_mode=use_panel_mode,
-                                kalman_predictions=smooth_metrics.get("kalman_prediction_frames",0),
-                                cpu_percent=avg_cpu, ram_mb=avg_ram,
-                                peak_cpu=peak_cpu, peak_ram_mb=peak_ram)
+                                kalman_predictions=smooth_metrics.get("kalman_prediction_frames",0))
     result={"analytics":analytics}
     if render_meta.get("subtitle_path"): result["subtitle_path"]=render_meta["subtitle_path"]
     return result
@@ -2871,8 +2754,6 @@ def process_sports_video(input_path: str, output_path: str,
     """
     Sports-optimized pipeline.
     v6.1 uses _sports_tracking_pass_optimized for ~2-3× faster tracking.
-    v6.2 adds velocity-gated ball tracking, EMA-smoothed crop nudge,
-         stale-carrier fix, resolution-scaled proximity, and CPU/RAM analytics.
     """
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
     _check_ffmpeg()
@@ -2894,27 +2775,6 @@ def process_sports_video(input_path: str, output_path: str,
     ics           = IntelligentCropStrategy(orig_w,orig_h,crop_w,crop_h,fps)
     phase_detector = SportsPlayPhaseDetector(fps)
 
-    # ── v6.2: CPU / RAM monitoring ──
-    cpu_samples: List[float] = []
-    ram_samples: List[float] = []
-    peak_cpu: float = 0.0
-    peak_ram: float = 0.0
-    proc = psutil.Process() if _PSUTIL_AVAILABLE else None
-
-    def _sample_resources() -> None:
-        if proc is None:
-            return
-        try:
-            cpu = proc.cpu_percent(interval=None)
-            mem = proc.memory_info().rss / (1024 * 1024)  # MB
-            cpu_samples.append(cpu)
-            ram_samples.append(mem)
-            nonlocal peak_cpu, peak_ram
-            peak_cpu = max(peak_cpu, cpu)
-            peak_ram = max(peak_ram, mem)
-        except Exception:
-            pass
-
     _p(0.05,"Sports tracking (optimized)...")
     raw_centers, speeds, scene_cuts = _sports_tracking_pass_optimized(
         input_path=input_path, orig_w=orig_w, orig_h=orig_h,
@@ -2924,11 +2784,10 @@ def process_sports_video(input_path: str, output_path: str,
         field_mask=field_mask,
         mot_tracker=mot_tracker, avs_smoother=avs_smoother,
         ics=ics, phase_detector=phase_detector,
-        progress_callback=lambda v,m: (_p(0.05+v*0.45,m), _sample_resources()),
+        progress_callback=lambda v,m:_p(0.05+v*0.45,m),
     )
 
     _p(0.50,"Sports post-smoothing...")
-    _sample_resources()
     dense_cx=np.array([c[0] for c in raw_centers],dtype=float)
     dense_cy=np.array([c[1] for c in raw_centers],dtype=float)
     dense_cx,dense_cy=_apply_sports_post_smooth(dense_cx,dense_cy,fps,scene_cuts,total_frames)
@@ -2941,7 +2800,6 @@ def process_sports_video(input_path: str, output_path: str,
                     "kalman_prediction_frames":0}
 
     _p(0.55,"Rendering sports video...")
-    _sample_resources()
     render_meta=_render_video(input_path=input_path,output_path=output_path,
                                out_w=out_w,out_h=out_h,crop_w=crop_w,crop_h=crop_h,
                                orig_w=orig_w,orig_h=orig_h,fps=fps,total_frames=total_frames,
@@ -2956,19 +2814,10 @@ def process_sports_video(input_path: str, output_path: str,
                                vignette_strength=vignette_strength,sharpen_strength=sharpen_strength,
                                ffmpeg_sharpen=ffmpeg_sharpen,scene_cuts=scene_cuts,
                                use_panel_mode=False,
-                               progress_callback=lambda v,m: (_p(0.55+v*0.43,m), _sample_resources()))
+                               progress_callback=lambda v,m:_p(0.55+v*0.43,m))
     _p(1.0,"Done!")
-    _sample_resources()
-
-    # Compute averages
-    avg_cpu = float(np.mean(cpu_samples)) if cpu_samples else 0.0
-    avg_ram = float(np.mean(ram_samples)) if ram_samples else 0.0
-
     analytics=_build_analytics(input_path,output_path,orig_w=orig_w,orig_h=orig_h,
-                                out_w=out_w,out_h=out_h,smooth_metrics=smooth_metrics,
-                                panel_mode=False,
-                                cpu_percent=avg_cpu, ram_mb=avg_ram,
-                                peak_cpu=peak_cpu, peak_ram_mb=peak_ram)
+                                out_w=out_w,out_h=out_h,smooth_metrics=smooth_metrics,panel_mode=False)
     result={"analytics":analytics}
     if render_meta.get("subtitle_path"): result["subtitle_path"]=render_meta["subtitle_path"]
     return result
