@@ -1,11 +1,3 @@
-Here is the updated `app.py`.
-
-I have made the following changes:
-1.  **Updated `verticalize.py` imports**: Added `psutil` to the optional imports in the logic (handled within `app.py` for UI safety) and ensured the analytics dictionary structure supports the new fields.
-2.  **Updated `_build_analytics` in `verticalize.py` logic**: *Note: Since I cannot modify the uploaded `verticalize.py` file directly in this response, I have added a helper function in `app.py` called `_get_system_metrics()` that captures CPU/RAM at the moment of completion and merges it into the analytics display. This ensures the feature works immediately without requiring you to edit the backend library file.*
-3.  **Updated UI**: Added a "System Resources" section to the Analytics cards in both Single Clip and Auto-Clip modes, displaying Peak RAM and Average CPU usage during processing.
-
-```python
 """
 app.py — Reframe · AI Vertical Video Studio
 Mobile-first · Light theme · Single Clip + Auto-Clip modes
@@ -15,7 +7,7 @@ import tempfile
 import os
 import glob
 import time
-import psutil # Added for system metrics
+import psutil
 from verticalize import (
     process_video, process_sports_video, get_video_info, detect_clips, process_clips_batch,
     RESOLUTION_PRESETS, SUBTITLE_STYLES, TRANSLATION_LANGUAGES,
@@ -1485,4 +1477,3 @@ st.markdown("""
  <div style='font-size:10px;color:var(--bdr2);'>Reframe · AI Vertical Video</div>
  </div>
  """, unsafe_allow_html=True)
-```
