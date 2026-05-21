@@ -470,14 +470,14 @@ def _draw_tracking_overlays(
 ) -> np.ndarray:
     """
     Draw thin bounding-box overlays on an already-cropped/resized output frame.
-    - Ball:    bright yellow corner-tick bracket + small centre dot
+    - Ball:    bright yellow corner-tick brackets + small centre dot
     - Persons: white 1-px outline with faint semi-transparent fill
     Returns a copy; caller's array is never mutated.
     """
     out = frame.copy()
     h, w = out.shape[:2]
 
-    # ── Person boxes (white, 1 px + subtle fill) ──────────────────────────────
+    # ── Person boxes (white, 1 px + 6% fill) ──────────────────────────────────
     for (x1, y1, x2, y2) in person_boxes_out:
         x1c = max(0, x1); y1c = max(0, y1)
         x2c = min(w-1, x2); y2c = min(h-1, y2)
@@ -497,14 +497,16 @@ def _draw_tracking_overlays(
             clen  = max(6, min((bx2c-bx1c)//4, (by2c-by1c)//4, 18))
             color = (0, 230, 255)   # bright yellow-orange (BGR)
             thick = 2
-            cv2.line(out, (bx1c,       by1c),       (bx1c+clen, by1c),       color, thick, cv2.LINE_AA)
-            cv2.line(out, (bx1c,       by1c),       (bx1c,      by1c+clen),  color, thick, cv2.LINE_AA)
-            cv2.line(out, (bx2c,       by1c),       (bx2c-clen, by1c),       color, thick, cv2.LINE_AA)
-            cv2.line(out, (bx2c,       by1c),       (bx2c,      by1c+clen),  color, thick, cv2.LINE_AA)
-            cv2.line(out, (bx1c,       by2c),       (bx1c+clen, by2c),       color, thick, cv2.LINE_AA)
-            cv2.line(out, (bx1c,       by2c),       (bx1c,      by2c-clen),  color, thick, cv2.LINE_AA)
-            cv2.line(out, (bx2c,       by2c),       (bx2c-clen, by2c),       color, thick, cv2.LINE_AA)
-            cv2.line(out, (bx2c,       by2c),       (bx2c,      by2c-clen),  color, thick, cv2.LINE_AA)
+            # Four corner ticks
+            cv2.line(out, (bx1c,      by1c), (bx1c+clen, by1c),      color, thick, cv2.LINE_AA)
+            cv2.line(out, (bx1c,      by1c), (bx1c,      by1c+clen), color, thick, cv2.LINE_AA)
+            cv2.line(out, (bx2c,      by1c), (bx2c-clen, by1c),      color, thick, cv2.LINE_AA)
+            cv2.line(out, (bx2c,      by1c), (bx2c,      by1c+clen), color, thick, cv2.LINE_AA)
+            cv2.line(out, (bx1c,      by2c), (bx1c+clen, by2c),      color, thick, cv2.LINE_AA)
+            cv2.line(out, (bx1c,      by2c), (bx1c,      by2c-clen), color, thick, cv2.LINE_AA)
+            cv2.line(out, (bx2c,      by2c), (bx2c-clen, by2c),      color, thick, cv2.LINE_AA)
+            cv2.line(out, (bx2c,      by2c), (bx2c,      by2c-clen), color, thick, cv2.LINE_AA)
+            # Centre dot
             bcx = (bx1c+bx2c)//2; bcy = (by1c+by2c)//2
             cv2.circle(out, (bcx, bcy), max(2, (bx2c-bx1c)//6), color, -1, cv2.LINE_AA)
     return out
@@ -751,17 +753,15 @@ def _open_ffmpeg_encoder(output_path: str, width: int, height: int, fps: float,
 def _close_ffmpeg_encoder(proc: subprocess.Popen, output_path: str) -> None:
     try: proc.stdin.close()
     except Exception: pass
-    # Drain stderr in a thread to prevent pipe deadlock on large videos
+    # Drain stderr in background thread to prevent pipe deadlock on large videos
     stderr_buf: List[bytes] = []
     def _drain():
         try:
             while True:
                 chunk = proc.stderr.read(4096)
-                if not chunk:
-                    break
+                if not chunk: break
                 stderr_buf.append(chunk)
-        except Exception:
-            pass
+        except Exception: pass
     t = threading.Thread(target=_drain, daemon=True)
     t.start()
     try: proc.wait(timeout=180)
@@ -1089,6 +1089,11 @@ class MultiObjectSportsTracker:
                 self.ball_state.is_possessed = True
                 self.ball_state.possessor_track_id = closest.id
                 return closest
+            else:
+                # Ball is visible but no player is close — signal caller to use ball position
+                self.ball_state.is_possessed = False
+                self.ball_state.possessor_track_id = None
+                return None  # ← caller will use ball_state.center directly
         active = [t for t in self.tracks.values() if t.status == TrackingStatus.ACTIVE]
         if not active:
             return None
@@ -1664,6 +1669,9 @@ def _parse_yolo_results(results_boxes, scale: float, confidence: float,
             person_confs.append(conf)
         elif cls == SPORTS_BALL_CLASS_ID and conf >= SPORTS_BALL_CONFIDENCE:
             balls.append((x1, y1, x2, y2, cx_b, cy_b, conf))
+    # Sort highest-confidence first so callers can safely use [0]
+    balls.sort(key=lambda b: b[6], reverse=True)
+    persons.sort(key=lambda p: p[6], reverse=True)
     return persons, balls, person_confs
 
 
@@ -2365,9 +2373,7 @@ def _render_video(input_path: str, output_path: str,
                   progress_callback=None, scene_cuts: Optional[List[int]] = None,
                   use_panel_mode: bool = False,
                   panel_config: Optional[PanelModeConfig] = None,
-                  panel_persons_map: Optional[Dict[int,List]] = None,
-                  tracking_boxes_map: Optional[Dict[int,Dict]] = None,
-                  draw_tracking_boxes: bool = False) -> Dict[str,Any]:
+                  panel_persons_map: Optional[Dict[int,List]] = None) -> Dict[str,Any]:
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
     eff_fps=output_fps or fps; srt_path=None
     if burn_subtitles and whisper_available():
@@ -2417,19 +2423,6 @@ def _render_video(input_path: str, output_path: str,
                     if crop.shape[0]==0 or crop.shape[1]==0:
                         crop=(frame[:crop_h,:crop_w] if orig_h>=crop_h and orig_w>=crop_w else frame)
                     out_frame=cv2.resize(crop,(out_w,out_h),interpolation=cv2.INTER_LANCZOS4)
-                    # ── Tracking overlays (transform orig→output space) ───────
-                    if draw_tracking_boxes and tracking_boxes_map is not None:
-                        tboxes = tracking_boxes_map.get(fi)
-                        if tboxes is not None:
-                            sx = out_w / max(crop_w, 1)
-                            sy = out_h / max(crop_h, 1)
-                            def _to_out(bx: Tuple[int,int,int,int]) -> Tuple[int,int,int,int]:
-                                return (int((bx[0]-x1)*sx), int((bx[1]-y1)*sy),
-                                        int((bx[2]-x1)*sx), int((bx[3]-y1)*sy))
-                            raw_ball = tboxes.get("ball")
-                            ball_out = _to_out(raw_ball) if raw_ball else None
-                            persons_out = [_to_out(p) for p in tboxes.get("persons", [])]
-                            out_frame = _draw_tracking_overlays(out_frame, ball_out, persons_out)
                     if vignette_strength>0: out_frame=apply_vignette(out_frame,vignette_strength)
                     if sharpen_strength>0 and not ffmpeg_sharpen:
                         out_frame=apply_sharpen(out_frame,sharpen_strength)
@@ -2571,9 +2564,9 @@ def _sports_tracking_pass_optimized(
     prev_ball_carrier: Optional[int] = None
     current_phase = PlayPhase.HALF_COURT
 
-    # Ball-detection bootstrap state
-    ball_found_ever: bool = False   # True once YOLO sees the ball for the first time
-    tracker_lost_ball: bool = False  # True when ROI tracker drops the ball mid-stream
+    # Ball-detection bootstrap: run YOLO every frame until ball first seen
+    ball_found_ever: bool = False
+    tracker_lost_ball: bool = False
 
     # Adaptive skip: start conservative
     yolo_skip = SPORTS_YOLO_SKIP_BASE
@@ -2603,20 +2596,18 @@ def _sports_tracking_pass_optimized(
                     tracker_lost_ball = False
 
                 # ── Decide whether to run YOLO ────────────────────────────────
-                # Force YOLO on frame 0 to establish baseline.
-                # Force YOLO on every frame until ball is found for the first time.
-                # Force YOLO immediately if the ROI tracker just lost the ball.
-                force_yolo_bootstrap = (not ball_found_ever)
+                # Force YOLO on frame 0, every frame until ball first seen,
+                # and immediately when ROI tracker loses the ball.
                 run_yolo = (
                     fi == 0
-                    or force_yolo_bootstrap
-                    or tracker_lost_ball
+                    or (not ball_found_ever)        # scan every frame until ball appears
+                    or tracker_lost_ball             # re-acquire after ROI drop
                     or frames_since_yolo >= yolo_skip
                     or det_cache.frame_idx < 0
                     or is_cut
                 )
                 frames_since_yolo = 0 if run_yolo else frames_since_yolo + 1
-                tracker_lost_ball = False  # reset; will be set again below if needed
+                tracker_lost_ball = False  # reset; will be re-set below if needed
 
                 if run_yolo and model is not None:
                     try:
@@ -2628,10 +2619,10 @@ def _sports_tracking_pass_optimized(
                                          int(p[2]/det_scale), int(p[3]/det_scale))
                                         for p in persons_raw]
                         if balls_raw and use_ball_tracking:
-                            bb = balls_raw[0]  # highest-conf ball already at top after max()
+                            bb = balls_raw[0]  # highest-conf ball (sorted by _parse_yolo_results)
                             ball_box_orig = (int(bb[0]/det_scale), int(bb[1]/det_scale),
                                              int(bb[2]/det_scale), int(bb[3]/det_scale))
-                            ball_found_ever = True   # ← ball seen at least once
+                            ball_found_ever = True   # ← latched once ball first appears
                             # Re-init ROI tracker on every YOLO keyframe
                             pad = BALL_ROI_PAD_PX
                             roi_bb = (max(0,bb[0]-pad), max(0,bb[1]-pad),
@@ -2673,9 +2664,12 @@ def _sports_tracking_pass_optimized(
                                             int(tracked_bb[1]/det_scale),
                                             int(tracked_bb[2]/det_scale),
                                             int(tracked_bb[3]/det_scale))
+                            # Keep det_cache.ball_box fresh with ROI position
+                            det_cache.ball_box = tracked_ball
                         else:
-                            # ROI tracker lost the ball → trigger YOLO on the next frame
+                            # ROI tracker lost the ball → trigger YOLO next frame
                             tracker_lost_ball = True
+                            det_cache.ball_box = None
                     # Update MOT with stale person list (predicts via velocity)
                     mot_tracker.update(det_cache.persons, tracked_ball,
                                         det_frame, det_cache.confidences)
@@ -2693,16 +2687,36 @@ def _sports_tracking_pass_optimized(
                     yolo_skip = SPORTS_YOLO_SKIP_BASE
 
                 # ── Get focus point ───────────────────────────────────────────
+                # Priority:
+                #  1. Ball possessed → follow ball-carrier (person)
+                #  2. Ball visible, uncontested → blend ball(55%) + nearest player(45%)
+                #  3. No ball → follow best active person track
+                #  4. Nothing → optical-flow / hold last position
+                ball_center = mot_tracker.ball_state.center  # orig coords, or None
                 primary_track = mot_tracker.get_primary_track(prev_ball_carrier)
+
                 if primary_track is not None:
+                    # Ball is possessed — frame the carrier
                     raw_cx = float(primary_track.center[0])
                     raw_cy = float(primary_track.center[1])
                     if primary_track.id == mot_tracker.ball_state.possessor_track_id:
                         prev_ball_carrier = primary_track.id
-                elif det_cache.det_result is not None:
-                    # fallback to cached det_result (if we had one)
-                    raw_cx = float(det_cache.det_result.cx) if hasattr(det_cache.det_result, 'cx') else (prev_cx or orig_w/2)
-                    raw_cy = float(det_cache.det_result.cy) if hasattr(det_cache.det_result, 'cy') else (prev_cy or orig_h/2)
+                elif ball_center is not None and use_ball_tracking:
+                    # Ball visible but no player holding it — lead with the ball
+                    active_tracks = [t for t in mot_tracker.tracks.values()
+                                     if t.status == TrackingStatus.ACTIVE]
+                    if active_tracks:
+                        nearest = min(active_tracks, key=lambda t: math.hypot(
+                            t.center[0] - ball_center[0], t.center[1] - ball_center[1]))
+                        raw_cx = ball_center[0] * 0.55 + nearest.center[0] * 0.45
+                        raw_cy = ball_center[1] * 0.55 + nearest.center[1] * 0.45
+                    else:
+                        raw_cx = float(ball_center[0])
+                        raw_cy = float(ball_center[1])
+                elif det_cache.persons:
+                    # No ball visible — centroid of known persons
+                    raw_cx = float(sum((p[0]+p[2])/2 for p in det_cache.persons) / len(det_cache.persons))
+                    raw_cy = float(sum((p[1]+p[3])/2 for p in det_cache.persons) / len(det_cache.persons))
                 else:
                     if prev_gray is not None and use_optical_flow:
                         of = sports_optical_flow_center(prev_gray, gray, det_w, det_h,
@@ -2718,7 +2732,13 @@ def _sports_tracking_pass_optimized(
                         raw_cy = float(prev_cy) if prev_cy else orig_h/2
 
                 # ── AVS smooth (every frame) ──────────────────────────────────
-                track_conf = primary_track.confidence if primary_track else 0.5
+                # Confidence: high when ball possessed, medium when ball visible, low otherwise
+                if primary_track is not None:
+                    track_conf = primary_track.confidence
+                elif ball_center is not None:
+                    track_conf = 0.7   # ball visible, good signal
+                else:
+                    track_conf = 0.4   # guessing from persons/flow
                 smooth_cx, smooth_cy = avs_smoother.smooth(raw_cx, raw_cy, track_conf, current_phase)
 
                 # ── ICS crop (every frame) ────────────────────────────────────
@@ -2735,10 +2755,10 @@ def _sports_tracking_pass_optimized(
 
                 speed = math.hypot(cx_out-(prev_cx or cx_out), cy_out-(prev_cy or cy_out))
 
-                # ── Store overlay boxes for this frame ────────────────────────
+                # ── Store per-frame overlay boxes ─────────────────────────────
                 tracking_boxes_map[fi] = {
-                    "ball":    det_cache.ball_box,    # in orig coords (or None)
-                    "persons": list(det_cache.persons),  # in orig coords
+                    "ball":    det_cache.ball_box,       # orig coords, kept fresh by ROI tracker
+                    "persons": list(det_cache.persons),  # orig coords
                 }
 
                 raw_centers.append((cx_out, cy_out)); speeds.append(speed)
@@ -2747,8 +2767,11 @@ def _sports_tracking_pass_optimized(
 
                 if fi % max(1, total_frames//50) == 0:
                     ball_status = "found" if ball_found_ever else "searching"
+                    focus = ("carrier" if primary_track and mot_tracker.ball_state.is_possessed
+                             else "ball" if ball_center is not None else "person/flow")
                     _p(fi/total_frames, f"Sports tracking {fi}/{total_frames} "
-                       f"(skip={yolo_skip}, phase={current_phase.name}, ball={ball_status})...")
+                       f"(skip={yolo_skip}, phase={current_phase.name}, "
+                       f"ball={ball_status}, focus={focus})...")
 
     except Exception as e:
         print(f"[sports_tracking_opt] Error: {e}", file=sys.stderr)
@@ -2855,12 +2878,10 @@ def process_sports_video(input_path: str, output_path: str,
                           scene_cut_threshold: float = 0.22,
                           vignette_strength: float = 0.275, sharpen_strength: float = 0.3,
                           ffmpeg_sharpen: bool = True, color_grade: str = "none",
-                          draw_tracking_boxes: bool = True,
                           progress_callback=None) -> Dict[str, Any]:
     """
     Sports-optimized pipeline.
     v6.1 uses _sports_tracking_pass_optimized for ~2-3× faster tracking.
-    draw_tracking_boxes: overlay ball (yellow corner brackets) and subject (white outline) boxes.
     """
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
     _check_ffmpeg()
@@ -2922,7 +2943,7 @@ def process_sports_video(input_path: str, output_path: str,
                                ffmpeg_sharpen=ffmpeg_sharpen,scene_cuts=scene_cuts,
                                use_panel_mode=False,
                                tracking_boxes_map=tracking_boxes_map,
-                               draw_tracking_boxes=draw_tracking_boxes and use_ball_tracking,
+                               draw_tracking_boxes=use_ball_tracking,
                                progress_callback=lambda v,m:_p(0.55+v*0.43,m))
     _p(1.0,"Done!")
     analytics=_build_analytics(input_path,output_path,orig_w=orig_w,orig_h=orig_h,
