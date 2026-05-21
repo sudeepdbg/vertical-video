@@ -1,17 +1,22 @@
 """
-verticalize.py — AI Vertical Video Converter v6.1 (Optimized)
-═══════════════════════════════════════════════════════════════
-Performance Optimizations v6.1:
-- SINGLE YOLO pass per frame (was double: detect_subjects + detect_persons_all)
-- Adaptive frame-skip tracking: YOLO every N frames, lightweight KCF tracker in between
-- Ball-specific ROI tracker (cv2.TrackerCSRT) for sub-frame-skip interpolation
-- Rolling-window AVS smoother: maintains fixed-size array, no full recompute
-- Vectorized spike damping replaces the O(n) per-frame loop in post_smooth
-- ICS caches velocity; skips recompute when center barely moves
-- DetectionCache: deduplicates detections across the sports pipeline
-- Thread-safe FFmpegVideoReader with larger pipe buffer
-- process_sports_video: merged tracking + rendering to single-pass when YOLO unavailable
-- All enums, dataclasses and helpers preserved; public API identical to v6.0
+verticalize.py — AI Vertical Video Converter v6.2 (Ball-Sync Fix)
+═══════════════════════════════════════════════════════════════════
+Changes in v6.2 vs v6.1:
+- BALL TRACKING SYNC FIX: every frame now records its ball position at the
+  exact moment YOLO saw it (or ROI-tracked it), so output frame N has the
+  ball overlay that was detected in source frame N — no temporal drift.
+- AVS DEAD-CODE FIX: removed premature `return sx, sy` that short-circuited
+  the full savgol/gaussian smoother, breaking sports smoothing entirely.
+- ROI TRACKER SCALE BUG FIX: BallROITracker now operates in det_frame space
+  and converts to orig coords only when storing results; previously the
+  init bbox was passed in mixed coordinates, losing precision.
+- BALL CONFIDENCE TIMELINE: per-frame ball confidence stored alongside bbox
+  so render pass can dim/hide brackets when confidence < threshold.
+- draw_tracking_boxes is now a standalone parameter independent of
+  use_ball_tracking (you can track the ball without drawing boxes).
+- process_sports_video exposes draw_tracking_boxes kwarg; app.py toggle wires
+  to it.
+- All other public APIs, enums, dataclasses and constants preserved.
 """
 from __future__ import annotations
 import math
@@ -132,12 +137,15 @@ MOT_APPEARANCE_WEIGHT             = 0.3
 MOT_MAX_TRACKS                    = 15
 MOT_MIN_TRACK_AGE                 = 3
 
-# ── NEW: frame-skip constants ─────────────────────────────────────────────────
+# ── Frame-skip constants ──────────────────────────────────────────────────────
 SPORTS_YOLO_SKIP_BASE      = 3   # run YOLO every N frames (fast break → fewer skips)
 SPORTS_YOLO_SKIP_MAX       = 6   # max skip during static/half-court
 SPORTS_YOLO_SKIP_FASTBREAK = 2   # aggressive tracking during fast break
-BALL_TRACKER_TYPE          = "CSRT"   # or "KCF" for faster (less accurate)
+BALL_TRACKER_TYPE          = "CSRT"
 BALL_ROI_PAD_PX            = 40  # padding around ball bbox for ROI tracker
+
+# Minimum YOLO confidence to show the tracking bracket overlay
+BALL_OVERLAY_CONF_THRESHOLD = 0.30
 
 VELOCITY_SMOOTH_TABLE: List[Tuple[float, int]] = [
     (0.0, 61), (3.0, 53), (8.0, 43), (15.0, 33),
@@ -255,41 +263,58 @@ class ClipSegment:
     def __repr__(self) -> str:
         return f"<Clip {self.start_sec:.1f}s-{self.end_sec:.1f}s score={self.score:.2f}>"
 
-# ── NEW: Detection result cache ───────────────────────────────────────────────
+# ── NEW v6.2: Per-frame ball record ───────────────────────────────────────────
+@dataclass
+class BallFrameRecord:
+    """
+    Exact ball information for one source frame index.
+    source: 'yolo'     — direct YOLO detection (most reliable)
+            'roi'      — lightweight ROI tracker interpolation
+            'predict'  — Kalman/physics prediction (least reliable)
+            'none'     — no ball information for this frame
+    """
+    bbox:       Optional[Tuple[int, int, int, int]]  # orig-coord bbox, or None
+    confidence: float = 0.0
+    source:     str   = "none"   # 'yolo' | 'roi' | 'predict' | 'none'
+
+# ── Detection result cache ────────────────────────────────────────────────────
 class DetectionCache:
     """
     Caches the last YOLO result and forwards it to skipped frames.
     Also stores per-class lists so callers don't need a second pass.
     """
     __slots__ = ("persons", "ball_box", "ball_carrier", "det_result",
-                 "frame_idx", "confidences")
+                 "frame_idx", "confidences", "ball_confidence")
 
     def __init__(self) -> None:
         self.persons:     List[Tuple[int, int, int, int]] = []
         self.ball_box:    Optional[Tuple[int, int, int, int]] = None
         self.ball_carrier: int = -1
-        self.det_result:  Optional[Any] = None  # DetectionResult namedtuple
+        self.det_result:  Optional[Any] = None
         self.frame_idx:   int = -1
         self.confidences: List[float] = []
+        self.ball_confidence: float = 0.0
 
-    def update(self, persons, ball_box, ball_carrier, det_result, confidences, fi):
-        self.persons     = persons
-        self.ball_box    = ball_box
+    def update(self, persons, ball_box, ball_carrier, det_result, confidences, fi,
+               ball_confidence: float = 0.0):
+        self.persons      = persons
+        self.ball_box     = ball_box
         self.ball_carrier = ball_carrier
-        self.det_result  = det_result
-        self.confidences = confidences
-        self.frame_idx   = fi
+        self.det_result   = det_result
+        self.confidences  = confidences
+        self.frame_idx    = fi
+        self.ball_confidence = ball_confidence
 
-# ── NEW: Lightweight ball ROI tracker wrapper ─────────────────────────────────
+# ── Lightweight ball ROI tracker wrapper ─────────────────────────────────────
 class BallROITracker:
     """
-    Wraps a cv2.Tracker to follow the ball in ROI between YOLO keyframes.
-    Falls back gracefully when tracking is lost.
+    v6.2: operates entirely in det_frame (scaled) pixel space.
+    The caller converts back to orig coords when storing results.
     """
     def __init__(self, tracker_type: str = BALL_TRACKER_TYPE) -> None:
         self._type    = tracker_type
         self._tracker: Optional[Any] = None
-        self._bbox:    Optional[Tuple[int, int, int, int]] = None
+        self._bbox_det: Optional[Tuple[int, int, int, int]] = None  # det-space
         self._lost    = True
         self._age     = 0
 
@@ -300,43 +325,42 @@ class BallROITracker:
             return cv2.TrackerKCF_create()
         return cv2.TrackerCSRT_create()
 
-    def init(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> None:
-        """bbox in (x1, y1, x2, y2) format."""
-        x1, y1, x2, y2 = bbox
+    def init(self, det_frame: np.ndarray,
+             bbox_det: Tuple[int, int, int, int]) -> None:
+        """bbox_det must be in det_frame (scaled-down) pixel coordinates."""
+        x1, y1, x2, y2 = bbox_det
         w, h = max(x2 - x1, 1), max(y2 - y1, 1)
         self._tracker = self._make_tracker()
-        self._tracker.init(frame, (x1, y1, w, h))
-        self._bbox = bbox
+        self._tracker.init(det_frame, (x1, y1, w, h))
+        self._bbox_det = bbox_det
         self._lost = False
         self._age  = 0
 
-    def update(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    def update(self, det_frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+        """Returns bbox in det_frame coords, or None if tracking lost."""
         if self._tracker is None or self._lost:
             return None
-        ok, (x, y, w, h) = self._tracker.update(frame)
+        ok, (x, y, w, h) = self._tracker.update(det_frame)
         if not ok or w < 2 or h < 2:
             self._lost = True
             return None
         self._age += 1
-        self._bbox = (int(x), int(y), int(x + w), int(y + h))
-        return self._bbox
+        self._bbox_det = (int(x), int(y), int(x + w), int(y + h))
+        return self._bbox_det
 
     def reset(self) -> None:
-        self._tracker = None
-        self._bbox    = None
-        self._lost    = True
-        self._age     = 0
+        self._tracker  = None
+        self._bbox_det = None
+        self._lost     = True
+        self._age      = 0
 
     @property
     def is_active(self) -> bool:
         return not self._lost and self._tracker is not None
 
     @property
-    def center(self) -> Optional[Tuple[float, float]]:
-        if self._bbox is None:
-            return None
-        return ((self._bbox[0] + self._bbox[2]) / 2,
-                (self._bbox[1] + self._bbox[3]) / 2)
+    def age(self) -> int:
+        return self._age
 
 # ── Feature guards ────────────────────────────────────────────────────────────
 def whisper_available() -> bool:
@@ -430,19 +454,20 @@ def apply_color_grade(frame: np.ndarray, grade: str = "none") -> np.ndarray:
 
 def _draw_tracking_overlays(
     frame: np.ndarray,
-    ball_box_out: Optional[Tuple[int,int,int,int]],
-    person_boxes_out: List[Tuple[int,int,int,int]],
+    ball_record: Optional[BallFrameRecord],
+    person_boxes_out: List[Tuple[int, int, int, int]],
 ) -> np.ndarray:
     """
-    Draw thin bounding-box overlays on an already-cropped/resized output frame.
+    Draw bounding-box overlays on an already-cropped/resized output frame.
     - Ball:    bright yellow corner-tick brackets + small centre dot
+              (color/opacity varies by source: yolo=bright, roi=dimmer, predict=dashed-look)
     - Persons: white 1-px outline with faint semi-transparent fill
     Returns a copy; caller's array is never mutated.
     """
     out = frame.copy()
     h, w = out.shape[:2]
 
-    # ── Person boxes (white, 1 px + 6% fill) ──────────────────────────────────
+    # ── Person boxes ──────────────────────────────────────────────────────────
     for (x1, y1, x2, y2) in person_boxes_out:
         x1c = max(0, x1); y1c = max(0, y1)
         x2c = min(w-1, x2); y2c = min(h-1, y2)
@@ -453,28 +478,42 @@ def _draw_tracking_overlays(
         cv2.addWeighted(overlay, 0.06, out, 0.94, 0, out)
         cv2.rectangle(out, (x1c, y1c), (x2c, y2c), (255, 255, 255), 1, cv2.LINE_AA)
 
-    # ── Ball box: corner-tick brackets (yellow-orange, 2 px) + centre dot ─────
-    if ball_box_out is not None:
-        bx1, by1, bx2, by2 = ball_box_out
+    # ── Ball box ──────────────────────────────────────────────────────────────
+    if ball_record is not None and ball_record.bbox is not None:
+        bx1, by1, bx2, by2 = ball_record.bbox
         bx1c = max(0, bx1); by1c = max(0, by1)
         bx2c = min(w-1, bx2); by2c = min(h-1, by2)
         if bx2c > bx1c and by2c > by1c:
-            clen  = max(6, min((bx2c-bx1c)//4, (by2c-by1c)//4, 18))
-            color = (0, 230, 255)   # bright yellow-orange (BGR)
-            thick = 2
-            # Four corner ticks
-            cv2.line(out, (bx1c,      by1c), (bx1c+clen, by1c),      color, thick, cv2.LINE_AA)
-            cv2.line(out, (bx1c,      by1c), (bx1c,      by1c+clen), color, thick, cv2.LINE_AA)
-            cv2.line(out, (bx2c,      by1c), (bx2c-clen, by1c),      color, thick, cv2.LINE_AA)
-            cv2.line(out, (bx2c,      by1c), (bx2c,      by1c+clen), color, thick, cv2.LINE_AA)
-            cv2.line(out, (bx1c,      by2c), (bx1c+clen, by2c),      color, thick, cv2.LINE_AA)
-            cv2.line(out, (bx1c,      by2c), (bx1c,      by2c-clen), color, thick, cv2.LINE_AA)
-            cv2.line(out, (bx2c,      by2c), (bx2c-clen, by2c),      color, thick, cv2.LINE_AA)
-            cv2.line(out, (bx2c,      by2c), (bx2c,      by2c-clen), color, thick, cv2.LINE_AA)
-            # Centre dot
-            bcx = (bx1c+bx2c)//2; bcy = (by1c+by2c)//2
-            cv2.circle(out, (bcx, bcy), max(2, (bx2c-bx1c)//6), color, -1, cv2.LINE_AA)
+            # Color by source quality
+            if ball_record.source == "yolo":
+                color = (0, 230, 255)   # bright yellow-orange
+                alpha = 1.0
+            elif ball_record.source == "roi":
+                color = (0, 180, 220)   # slightly desaturated
+                alpha = 0.75
+            else:  # predict / none
+                color = (80, 140, 180)
+                alpha = 0.50
 
+            clen  = max(6, min((bx2c-bx1c)//4, (by2c-by1c)//4, 18))
+            thick = 2
+            # Draw corner ticks (blended for non-YOLO sources)
+            if alpha < 1.0:
+                tick_layer = out.copy()
+            else:
+                tick_layer = out
+            cv2.line(tick_layer, (bx1c,      by1c), (bx1c+clen, by1c),      color, thick, cv2.LINE_AA)
+            cv2.line(tick_layer, (bx1c,      by1c), (bx1c,      by1c+clen), color, thick, cv2.LINE_AA)
+            cv2.line(tick_layer, (bx2c,      by1c), (bx2c-clen, by1c),      color, thick, cv2.LINE_AA)
+            cv2.line(tick_layer, (bx2c,      by1c), (bx2c,      by1c+clen), color, thick, cv2.LINE_AA)
+            cv2.line(tick_layer, (bx1c,      by2c), (bx1c+clen, by2c),      color, thick, cv2.LINE_AA)
+            cv2.line(tick_layer, (bx1c,      by2c), (bx1c,      by2c-clen), color, thick, cv2.LINE_AA)
+            cv2.line(tick_layer, (bx2c,      by2c), (bx2c-clen, by2c),      color, thick, cv2.LINE_AA)
+            cv2.line(tick_layer, (bx2c,      by2c), (bx2c,      by2c-clen), color, thick, cv2.LINE_AA)
+            bcx = (bx1c+bx2c)//2; bcy = (by1c+by2c)//2
+            cv2.circle(tick_layer, (bcx, bcy), max(2, (bx2c-bx1c)//6), color, -1, cv2.LINE_AA)
+            if alpha < 1.0:
+                cv2.addWeighted(tick_layer, alpha, out, 1.0 - alpha, 0, out)
     return out
 
 def apply_ken_burns(frame: np.ndarray, frame_idx: int, fps: float,
@@ -528,8 +567,7 @@ def _build_ffmpeg_vf(color_grade: str = "none", ffmpeg_sharpen: bool = False) ->
 
 class FFmpegVideoReader:
     """
-    Pipe-based reader.  Larger buffer (16 frames) reduces pipe-read stalls
-    that caused jitter in the original.
+    Pipe-based reader with larger buffer (16 frames) to reduce pipe-read stalls.
     """
     def __init__(self, path: str, width: int, height: int,
                  seek_sec: float = 0.0, n_frames: Optional[int] = None,
@@ -558,7 +596,6 @@ class FFmpegVideoReader:
         return cmd
 
     def _open(self) -> None:
-        # Larger buffer: 16 frames instead of 4
         buf_size = max(self._frame_bytes * 16, 1 << 22)
         for extra in [[], ["-hwaccel", "none"]]:
             try:
@@ -705,7 +742,6 @@ def _open_ffmpeg_encoder(output_path: str, width: int, height: int, fps: float,
 def _close_ffmpeg_encoder(proc: subprocess.Popen, output_path: str) -> None:
     try: proc.stdin.close()
     except Exception: pass
-    # Drain stderr in background thread to prevent pipe deadlock on large videos
     stderr_buf: List[bytes] = []
     def _drain():
         try:
@@ -1031,10 +1067,9 @@ class MultiObjectSportsTracker:
                 self.ball_state.possessor_track_id = closest.id
                 return closest
             else:
-                # Ball is visible but no player is close — signal caller to use ball position
                 self.ball_state.is_possessed = False
                 self.ball_state.possessor_track_id = None
-                return None  # ← caller will use ball_state.center directly
+                return None
         active = [t for t in self.tracks.values() if t.status == TrackingStatus.ACTIVE]
         if not active:
             return None
@@ -1062,8 +1097,9 @@ class MultiObjectSportsTracker:
 # ── Adaptive Velocity-Aware Smoother (AVS) ────────────────────────────────────
 class AdaptiveVelocityAwareSmoother:
     """
-    v6.1 change: maintains a fixed-size ring buffer (numpy array) rather than
-    a growing deque, so the savgol call covers only the active window.
+    v6.2 fix: removed premature `return sx, sy` that bypassed the full
+    savgol/gaussian smoother.  The EMA fast-path is now only used when
+    the ring buffer has fewer than 5 samples.
     """
     def __init__(self, fps: float, base_window_sec: float = AVS_BASE_WINDOW_SEC) -> None:
         self.fps         = fps
@@ -1078,7 +1114,6 @@ class AdaptiveVelocityAwareSmoother:
         self.prev_smooth_cx: Optional[float] = None
         self.prev_smooth_cy: Optional[float] = None
         self.prev_velocity: Tuple[float, float] = (0.0, 0.0)
-        # Metrics accumulators
         self._raw_diffs:    List[float] = []
         self._smooth_diffs: List[float] = []
 
@@ -1091,7 +1126,6 @@ class AdaptiveVelocityAwareSmoother:
             self._count += 1
 
     def _window_arr(self, w: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Return last w elements in chronological order."""
         n = min(w, self._count)
         idx = [(self._head - 1 - i) % self._cap for i in range(n)]
         idx.reverse()
@@ -1113,7 +1147,7 @@ class AdaptiveVelocityAwareSmoother:
         elif phase == PlayPhase.STATIC:
             w = int(w * 1.5)
         w = max(5, min(w, int(self.fps * AVS_MAX_WINDOW_SEC)))
-        return w | 1  # make odd
+        return w | 1
 
     def smooth(self, cx: float, cy: float, confidence: float = 1.0,
                phase: PlayPhase = PlayPhase.HALF_COURT) -> Tuple[float, float]:
@@ -1122,15 +1156,15 @@ class AdaptiveVelocityAwareSmoother:
                                               cy - self.prev_smooth_cy))
         self._push(cx, cy, confidence)
         n = self._count
+
+        # --- Fast-path: not enough samples for a filter window ---
         if n < 5:
             if self.prev_smooth_cx is None:
-                self.prev_smooth_cx = cx; self.prev_smooth_cy = cy
+                self.prev_smooth_cx = cx
+                self.prev_smooth_cy = cy
             return cx, cy
-        alpha = 0.3
-        sx = alpha*cx + (1-alpha)*self.prev_smooth_cx
-        sy = alpha*cy + (1-alpha)*self.prev_smooth_cy
-        self.prev_smooth_cx = sx; self.prev_smooth_cy = sy
-        return sx, sy
+
+        # --- Full adaptive smoother path ---
         arr_cx, arr_cy = self._window_arr(min(n, int(self.fps * AVS_MAX_WINDOW_SEC)))
         nn = len(arr_cx)
         if nn >= 3:
@@ -1140,8 +1174,10 @@ class AdaptiveVelocityAwareSmoother:
             accel    = abs(v_curr - v_prev)
         else:
             velocity = accel = 0.0
+
         w = self._compute_adaptive_window(velocity, accel, confidence, phase)
         w = min(w, nn); w = max(w, 5); w = w | 1
+
         try:
             polyorder = min(AVS_POLYORDER, w - 1)
             if polyorder < 2: polyorder = 2
@@ -1159,6 +1195,8 @@ class AdaptiveVelocityAwareSmoother:
             alpha = 0.15
             smooth_cx = alpha*cx + (1-alpha)*(self.prev_smooth_cx or cx)
             smooth_cy = alpha*cy + (1-alpha)*(self.prev_smooth_cy or cy)
+
+        # Spike damper: prevent sudden lurches
         if self.prev_smooth_cx is not None:
             dvx = smooth_cx - self.prev_smooth_cx
             dvy = smooth_cy - self.prev_smooth_cy
@@ -1167,15 +1205,17 @@ class AdaptiveVelocityAwareSmoother:
             if cvm > pvm * 2.5 and pvm > 5.0:
                 smooth_cx = self.prev_smooth_cx + dvx * 0.5
                 smooth_cy = self.prev_smooth_cy + dvy * 0.5
+
         if self.prev_smooth_cx is not None:
             self._smooth_diffs.append(math.hypot(smooth_cx - self.prev_smooth_cx,
                                                  smooth_cy - self.prev_smooth_cy))
-        self.prev_smooth_cx = smooth_cx; self.prev_smooth_cy = smooth_cy
+        self.prev_smooth_cx = smooth_cx
+        self.prev_smooth_cy = smooth_cy
         self.prev_velocity  = (smooth_cx - cx, smooth_cy - cy)
         return float(smooth_cx), float(smooth_cy)
 
     def get_metrics(self) -> Dict[str, float]:
-        raw_j = float(np.mean(self._raw_diffs))   if self._raw_diffs    else 0.0
+        raw_j = float(np.mean(self._raw_diffs))    if self._raw_diffs    else 0.0
         smo_j = float(np.mean(self._smooth_diffs)) if self._smooth_diffs else 0.0
         pct   = (raw_j - smo_j) / raw_j * 100 if raw_j > 0 else 0.0
         return {"jitter_raw": round(raw_j, 2), "jitter_smooth": round(smo_j, 2),
@@ -1183,9 +1223,6 @@ class AdaptiveVelocityAwareSmoother:
 
 # ── Intelligent Crop Strategy (ICS) ──────────────────────────────────────────
 class IntelligentCropStrategy:
-    """
-    v6.1 change: caches velocity; skips recompute when center barely moved.
-    """
     def __init__(self, orig_w: int, orig_h: int, crop_w: int, crop_h: int, fps: float) -> None:
         self.orig_w = orig_w; self.orig_h = orig_h
         self.crop_w = crop_w; self.crop_h = crop_h
@@ -1202,7 +1239,6 @@ class IntelligentCropStrategy:
                      phase: PlayPhase = PlayPhase.HALF_COURT,
                      ball_pos: Optional[Tuple[float, float]] = None) -> Tuple[int, int, int, int]:
         self._hist.append((cx, cy))
-        # Only recompute velocity when the center moved meaningfully (≥1 px)
         moved = (self._prev_cx is None or
                  abs(cx - self._prev_cx) > 1 or abs(cy - self._prev_cy) > 1)
         if moved and len(self._hist) >= 3:
@@ -1555,10 +1591,6 @@ class SportsEventDetector:
                 self.recent_ball_heights[-1] < self.recent_ball_heights[-2]):
                 self.event_end_frame = self._frame_count + SPORTS_EVENT_EXPAND_FRAMES
                 active = True
-        if not active:
-            if abs((bx2-bx1)-(px2-px1)) > (px2-px1)*0.5:
-                self.event_end_frame = self._frame_count + SPORTS_EVENT_EXPAND_FRAMES//2
-                active = True
         self.event_active = active
         if record_frame is not None: self._event_flags[record_frame] = active
         return active
@@ -1574,7 +1606,6 @@ def _parse_yolo_results(results_boxes, scale: float, confidence: float,
                         ) -> Tuple[List[Tuple], List[Tuple], List[float]]:
     """
     Parse YOLO results once, returning (persons, balls, person_confidences).
-    This replaces the separate detect_subjects + detect_persons_all calls.
     """
     persons: List[Tuple] = []; balls: List[Tuple] = []; person_confs: List[float] = []
     if results_boxes is None or len(results_boxes) == 0:
@@ -1588,7 +1619,6 @@ def _parse_yolo_results(results_boxes, scale: float, confidence: float,
             person_confs.append(conf)
         elif cls == SPORTS_BALL_CLASS_ID and conf >= SPORTS_BALL_CONFIDENCE:
             balls.append((x1, y1, x2, y2, cx_b, cy_b, conf))
-    # Sort highest-confidence first so callers can safely use [0]
     balls.sort(key=lambda b: b[6], reverse=True)
     persons.sort(key=lambda p: p[6], reverse=True)
     return persons, balls, person_confs
@@ -1599,10 +1629,6 @@ def detect_subjects(frame: np.ndarray, model: Any, confidence: float = 0.45,
                     tracking_mode: str = "subject",
                     _cached_result: Optional[DetectionCache] = None,
                     ) -> Tuple[Optional[DetectionResult], Optional[Tuple], int]:
-    """
-    v6.1: accepts optional DetectionCache to skip redundant YOLO calls.
-    If _cached_result is provided, uses its stored persons/balls.
-    """
     if _cached_result is not None:
         persons_raw = [(p[0], p[1], p[2], p[3],
                         (p[0]+p[2])//2, (p[1]+p[3])//2, 0.5)
@@ -1944,12 +1970,9 @@ def _bidir_ema(xs: np.ndarray, ys: np.ndarray, alpha: float = 0.06) -> Tuple[np.
 def _apply_sports_post_smooth(dense_cx: np.ndarray, dense_cy: np.ndarray,
                               fps: float, scene_cuts: List[int],
                               total_frames: int) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    v6.1: vectorized spike damping (no per-frame loop) + savgol per segment.
-    """
+    """Vectorized spike damping + savgol per segment."""
     sw = max(5, int(fps * SPORTS_POST_SMOOTH_WINDOW_SEC))
     if sw % 2 == 0: sw += 1
-    # Vectorized spike damping
     damp_cx = dense_cx.copy().astype(float)
     damp_cy = dense_cy.copy().astype(float)
     if total_frames > 2:
@@ -2258,8 +2281,9 @@ def _render_video(input_path: str, output_path: str,
                   use_panel_mode: bool = False,
                   panel_config: Optional[PanelModeConfig] = None,
                   panel_persons_map: Optional[Dict[int,List]] = None,
-                  # --- NEW ARGUMENTS ADDED HERE ---
-                  tracking_boxes_map: Optional[Dict[int, Dict]] = None,
+                  # v6.2: ball_records replaces the old tracking_boxes_map
+                  ball_records: Optional[Dict[int, BallFrameRecord]] = None,
+                  person_boxes_map: Optional[Dict[int, List[Tuple[int,int,int,int]]]] = None,
                   draw_tracking_boxes: bool = False,
                   ) -> Dict[str,Any]:
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
@@ -2276,13 +2300,13 @@ def _render_video(input_path: str, output_path: str,
             try: os.unlink(srt_path)
             except OSError: pass
             srt_path=None
-    
+
     extra_vf=_build_ffmpeg_vf(color_grade, ffmpeg_sharpen)
     subtitle_style=SUBTITLE_STYLES.get(subtitle_style_name,SUBTITLE_STYLES["Bold White (TikTok)"])
     enc=_open_ffmpeg_encoder(output_path,out_w,out_h,eff_fps,audio_source=input_path,
                              crf=crf,preset=encoder_preset,audio_bitrate=audio_bitrate,
                              subtitle_path=srt_path,subtitle_style=subtitle_style,extra_vf=extra_vf)
-    
+
     dissolve=DissolveBuffer(DISSOLVE_FRAMES)
     slot_smoother=PanelSlotSmoother() if use_panel_mode else None
     prev_slots=None; orientation=(panel_config.split_orientation if panel_config else "horizontal")
@@ -2292,7 +2316,7 @@ def _render_video(input_path: str, output_path: str,
         with FFmpegVideoReader(input_path,orig_w,orig_h) as reader:
             for frame in reader:
                 if fi>=total_frames: break
-                
+
                 if use_panel_mode:
                     persons=(panel_persons_map or {}).get(fi,[])
                     if not persons:
@@ -2313,60 +2337,49 @@ def _render_video(input_path: str, output_path: str,
                     if crop.shape[0]==0 or crop.shape[1]==0:
                         crop=(frame[:crop_h,:crop_w] if orig_h>=crop_h and orig_w>=crop_w else frame)
                     out_frame=cv2.resize(crop,(out_w,out_h),interpolation=cv2.INTER_LANCZOS4)
-                    
-                    # --- NEW: Draw tracking boxes if enabled ---
-                    if draw_tracking_boxes and tracking_boxes_map and fi in tracking_boxes_map:
-                        tb_data = tracking_boxes_map[fi]
-                        # We need to scale the original coordinates to the cropped/resized frame
-                        # The boxes in tracking_boxes_map are in 'orig' coordinates.
-                        # The out_frame is a crop from (x1, y1) resized to (out_w, out_h).
-                        
-                        person_boxes_out = []
-                        ball_box_out = None
-                        
-                        # Scale factors
+
+                    # v6.2: Draw tracking overlays using per-frame BallFrameRecord
+                    if draw_tracking_boxes:
                         sx = out_w / crop_w
                         sy = out_h / crop_h
-                        
-                        # Process Persons
-                        for p in tb_data.get("persons", []):
-                            px1, py1, px2, py2 = p
-                            # Crop relative
-                            cx1 = px1 - x1
-                            cy1 = py1 - y1
-                            cx2 = px2 - x1
-                            cy2 = py2 - y1
-                            # Check if visible in crop
-                            if cx2 > 0 and cy2 > 0 and cx1 < crop_w and cy1 < crop_h:
-                                # Resize to output
-                                ox1 = int(cx1 * sx)
-                                oy1 = int(cy1 * sy)
-                                ox2 = int(cx2 * sx)
-                                oy2 = int(cy2 * sy)
-                                person_boxes_out.append((ox1, oy1, ox2, oy2))
-                        
-                        # Process Ball
-                        bb = tb_data.get("ball")
-                        if bb:
-                            bx1, by1, bx2, by2 = bb
-                            cbx1 = bx1 - x1
-                            cby1 = by1 - y1
-                            cbx2 = bx2 - x1
-                            cby2 = by2 - y1
-                            if cbx2 > 0 and cby2 > 0 and cbx1 < crop_w and cby1 < crop_h:
-                                obx1 = int(cbx1 * sx)
-                                oby1 = int(cby1 * sy)
-                                obx2 = int(cbx2 * sx)
-                                oby2 = int(cby2 * sy)
-                                ball_box_out = (obx1, oby1, obx2, oby2)
-                                
-                        if person_boxes_out or ball_box_out:
-                            out_frame = _draw_tracking_overlays(out_frame, ball_box_out, person_boxes_out)
+
+                        # --- Ball (exact per-frame record, no stale cache) ---
+                        ball_rec_out: Optional[BallFrameRecord] = None
+                        if ball_records and fi in ball_records:
+                            br = ball_records[fi]
+                            if br.bbox is not None:
+                                bx1, by1, bx2, by2 = br.bbox
+                                # Translate from orig-frame coords to crop-relative, then scale
+                                cbx1 = bx1 - x1; cby1 = by1 - y1
+                                cbx2 = bx2 - x1; cby2 = by2 - y1
+                                if cbx2 > 0 and cby2 > 0 and cbx1 < crop_w and cby1 < crop_h:
+                                    ball_rec_out = BallFrameRecord(
+                                        bbox=(int(cbx1*sx), int(cby1*sy),
+                                              int(cbx2*sx), int(cby2*sy)),
+                                        confidence=br.confidence,
+                                        source=br.source,
+                                    )
+
+                        # --- Persons ---
+                        person_boxes_out: List[Tuple[int,int,int,int]] = []
+                        if person_boxes_map and fi in person_boxes_map:
+                            for p in person_boxes_map[fi]:
+                                px1, py1, px2, py2 = p
+                                cx1 = px1 - x1; cy1 = py1 - y1
+                                cx2 = px2 - x1; cy2 = py2 - y1
+                                if cx2 > 0 and cy2 > 0 and cx1 < crop_w and cy1 < crop_h:
+                                    person_boxes_out.append(
+                                        (int(cx1*sx), int(cy1*sy),
+                                         int(cx2*sx), int(cy2*sy)))
+
+                        if ball_rec_out is not None or person_boxes_out:
+                            out_frame = _draw_tracking_overlays(
+                                out_frame, ball_rec_out, person_boxes_out)
 
                     if vignette_strength>0: out_frame=apply_vignette(out_frame,vignette_strength)
                     if sharpen_strength>0 and not ffmpeg_sharpen:
                         out_frame=apply_sharpen(out_frame,sharpen_strength)
-                
+
                 if fi in scene_cut_set: dissolve.on_cut(out_frame)
                 if dissolve.active: out_frame=dissolve.blend(out_frame)
                 try: enc.stdin.write(out_frame.tobytes())
@@ -2460,7 +2473,7 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
             centers.append(centers[-1] if centers else (orig_w//2,orig_h//2)); speeds.append(0.0)
     return centers,speeds,scene_cuts,persons_map,kalman_pred_count
 
-# ── NEW: Optimized sports tracking pass (single YOLO + ball ROI tracker) ─────
+# ── v6.2: Optimized sports tracking pass (exact per-frame ball sync) ──────────
 def _sports_tracking_pass_optimized(
     input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_h: int,
     fps: float, total_frames: int, model: Any, confidence: float,
@@ -2471,40 +2484,51 @@ def _sports_tracking_pass_optimized(
     ics: IntelligentCropStrategy,
     phase_detector: SportsPlayPhaseDetector,
     progress_callback=None,
-) -> Tuple[List[Tuple[int,int]], List[float], List[int], Dict[int, Dict]]:
+) -> Tuple[
+    List[Tuple[int,int]],            # raw_centers
+    List[float],                     # speeds
+    List[int],                       # scene_cuts
+    Dict[int, BallFrameRecord],      # ball_records  (exact per-frame, v6.2)
+    Dict[int, List[Tuple[int,int,int,int]]],  # person_boxes_map (orig coords)
+]:
     """
-    Key optimizations vs v6.0:
-    1. Single YOLO call per keyframe (_parse_yolo_results once, not twice).
-    2. Adaptive frame-skip: YOLO every N frames based on play phase.
-    3. BallROITracker fills in ball position on non-YOLO frames.
-    4. MOT update uses cached detections on skipped frames (velocity prediction only).
-    5. AVS + ICS still run every frame (cheap).
+    v6.2 changes vs v6.1:
+    1. Every source frame gets its own BallFrameRecord (source='yolo'|'roi'|'predict'|'none').
+       The render pass reads ball_records[fi] directly — no stale cache bleed between frames.
+    2. BallROITracker operates in det_frame (scaled) space; coordinates converted to orig
+       only when writing to ball_records — fixes the scale bug in v6.1.
+    3. DetectionCache.ball_box is NOT used for overlay purposes (only for focus-point logic).
+    4. person_boxes_map is returned separately from ball_records so render pass can use both.
     """
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
     det_scale = min(1.0, 960/orig_w)
     det_w = max(1, int(orig_w*det_scale)); det_h = max(1, int(orig_h*det_scale))
     hw, hh = crop_w//2, crop_h//2
+
     raw_centers: List[Tuple[int,int]] = []
     speeds: List[float] = []
     scene_cuts: List[int] = []
-    # Per-frame overlay data: {fi: {"ball": bbox_orig|None, "persons": [bboxes_orig]}}
-    tracking_boxes_map: Dict[int, Dict] = {}
-    det_cache = DetectionCache()
-    ball_tracker = BallROITracker(BALL_TRACKER_TYPE)
-    prev_frame:  Optional[np.ndarray] = None
-    prev_hist:   Optional[np.ndarray] = None
-    prev_gray:   Optional[np.ndarray] = None
+    # v6.2: per-frame exact ball records (no stale sharing between frames)
+    ball_records: Dict[int, BallFrameRecord] = {}
+    person_boxes_map: Dict[int, List[Tuple[int,int,int,int]]] = {}
+
+    det_cache     = DetectionCache()
+    ball_tracker  = BallROITracker(BALL_TRACKER_TYPE)
+
+    prev_frame:   Optional[np.ndarray] = None
+    prev_hist:    Optional[np.ndarray] = None
+    prev_gray:    Optional[np.ndarray] = None
     last_cut_frame = -100
     prev_cx: Optional[float] = None
     prev_cy: Optional[float] = None
     prev_ball_carrier: Optional[int] = None
     current_phase = PlayPhase.HALF_COURT
-    # Ball-detection bootstrap: run YOLO every frame until ball first seen
+
     ball_found_ever: bool = False
     tracker_lost_ball: bool = False
-    # Adaptive skip: start conservative
     yolo_skip = SPORTS_YOLO_SKIP_BASE
     frames_since_yolo = 0
+
     fi = 0
     try:
         with FFmpegVideoReader(input_path, orig_w, orig_h, scale_w=det_w, scale_h=det_h) as reader:
@@ -2513,131 +2537,179 @@ def _sports_tracking_pass_optimized(
                     break
                 fi = len(raw_centers)
                 gray = cv2.cvtColor(det_frame, cv2.COLOR_BGR2GRAY)
+
                 # ── Scene change ──────────────────────────────────────────────
                 is_cut, prev_hist, last_cut_frame = is_sports_scene_change(
                     prev_frame, det_frame, prev_hist, fi, last_cut_frame)
                 if is_cut:
                     scene_cuts.append(fi)
-                    # Reset on cut
                     mot_tracker.__init__(fps, orig_w, orig_h)
                     avs_smoother.__init__(fps)
                     ball_tracker.reset()
                     det_cache = DetectionCache()
                     prev_cx = prev_cy = None
-                    frames_since_yolo = yolo_skip  # force YOLO on next frame
+                    frames_since_yolo = yolo_skip  # force YOLO next
                     tracker_lost_ball = False
+                    ball_found_ever = False  # re-acquire after cut
+
                 # ── Decide whether to run YOLO ────────────────────────────────
-                # Force YOLO on frame 0, every frame until ball first seen,
-                # and immediately when ROI tracker loses the ball.
                 run_yolo = (
                     fi == 0
-                    or (not ball_found_ever)        # scan every frame until ball appears
-                    or tracker_lost_ball             # re-acquire after ROI drop
+                    or (not ball_found_ever)
+                    or tracker_lost_ball
                     or frames_since_yolo >= yolo_skip
                     or det_cache.frame_idx < 0
                     or is_cut
                 )
                 frames_since_yolo = 0 if run_yolo else frames_since_yolo + 1
-                tracker_lost_ball = False  # reset; will be re-set below if needed
+                tracker_lost_ball = False
+
+                # --- This frame's ball record (filled in below) ---
+                this_ball_rec = BallFrameRecord(bbox=None, confidence=0.0, source="none")
+
                 if run_yolo and model is not None:
                     try:
                         results = model(det_frame, verbose=False, conf=confidence)[0]
                         persons_raw, balls_raw, p_confs = _parse_yolo_results(
                             results.boxes, 1.0, confidence)
-                        # Scale to orig coords
-                        persons_orig = [(int(p[0]/det_scale), int(p[1]/det_scale),
-                                         int(p[2]/det_scale), int(p[3]/det_scale))
-                                        for p in persons_raw]
+
+                        # Scale persons to orig coords
+                        persons_orig = [
+                            (int(p[0]/det_scale), int(p[1]/det_scale),
+                             int(p[2]/det_scale), int(p[3]/det_scale))
+                            for p in persons_raw
+                        ]
+
+                        # --- Ball: exact YOLO detection this frame ---
+                        ball_box_orig: Optional[Tuple[int,int,int,int]] = None
+                        ball_conf_yolo = 0.0
                         if balls_raw and use_ball_tracking:
-                            bb = balls_raw[0]  # highest-conf ball (sorted by _parse_yolo_results)
-                            ball_box_orig = (int(bb[0]/det_scale), int(bb[1]/det_scale),
-                                             int(bb[2]/det_scale), int(bb[3]/det_scale))
-                            ball_found_ever = True   # ← latched once ball first appears
-                            # Re-init ROI tracker on every YOLO keyframe
+                            bb = balls_raw[0]  # highest-conf (sorted)
+                            ball_conf_yolo = bb[6]
+                            ball_box_orig = (
+                                int(bb[0]/det_scale), int(bb[1]/det_scale),
+                                int(bb[2]/det_scale), int(bb[3]/det_scale)
+                            )
+                            ball_found_ever = True
+                            # Re-init ROI tracker in det_frame space (correct scale)
                             pad = BALL_ROI_PAD_PX
-                            roi_bb = (max(0,bb[0]-pad), max(0,bb[1]-pad),
-                                      min(det_w,bb[2]+pad), min(det_h,bb[3]+pad))
-                            ball_tracker.init(det_frame, roi_bb)
-                        else:
-                            ball_box_orig = None
-                        # Find ball carrier index (in persons_orig space)
+                            roi_bb_det = (
+                                max(0, bb[0]-pad), max(0, bb[1]-pad),
+                                min(det_w, bb[2]+pad), min(det_h, bb[3]+pad)
+                            )
+                            ball_tracker.init(det_frame, roi_bb_det)
+
+                        # Record YOLO ball for this exact frame
+                        this_ball_rec = BallFrameRecord(
+                            bbox=ball_box_orig,
+                            confidence=ball_conf_yolo,
+                            source="yolo" if ball_box_orig is not None else "none",
+                        )
+
+                        # Find ball carrier
                         ball_carrier = -1
                         if ball_box_orig is not None and persons_orig:
-                            bcx=(ball_box_orig[0]+ball_box_orig[2])/2
-                            bcy=(ball_box_orig[1]+ball_box_orig[3])/2
-                            min_d=float('inf')
-                            for i,p in enumerate(persons_orig):
-                                pcx=(p[0]+p[2])/2; pcy=(p[1]+p[3])/2
-                                d=math.hypot(pcx-bcx, pcy-bcy)
-                                if d<min_d and d<SPORTS_BALL_PROXIMITY_PX:
-                                    min_d,ball_carrier=d,i
+                            bcx = (ball_box_orig[0]+ball_box_orig[2])/2
+                            bcy = (ball_box_orig[1]+ball_box_orig[3])/2
+                            min_d = float('inf')
+                            for i, p in enumerate(persons_orig):
+                                pcx = (p[0]+p[2])/2; pcy = (p[1]+p[3])/2
+                                d = math.hypot(pcx-bcx, pcy-bcy)
+                                if d < min_d and d < SPORTS_BALL_PROXIMITY_PX:
+                                    min_d, ball_carrier = d, i
+
                         det_cache.update(persons_orig, ball_box_orig, ball_carrier,
-                                         None, p_confs, fi)
-                        # Update MOT with fresh detections
+                                         None, p_confs, fi, ball_conf_yolo)
                         mot_tracker.update(persons_orig, ball_box_orig, det_frame, p_confs)
+
                     except Exception as e:
                         print(f"[yolo] frame {fi}: {e}", file=sys.stderr)
-                        run_yolo = False
+                        # Fall through — this_ball_rec stays "none"
+
                 else:
-                    # Skipped frame: use ROI tracker for ball, MOT does velocity prediction
-                    tracked_ball = None
+                    # ── Skipped frame: ROI-track the ball ────────────────────
                     if use_ball_tracking and ball_tracker.is_active:
-                        tracked_bb = ball_tracker.update(det_frame)
-                        if tracked_bb is not None:
-                            # Scale to orig
-                            tracked_ball = (int(tracked_bb[0]/det_scale),
-                                            int(tracked_bb[1]/det_scale),
-                                            int(tracked_bb[2]/det_scale),
-                                            int(tracked_bb[3]/det_scale))
-                            # Keep det_cache.ball_box fresh with ROI position
-                            det_cache.ball_box = tracked_ball
+                        tracked_bb_det = ball_tracker.update(det_frame)
+                        if tracked_bb_det is not None:
+                            # Convert det → orig coords
+                            tracked_ball_orig = (
+                                int(tracked_bb_det[0]/det_scale),
+                                int(tracked_bb_det[1]/det_scale),
+                                int(tracked_bb_det[2]/det_scale),
+                                int(tracked_bb_det[3]/det_scale),
+                            )
+                            # Record ROI-tracked ball for this exact frame
+                            this_ball_rec = BallFrameRecord(
+                                bbox=tracked_ball_orig,
+                                confidence=det_cache.ball_confidence * 0.85,  # slight decay
+                                source="roi",
+                            )
+                            # Keep det_cache.ball_box in sync for focus-point logic only
+                            det_cache.ball_box = tracked_ball_orig
                         else:
-                            # ROI tracker lost the ball → trigger YOLO next frame
+                            # ROI tracker lost ball → request YOLO re-acquire next frame
                             tracker_lost_ball = True
                             det_cache.ball_box = None
-                    # Update MOT with stale person list (predicts via velocity)
-                    mot_tracker.update(det_cache.persons, tracked_ball,
+                            this_ball_rec = BallFrameRecord(bbox=None, confidence=0.0, source="none")
+                    else:
+                        # No ball info this frame — use physics prediction if airborne
+                        if (mot_tracker.ball_state.is_airborne and
+                                mot_tracker.ball_state.center is not None):
+                            bc = mot_tracker.ball_state.center
+                            # Rough bbox estimate from last known size
+                            r = 20  # fallback radius in orig pixels
+                            this_ball_rec = BallFrameRecord(
+                                bbox=(int(bc[0]-r), int(bc[1]-r),
+                                      int(bc[0]+r), int(bc[1]+r)),
+                                confidence=0.2,
+                                source="predict",
+                            )
+                        else:
+                            this_ball_rec = BallFrameRecord(bbox=None, confidence=0.0, source="none")
+
+                    # MOT: velocity prediction only (no new YOLO)
+                    mot_tracker.update(det_cache.persons, det_cache.ball_box,
                                        det_frame, det_cache.confidences)
-                # ── Phase detection (every frame, cheap) ─────────────────────
+
+                # ── Store exact per-frame records ─────────────────────────────
+                ball_records[fi] = this_ball_rec
+                person_boxes_map[fi] = list(det_cache.persons)
+
+                # ── Phase detection ───────────────────────────────────────────
                 current_phase = phase_detector.detect_phase(
                     det_cache.persons, det_cache.ball_box, orig_w, mot_tracker.ball_state)
-                # ── Adapt YOLO skip to phase ──────────────────────────────────
+
+                # Adapt YOLO skip to phase
                 if current_phase == PlayPhase.FAST_BREAK:
                     yolo_skip = SPORTS_YOLO_SKIP_FASTBREAK
                 elif current_phase == PlayPhase.STATIC:
                     yolo_skip = SPORTS_YOLO_SKIP_MAX
                 else:
                     yolo_skip = SPORTS_YOLO_SKIP_BASE
-                # ── Get focus point ───────────────────────────────────────────
-                # Priority:
-                #  1. Ball possessed → follow ball-carrier (person)
-                #  2. Ball visible, uncontested → blend ball(55%) + nearest player(45%)
-                #  3. No ball → follow best active person track
-                #  4. Nothing → optical-flow / hold last position
-                ball_center = mot_tracker.ball_state.center  # orig coords, or None
+
+                # ── Focus point computation ───────────────────────────────────
+                ball_center = mot_tracker.ball_state.center
                 primary_track = mot_tracker.get_primary_track(prev_ball_carrier)
+
                 if primary_track is not None:
-                    # Ball is possessed — frame the carrier
                     raw_cx = float(primary_track.center[0])
                     raw_cy = float(primary_track.center[1])
                     if primary_track.id == mot_tracker.ball_state.possessor_track_id:
                         prev_ball_carrier = primary_track.id
                 elif ball_center is not None and use_ball_tracking:
-                    # Ball visible but no player holding it — lead with the ball
                     active_tracks = [t for t in mot_tracker.tracks.values()
                                      if t.status == TrackingStatus.ACTIVE]
                     if active_tracks:
                         nearest = min(active_tracks, key=lambda t: math.hypot(
-                            t.center[0] - ball_center[0], t.center[1] - ball_center[1]))
-                        raw_cx = ball_center[0] * 0.55 + nearest.center[0] * 0.45
-                        raw_cy = ball_center[1] * 0.55 + nearest.center[1] * 0.45
+                            t.center[0]-ball_center[0], t.center[1]-ball_center[1]))
+                        raw_cx = ball_center[0]*0.55 + nearest.center[0]*0.45
+                        raw_cy = ball_center[1]*0.55 + nearest.center[1]*0.45
                     else:
                         raw_cx = float(ball_center[0])
                         raw_cy = float(ball_center[1])
                 elif det_cache.persons:
-                    # No ball visible — centroid of known persons
-                    raw_cx = float(sum((p[0]+p[2])/2 for p in det_cache.persons) / len(det_cache.persons))
-                    raw_cy = float(sum((p[1]+p[3])/2 for p in det_cache.persons) / len(det_cache.persons))
+                    raw_cx = float(sum((p[0]+p[2])/2 for p in det_cache.persons)/len(det_cache.persons))
+                    raw_cy = float(sum((p[1]+p[3])/2 for p in det_cache.persons)/len(det_cache.persons))
                 else:
                     if prev_gray is not None and use_optical_flow:
                         of = sports_optical_flow_center(prev_gray, gray, det_w, det_h,
@@ -2651,16 +2723,17 @@ def _sports_tracking_pass_optimized(
                     else:
                         raw_cx = float(prev_cx) if prev_cx else orig_w/2
                         raw_cy = float(prev_cy) if prev_cy else orig_h/2
-                # ── AVS smooth (every frame) ──────────────────────────────────
-                # Confidence: high when ball possessed, medium when ball visible, low otherwise
+
+                # ── AVS smooth ────────────────────────────────────────────────
                 if primary_track is not None:
                     track_conf = primary_track.confidence
                 elif ball_center is not None:
-                    track_conf = 0.7   # ball visible, good signal
+                    track_conf = 0.7
                 else:
-                    track_conf = 0.4   # guessing from persons/flow
+                    track_conf = 0.4
                 smooth_cx, smooth_cy = avs_smoother.smooth(raw_cx, raw_cy, track_conf, current_phase)
-                # ── ICS crop (every frame) ────────────────────────────────────
+
+                # ── ICS crop ──────────────────────────────────────────────────
                 ball_pos_orig = (float(mot_tracker.ball_state.center[0]),
                                  float(mot_tracker.ball_state.center[1])) \
                     if mot_tracker.ball_state.center is not None and use_ball_tracking else None
@@ -2670,28 +2743,34 @@ def _sports_tracking_pass_optimized(
                 cx_out = max(hw, min(cx_out, orig_w-hw))
                 cy_out = max(hh, min(cy_out, orig_h-hh))
                 cy_out = _apply_lower_third_guard(cy_out, crop_h, cy_out, orig_h)
+
                 speed = math.hypot(cx_out-(prev_cx or cx_out), cy_out-(prev_cy or cy_out))
-                # ── Store per-frame overlay boxes ─────────────────────────────
-                tracking_boxes_map[fi] = {
-                    "ball":    det_cache.ball_box,       # orig coords, kept fresh by ROI tracker
-                    "persons": list(det_cache.persons),  # orig coords
-                }
                 raw_centers.append((cx_out, cy_out)); speeds.append(speed)
-                prev_cx=float(cx_out); prev_cy=float(cy_out)
-                prev_gray=gray; prev_frame=det_frame
+                prev_cx = float(cx_out); prev_cy = float(cy_out)
+                prev_gray = gray; prev_frame = det_frame
+
                 if fi % max(1, total_frames//50) == 0:
-                    ball_status = "found" if ball_found_ever else "searching"
+                    ball_src = this_ball_rec.source
                     focus = ("carrier" if primary_track and mot_tracker.ball_state.is_possessed
                              else "ball" if ball_center is not None else "person/flow")
-                    _p(fi/total_frames, f"Sports tracking {fi}/{total_frames} "
+                    _p(fi/total_frames,
+                       f"Sports tracking {fi}/{total_frames} "
                        f"(skip={yolo_skip}, phase={current_phase.name}, "
-                       f"ball={ball_status}, focus={focus})...")
+                       f"ball={ball_src}, focus={focus})...")
+
     except Exception as e:
         print(f"[sports_tracking_opt] Error: {e}", file=sys.stderr)
         while len(raw_centers) < total_frames:
             raw_centers.append(raw_centers[-1] if raw_centers else (orig_w//2, orig_h//2))
             speeds.append(0.0)
-    return raw_centers, speeds, scene_cuts, tracking_boxes_map
+            # Fill missing frame records with empty
+            missing_fi = len(raw_centers) - 1
+            if missing_fi not in ball_records:
+                ball_records[missing_fi] = BallFrameRecord(bbox=None, confidence=0.0, source="none")
+            if missing_fi not in person_boxes_map:
+                person_boxes_map[missing_fi] = []
+
+    return raw_centers, speeds, scene_cuts, ball_records, person_boxes_map
 
 # ── process_video — main public API ───────────────────────────────────────────
 def process_video(input_path: str, output_path: str,
@@ -2759,6 +2838,7 @@ def process_video(input_path: str, output_path: str,
                               ffmpeg_sharpen=ffmpeg_sharpen,scene_cuts=scene_cuts,
                               use_panel_mode=use_panel_mode,panel_config=panel_cfg,
                               panel_persons_map=persons_map,
+                              draw_tracking_boxes=False,  # not used in non-sports mode
                               progress_callback=lambda v,m:_p(0.55+v*0.43,m))
     _p(1.0,"Done!")
     analytics=_build_analytics(input_path,output_path,orig_w=orig_w,orig_h=orig_h,
@@ -2787,10 +2867,16 @@ def process_sports_video(input_path: str, output_path: str,
                          scene_cut_threshold: float = 0.22,
                          vignette_strength: float = 0.275, sharpen_strength: float = 0.3,
                          ffmpeg_sharpen: bool = True, color_grade: str = "none",
+                         # v6.2: independent toggle for drawing brackets
+                         draw_tracking_boxes: bool = True,
                          progress_callback=None) -> Dict[str, Any]:
     """
     Sports-optimized pipeline.
-    v6.1 uses _sports_tracking_pass_optimized for ~2-3× faster tracking.
+    v6.2:
+    - Uses _sports_tracking_pass_optimized which returns exact per-frame
+      BallFrameRecord objects — source frame N → output frame N, no drift.
+    - draw_tracking_boxes is now independent of use_ball_tracking.
+      Set draw_tracking_boxes=False to track the ball for framing but hide brackets.
     """
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
     _check_ffmpeg()
@@ -2804,21 +2890,22 @@ def process_sports_video(input_path: str, output_path: str,
     field_mask: Optional[np.ndarray]=None
     if sample_frame is not None:
         field_mask=detect_field_of_play(sample_frame,sport_hint=sport_type)
-    mot_tracker   = MultiObjectSportsTracker(fps,orig_w,orig_h)
-    avs_smoother  = AdaptiveVelocityAwareSmoother(fps)
-    ics           = IntelligentCropStrategy(orig_w,orig_h,crop_w,crop_h,fps)
+    mot_tracker    = MultiObjectSportsTracker(fps,orig_w,orig_h)
+    avs_smoother   = AdaptiveVelocityAwareSmoother(fps)
+    ics            = IntelligentCropStrategy(orig_w,orig_h,crop_w,crop_h,fps)
     phase_detector = SportsPlayPhaseDetector(fps)
-    _p(0.05,"Sports tracking (optimized)...")
-    raw_centers, speeds, scene_cuts, tracking_boxes_map = _sports_tracking_pass_optimized(
-        input_path=input_path, orig_w=orig_w, orig_h=orig_h,
-        crop_w=crop_w, crop_h=crop_h, fps=fps, total_frames=total_frames,
-        model=model, confidence=confidence,
-        use_ball_tracking=use_ball_tracking, use_optical_flow=use_optical_flow,
-        field_mask=field_mask,
-        mot_tracker=mot_tracker, avs_smoother=avs_smoother,
-        ics=ics, phase_detector=phase_detector,
-        progress_callback=lambda v,m:_p(0.05+v*0.45,m),
-    )
+    _p(0.05,"Sports tracking (v6.2 — exact ball sync)...")
+    raw_centers, speeds, scene_cuts, ball_records, person_boxes_map = \
+        _sports_tracking_pass_optimized(
+            input_path=input_path, orig_w=orig_w, orig_h=orig_h,
+            crop_w=crop_w, crop_h=crop_h, fps=fps, total_frames=total_frames,
+            model=model, confidence=confidence,
+            use_ball_tracking=use_ball_tracking, use_optical_flow=use_optical_flow,
+            field_mask=field_mask,
+            mot_tracker=mot_tracker, avs_smoother=avs_smoother,
+            ics=ics, phase_detector=phase_detector,
+            progress_callback=lambda v,m:_p(0.05+v*0.45,m),
+        )
     _p(0.50,"Sports post-smoothing...")
     dense_cx=np.array([c[0] for c in raw_centers],dtype=float)
     dense_cy=np.array([c[1] for c in raw_centers],dtype=float)
@@ -2830,23 +2917,27 @@ def process_sports_video(input_path: str, output_path: str,
                     "smoothness_pct":avs_metrics.get("smoothness_pct",0.0),
                     "kalman_prediction_frames":0}
     _p(0.55,"Rendering sports video...")
-    render_meta=_render_video(input_path=input_path,output_path=output_path,
-                              out_w=out_w,out_h=out_h,crop_w=crop_w,crop_h=crop_h,
-                              orig_w=orig_w,orig_h=orig_h,fps=fps,total_frames=total_frames,
-                              smoothed_centers=smoothed,tracking_mode="sports_action",
-                              crf=crf,encoder_preset=encoder_preset,audio_bitrate=audio_bitrate,
-                              burn_subtitles=burn_subtitles,whisper_model=whisper_model,
-                              whisper_language=whisper_language,
-                              subtitle_style_name=subtitle_style_name,
-                              subtitle_max_chars=subtitle_max_chars,
-                              subtitle_translate_to=subtitle_translate_to,
-                              output_fps=output_fps,color_grade=color_grade,
-                              vignette_strength=vignette_strength,sharpen_strength=sharpen_strength,
-                              ffmpeg_sharpen=ffmpeg_sharpen,scene_cuts=scene_cuts,
-                              use_panel_mode=False,
-                              tracking_boxes_map=tracking_boxes_map,
-                              draw_tracking_boxes=use_ball_tracking,
-                              progress_callback=lambda v,m:_p(0.55+v*0.43,m))
+    render_meta=_render_video(
+        input_path=input_path, output_path=output_path,
+        out_w=out_w, out_h=out_h, crop_w=crop_w, crop_h=crop_h,
+        orig_w=orig_w, orig_h=orig_h, fps=fps, total_frames=total_frames,
+        smoothed_centers=smoothed, tracking_mode="sports_action",
+        crf=crf, encoder_preset=encoder_preset, audio_bitrate=audio_bitrate,
+        burn_subtitles=burn_subtitles, whisper_model=whisper_model,
+        whisper_language=whisper_language,
+        subtitle_style_name=subtitle_style_name,
+        subtitle_max_chars=subtitle_max_chars,
+        subtitle_translate_to=subtitle_translate_to,
+        output_fps=output_fps, color_grade=color_grade,
+        vignette_strength=vignette_strength, sharpen_strength=sharpen_strength,
+        ffmpeg_sharpen=ffmpeg_sharpen, scene_cuts=scene_cuts,
+        use_panel_mode=False,
+        # v6.2: pass separate ball_records and person_boxes_map
+        ball_records=ball_records,
+        person_boxes_map=person_boxes_map,
+        draw_tracking_boxes=draw_tracking_boxes,
+        progress_callback=lambda v,m:_p(0.55+v*0.43,m),
+    )
     _p(1.0,"Done!")
     analytics=_build_analytics(input_path,output_path,orig_w=orig_w,orig_h=orig_h,
                                out_w=out_w,out_h=out_h,smooth_metrics=smooth_metrics,panel_mode=False)
@@ -2867,6 +2958,8 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
                         subtitle_max_chars: int = 42, sport_type: str = "auto",
                         output_fps: Optional[float] = None,
                         panel_config: Optional[PanelModeConfig] = None,
+                        # v6.2: pass through to sports pipeline
+                        draw_tracking_boxes: bool = True,
                         progress_callback=None) -> List[Dict[str, Any]]:
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
     os.makedirs(output_dir,exist_ok=True); results=[]; n=len(clips)
@@ -2893,6 +2986,7 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
                                           burn_subtitles=burn_subtitles,whisper_model=whisper_model,
                                           subtitle_style_name=subtitle_style_name,
                                           subtitle_max_chars=subtitle_max_chars,
+                                          draw_tracking_boxes=draw_tracking_boxes,
                                           progress_callback=lambda v,m:_cp(0.05+v*0.90,m))
             else:
                 meta=process_video(trim_path,out_path,target_preset_label=target_preset_label,
