@@ -463,6 +463,53 @@ def apply_color_grade(frame: np.ndarray, grade: str = "none") -> np.ndarray:
     return cv2.LUT(frame, _build_lut(grade))
 
 
+def _draw_tracking_overlays(
+    frame: np.ndarray,
+    ball_box_out: Optional[Tuple[int,int,int,int]],
+    person_boxes_out: List[Tuple[int,int,int,int]],
+) -> np.ndarray:
+    """
+    Draw thin bounding-box overlays on an already-cropped/resized output frame.
+    - Ball:    bright yellow corner-tick bracket + small centre dot
+    - Persons: white 1-px outline with faint semi-transparent fill
+    Returns a copy; caller's array is never mutated.
+    """
+    out = frame.copy()
+    h, w = out.shape[:2]
+
+    # ── Person boxes (white, 1 px + subtle fill) ──────────────────────────────
+    for (x1, y1, x2, y2) in person_boxes_out:
+        x1c = max(0, x1); y1c = max(0, y1)
+        x2c = min(w-1, x2); y2c = min(h-1, y2)
+        if x2c <= x1c or y2c <= y1c:
+            continue
+        overlay = out.copy()
+        cv2.rectangle(overlay, (x1c, y1c), (x2c, y2c), (255, 255, 255), -1)
+        cv2.addWeighted(overlay, 0.06, out, 0.94, 0, out)
+        cv2.rectangle(out, (x1c, y1c), (x2c, y2c), (255, 255, 255), 1, cv2.LINE_AA)
+
+    # ── Ball box: corner-tick brackets (yellow-orange, 2 px) + centre dot ─────
+    if ball_box_out is not None:
+        bx1, by1, bx2, by2 = ball_box_out
+        bx1c = max(0, bx1); by1c = max(0, by1)
+        bx2c = min(w-1, bx2); by2c = min(h-1, by2)
+        if bx2c > bx1c and by2c > by1c:
+            clen  = max(6, min((bx2c-bx1c)//4, (by2c-by1c)//4, 18))
+            color = (0, 230, 255)   # bright yellow-orange (BGR)
+            thick = 2
+            cv2.line(out, (bx1c,       by1c),       (bx1c+clen, by1c),       color, thick, cv2.LINE_AA)
+            cv2.line(out, (bx1c,       by1c),       (bx1c,      by1c+clen),  color, thick, cv2.LINE_AA)
+            cv2.line(out, (bx2c,       by1c),       (bx2c-clen, by1c),       color, thick, cv2.LINE_AA)
+            cv2.line(out, (bx2c,       by1c),       (bx2c,      by1c+clen),  color, thick, cv2.LINE_AA)
+            cv2.line(out, (bx1c,       by2c),       (bx1c+clen, by2c),       color, thick, cv2.LINE_AA)
+            cv2.line(out, (bx1c,       by2c),       (bx1c,      by2c-clen),  color, thick, cv2.LINE_AA)
+            cv2.line(out, (bx2c,       by2c),       (bx2c-clen, by2c),       color, thick, cv2.LINE_AA)
+            cv2.line(out, (bx2c,       by2c),       (bx2c,      by2c-clen),  color, thick, cv2.LINE_AA)
+            bcx = (bx1c+bx2c)//2; bcy = (by1c+by2c)//2
+            cv2.circle(out, (bcx, bcy), max(2, (bx2c-bx1c)//6), color, -1, cv2.LINE_AA)
+    return out
+
+
 def apply_ken_burns(frame: np.ndarray, frame_idx: int, fps: float,
                     max_zoom: float = KEN_BURNS_MAX_ZOOM, period: float = KEN_BURNS_PERIOD) -> np.ndarray:
     if max_zoom <= 1.0:
@@ -2318,7 +2365,9 @@ def _render_video(input_path: str, output_path: str,
                   progress_callback=None, scene_cuts: Optional[List[int]] = None,
                   use_panel_mode: bool = False,
                   panel_config: Optional[PanelModeConfig] = None,
-                  panel_persons_map: Optional[Dict[int,List]] = None) -> Dict[str,Any]:
+                  panel_persons_map: Optional[Dict[int,List]] = None,
+                  tracking_boxes_map: Optional[Dict[int,Dict]] = None,
+                  draw_tracking_boxes: bool = False) -> Dict[str,Any]:
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
     eff_fps=output_fps or fps; srt_path=None
     if burn_subtitles and whisper_available():
@@ -2368,6 +2417,19 @@ def _render_video(input_path: str, output_path: str,
                     if crop.shape[0]==0 or crop.shape[1]==0:
                         crop=(frame[:crop_h,:crop_w] if orig_h>=crop_h and orig_w>=crop_w else frame)
                     out_frame=cv2.resize(crop,(out_w,out_h),interpolation=cv2.INTER_LANCZOS4)
+                    # ── Tracking overlays (transform orig→output space) ───────
+                    if draw_tracking_boxes and tracking_boxes_map is not None:
+                        tboxes = tracking_boxes_map.get(fi)
+                        if tboxes is not None:
+                            sx = out_w / max(crop_w, 1)
+                            sy = out_h / max(crop_h, 1)
+                            def _to_out(bx: Tuple[int,int,int,int]) -> Tuple[int,int,int,int]:
+                                return (int((bx[0]-x1)*sx), int((bx[1]-y1)*sy),
+                                        int((bx[2]-x1)*sx), int((bx[3]-y1)*sy))
+                            raw_ball = tboxes.get("ball")
+                            ball_out = _to_out(raw_ball) if raw_ball else None
+                            persons_out = [_to_out(p) for p in tboxes.get("persons", [])]
+                            out_frame = _draw_tracking_overlays(out_frame, ball_out, persons_out)
                     if vignette_strength>0: out_frame=apply_vignette(out_frame,vignette_strength)
                     if sharpen_strength>0 and not ffmpeg_sharpen:
                         out_frame=apply_sharpen(out_frame,sharpen_strength)
@@ -2495,6 +2557,8 @@ def _sports_tracking_pass_optimized(
     raw_centers: List[Tuple[int,int]] = []
     speeds: List[float] = []
     scene_cuts: List[int] = []
+    # Per-frame overlay data: {fi: {"ball": bbox_orig|None, "persons": [bboxes_orig]}}
+    tracking_boxes_map: Dict[int, Dict] = {}
 
     det_cache = DetectionCache()
     ball_tracker = BallROITracker(BALL_TRACKER_TYPE)
@@ -2670,6 +2734,13 @@ def _sports_tracking_pass_optimized(
                 cy_out = _apply_lower_third_guard(cy_out, crop_h, cy_out, orig_h)
 
                 speed = math.hypot(cx_out-(prev_cx or cx_out), cy_out-(prev_cy or cy_out))
+
+                # ── Store overlay boxes for this frame ────────────────────────
+                tracking_boxes_map[fi] = {
+                    "ball":    det_cache.ball_box,    # in orig coords (or None)
+                    "persons": list(det_cache.persons),  # in orig coords
+                }
+
                 raw_centers.append((cx_out, cy_out)); speeds.append(speed)
                 prev_cx=float(cx_out); prev_cy=float(cy_out)
                 prev_gray=gray; prev_frame=det_frame
@@ -2686,7 +2757,7 @@ def _sports_tracking_pass_optimized(
         raw_centers.append(raw_centers[-1] if raw_centers else (orig_w//2, orig_h//2))
         speeds.append(0.0)
 
-    return raw_centers, speeds, scene_cuts
+    return raw_centers, speeds, scene_cuts, tracking_boxes_map
 
 
 # ── process_video — main public API ───────────────────────────────────────────
@@ -2784,10 +2855,12 @@ def process_sports_video(input_path: str, output_path: str,
                           scene_cut_threshold: float = 0.22,
                           vignette_strength: float = 0.275, sharpen_strength: float = 0.3,
                           ffmpeg_sharpen: bool = True, color_grade: str = "none",
+                          draw_tracking_boxes: bool = True,
                           progress_callback=None) -> Dict[str, Any]:
     """
     Sports-optimized pipeline.
     v6.1 uses _sports_tracking_pass_optimized for ~2-3× faster tracking.
+    draw_tracking_boxes: overlay ball (yellow corner brackets) and subject (white outline) boxes.
     """
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
     _check_ffmpeg()
@@ -2810,7 +2883,7 @@ def process_sports_video(input_path: str, output_path: str,
     phase_detector = SportsPlayPhaseDetector(fps)
 
     _p(0.05,"Sports tracking (optimized)...")
-    raw_centers, speeds, scene_cuts = _sports_tracking_pass_optimized(
+    raw_centers, speeds, scene_cuts, tracking_boxes_map = _sports_tracking_pass_optimized(
         input_path=input_path, orig_w=orig_w, orig_h=orig_h,
         crop_w=crop_w, crop_h=crop_h, fps=fps, total_frames=total_frames,
         model=model, confidence=confidence,
@@ -2848,6 +2921,8 @@ def process_sports_video(input_path: str, output_path: str,
                                vignette_strength=vignette_strength,sharpen_strength=sharpen_strength,
                                ffmpeg_sharpen=ffmpeg_sharpen,scene_cuts=scene_cuts,
                                use_panel_mode=False,
+                               tracking_boxes_map=tracking_boxes_map,
+                               draw_tracking_boxes=draw_tracking_boxes and use_ball_tracking,
                                progress_callback=lambda v,m:_p(0.55+v*0.43,m))
     _p(1.0,"Done!")
     analytics=_build_analytics(input_path,output_path,orig_w=orig_w,orig_h=orig_h,
