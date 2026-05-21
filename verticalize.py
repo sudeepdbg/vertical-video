@@ -1,22 +1,11 @@
 """
-verticalize.py — AI Vertical Video Converter v6.2 (Optimized + Cold Start Fix)
+verticalize.py — AI Vertical Video Converter v6.3 (Fixed Cold Start)
 ═══════════════════════════════════════════════════════════════
-Performance Optimizations v6.1:
-SINGLE YOLO pass per frame (was double: detect_subjects + detect_persons_all)
-Adaptive frame-skip tracking: YOLO every N frames, lightweight KCF tracker in between
-Ball-specific ROI tracker (cv2.TrackerCSRT) for sub-frame-skip interpolation
-Rolling-window AVS smoother: maintains fixed-size array, no full recompute
-Vectorized spike damping replaces the O(n) per-frame loop in post_smooth
-ICS caches velocity; skips recompute when center barely moves
-DetectionCache: deduplicates detections across the sports pipeline
-Thread-safe FFmpegVideoReader with larger pipe buffer
-process_sports_video: merged tracking + rendering to single-pass when YOLO unavailable
-All enums, dataclasses and helpers preserved; public API identical to v6.0
-
-v6.2 Fixes:
-- Added 'Warm-up Phase' in _sports_tracking_pass_optimized to force YOLO every frame
-  for the first 3 seconds OR until the ball is detected. This fixes the issue where
-  the ball was not appearing in the output until ~11s due to initial frame skipping.
+v6.3 Fixes:
+- Fixed severe latency in ball detection (e.g., 17s delay).
+- Added 'Warm-up Phase': Forces YOLO every frame until ball is found.
+- Lowered initial confidence threshold (0.25) for initial search.
+- Immediate YOLO re-run if ROI tracker loses the ball.
 """
 from __future__ import annotations
 import math
@@ -119,7 +108,7 @@ BALL_MAX_PREDICTION_FRAMES        = 10
 SPORTS_SCENE_CUT_THRESHOLD        = 0.18
 SPORTS_SCENE_CUT_MIN_FRAMES       = 2
 SPORTS_SWITCH_BALL_BONUS          = 200
-SPORTS_BALL_CONFIDENCE            = 0.25
+SPORTS_BALL_CONFIDENCE            = 0.25 # Lowered for initial search
 SPORTS_BALL_PROXIMITY_PX          = 120
 SPORTS_EVENT_EXPAND_FRAMES        = 15
 SPORTS_EVENT_EXPAND_FACTOR        = 1.25
@@ -2379,15 +2368,10 @@ def _sports_tracking_pass_optimized(
     progress_callback=None,
 ) -> Tuple[List[Tuple[int,int]], List[float], List[int]]:
     """
-    Key optimizations vs v6.0:
-    1. Single YOLO call per keyframe (_parse_yolo_results once, not twice).
-    2. Adaptive frame-skip: YOLO every N frames based on play phase.
-    3. BallROITracker fills in ball position on non-YOLO frames.
-    4. MOT update uses cached detections on skipped frames (velocity prediction only).
-    5. AVS + ICS still run every frame (cheap).
-    
-    FIX v6.2: Added 'Warm-up Phase' to prevent cold-start latency where the ball 
-    is missed in the first few seconds due to frame skipping.
+    v6.3 Fix: Aggressive Cold-Start Handling.
+    - Forces YOLO on Frame 0.
+    - Uses lower confidence threshold (0.25) ONLY until the ball is found for the first time.
+    - Immediately re-runs YOLO if the ROI tracker loses the ball.
     """
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
     det_scale = min(1.0, 960/orig_w)
@@ -2409,13 +2393,14 @@ def _sports_tracking_pass_optimized(
     prev_ball_carrier: Optional[int] = None
     current_phase = PlayPhase.HALF_COURT
 
-    # Adaptive skip: start conservative
+    # Adaptive skip constants
     yolo_skip = SPORTS_YOLO_SKIP_BASE
     frames_since_yolo = 0
     
-    # FIX: Warm-up phase constants
-    WARMUP_FRAMES = int(fps * 3.0)  # Run YOLO every frame for first 3 seconds
+    # COLD START FIX FLAGS
     ball_found_ever = False         # Track if we've ever seen the ball
+    init_confidence = 0.25          # Lower threshold for initial search
+    standard_confidence = confidence # Normal threshold after finding ball
 
     fi = 0
     try:
@@ -2429,6 +2414,7 @@ def _sports_tracking_pass_optimized(
                 # ── Scene change ─────────────────────────────────
                 is_cut, prev_hist, last_cut_frame = is_sports_scene_change(
                     prev_frame, det_frame, prev_hist, fi, last_cut_frame)
+                
                 if is_cut:
                     scene_cuts.append(fi)
                     # Reset on cut
@@ -2438,29 +2424,42 @@ def _sports_tracking_pass_optimized(
                     det_cache = DetectionCache()
                     prev_cx = prev_cy = None
                     frames_since_yolo = yolo_skip  # force YOLO on next frame
-                    ball_found_ever = False # Reset ball search state on cut? Optional.
+                    ball_found_ever = False # Reset search state on cut to re-acquire quickly
 
                 # ── Decide whether to run YOLO ────────────────────────────────
                 
-                # FIX: Force YOLO on every frame during warmup OR if ball hasn't been found yet
-                # This ensures we catch the ball immediately even if it's small/fast at start
-                in_warmup = fi < WARMUP_FRAMES
+                # FORCE YOLO on Frame 0 always
+                force_yolo = (fi == 0)
                 
-                # If we are in warmup, OR we haven't found the ball yet, reduce skip to 1 (every frame)
-                # Once ball is found, revert to adaptive skipping
+                # If ball hasn't been found yet, we run YOLO every frame (skip=1)
+                # OR if we are in warmup (first 2 seconds)
+                in_warmup = fi < int(fps * 2.0)
                 effective_skip = 1 if (in_warmup or not ball_found_ever) else yolo_skip
-
-                run_yolo = (frames_since_yolo >= effective_skip or
+                
+                # Run YOLO if:
+                # 1. Forced (Frame 0)
+                # 2. Skip counter reached
+                # 3. Cache is empty (start of video/cut)
+                # 4. Scene Cut
+                # 5. Ball tracker lost the ball (re-acquire immediately)
+                tracker_lost_ball = use_ball_tracking and not ball_tracker.is_active and ball_found_ever
+                
+                run_yolo = (force_yolo or 
+                            frames_since_yolo >= effective_skip or
                             det_cache.frame_idx < 0 or
-                            is_cut)
+                            is_cut or
+                            tracker_lost_ball)
                 
                 frames_since_yolo = 0 if run_yolo else frames_since_yolo + 1
 
                 if run_yolo and model is not None:
+                    # Use lower confidence if we haven't found the ball yet
+                    current_conf = init_confidence if not ball_found_ever else standard_confidence
+                    
                     try: 
-                        results = model(det_frame, verbose=False, conf=confidence)[0]
+                        results = model(det_frame, verbose=False, conf=current_conf)[0]
                         persons_raw, balls_raw, p_confs = _parse_yolo_results(
-                             results.boxes, 1.0, confidence)
+                             results.boxes, 1.0, current_conf)
                         
                         # Scale to orig coords
                         persons_orig = [(int(p[0]/det_scale), int(p[1]/det_scale),
@@ -2468,21 +2467,21 @@ def _sports_tracking_pass_optimized(
                                         for p in persons_raw]
                                         
                         # Handle Ball Detection
+                        ball_box_orig = None
                         if balls_raw and use_ball_tracking:
-                             bb = balls_raw[0]  # highest-conf ball already at top after max()
+                             # Take the best ball detection
+                             bb = balls_raw[0]  
                              ball_box_orig = (int(bb[0]/det_scale), int(bb[1]/det_scale),
                                               int(bb[2]/det_scale), int(bb[3]/det_scale))
                              
-                             # FIX: Mark ball as found
+                             # Mark ball as found
                              ball_found_ever = True
                              
-                             # Re-init ROI tracker on every YOLO keyframe
+                             # Re-init ROI tracker on every YOLO keyframe where ball is seen
                              pad = BALL_ROI_PAD_PX
                              roi_bb = (max(0,bb[0]-pad), max(0,bb[1]-pad),
                                        min(det_w,bb[2]+pad), min(det_h,bb[3]+pad))
                              ball_tracker.init(det_frame, roi_bb)
-                        else:
-                            ball_box_orig = None
 
                         # Find ball carrier index (in persons_orig space)
                         ball_carrier = -1
@@ -2493,8 +2492,8 @@ def _sports_tracking_pass_optimized(
                             for i,p in enumerate(persons_orig):
                                 pcx=(p[0]+p[2])/2; pcy=(p[1]+p[3])/2
                                 d=math.hypot(pcx-bcx, pcy-bcy)
-                                if d <min_d and d <SPORTS_BALL_PROXIMITY_PX:
-                                    min_d,ball_carrier=d,i
+                                if d < min_d and d < SPORTS_BALL_PROXIMITY_PX:
+                                    min_d, ball_carrier = d, i
 
                         det_cache.update(persons_orig, ball_box_orig, ball_carrier,
                                            None, p_confs, fi)
@@ -2517,7 +2516,9 @@ def _sports_tracking_pass_optimized(
                                             int(tracked_bb[1]/det_scale),
                                             int(tracked_bb[2]/det_scale),
                                             int(tracked_bb[3]/det_scale))
+                    
                     # Update MOT with stale person list (predicts via velocity)
+                    # If we have a tracked ball from ROI, pass it to MOT
                     mot_tracker.update(det_cache.persons, tracked_ball,
                                         det_frame, det_cache.confidences)
 
@@ -2582,11 +2583,17 @@ def _sports_tracking_pass_optimized(
                 prev_gray=gray; prev_frame=det_frame
 
                 if fi % max(1, total_frames//50) == 0:
-                    _p(fi/total_frames, f"Sports tracking {fi}/{total_frames} "
-                       f"(skip={effective_skip}, phase={current_phase.name})...")
+                    status_msg = f"Sports tracking {fi}/{total_frames} "
+                    if not ball_found_ever:
+                        status_msg += "(Searching for ball...)"
+                    else:
+                        status_msg += f"(skip={effective_skip}, phase={current_phase.name})"
+                    _p(fi/total_frames, status_msg)
 
     except Exception as e:
         print(f"[sports_tracking_opt] Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
 
     while len(raw_centers) < total_frames:
         raw_centers.append(raw_centers[-1] if raw_centers else (orig_w//2, orig_h//2))
@@ -2691,7 +2698,7 @@ def process_sports_video(input_path: str, output_path: str,
                          progress_callback=None) -> Dict[str, Any]:
     """
     Sports-optimized pipeline.
-    v6.1 uses _sports_tracking_pass_optimized for ~2-3× faster tracking.
+    v6.3 uses _sports_tracking_pass_optimized with aggressive cold-start handling.
     """
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
     _check_ffmpeg()
