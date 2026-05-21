@@ -1,14 +1,11 @@
 """
 app.py — Reframe · AI Vertical Video Studio
 Mobile-first · Light theme · Single Clip + Auto-Clip modes
-v6.2: draw_tracking_boxes toggle (independent of use_ball_tracking)
 """
 import streamlit as st
 import tempfile
 import os
 import glob
-import time
-import psutil
 from verticalize import (
     process_video, process_sports_video, get_video_info, detect_clips, process_clips_batch,
     RESOLUTION_PRESETS, SUBTITLE_STYLES, TRANSLATION_LANGUAGES,
@@ -165,7 +162,7 @@ video { border-radius: var(--r) !important; width: 100% !important; }
     border-radius:4px; font-size:10px; font-weight:600; color:var(--pur); padding:1px 6px; margin-top:5px; margin-left:4px; }
 
 /* Buttons */
-.stButton >button { font-family:'DM Sans',sans-serif !important; border-radius:var(--rs) !important; font-weight:600 !important; font-size:13px !important; transition:all 0.15s !important; }
+.stButton >button { font-family:'DM Sans',sans-serif !important; border-radius:var(--rs) !important; font-weight:600 !important; font-size:13px !important; transition:all 0.15s !important; } 
 .stButton >button[kind="primary"]   { background:var(--ink) !important; color:#fff !important; border:none !important; padding:10px 20px !important; }
 .stButton >button[kind="primary"]:hover  { background:#000 !important; transform:translateY(-1px) !important; }
 .stButton >button[kind="primary"]:disabled { background:var(--bdr2) !important; color:var(--ink3) !important; transform:none !important; }
@@ -232,7 +229,7 @@ video { border-radius: var(--r) !important; width: 100% !important; }
 [data-testid="stRadio"] [data-testid="stMarkdownContainer"] p { font-size:12px !important; }
 [data-testid="stRadio"]  > div { gap:6px !important; }
 
-/* Vertical 9:16 player */
+/* Vertical 9:16 player — height matches landscape player (~360px) so width = 360*9/16 = 202px */
 .rf-vplayer { width:202px; flex-shrink:0; }
 .rf-vplayer [data-testid="stVideo"] {
     border-radius:10px !important;
@@ -264,15 +261,14 @@ _DEFAULTS = dict(
     detected_clips=None, selected_clip_indices=None,
     clip_results=None, scan_done=False,
     clip_out_dir=None,
+    # vertical player: index of the clip currently being previewed (-1 = none)
     playing_clip_idx=-1,
-    # panel mode
+    # panel mode (v4.1)
     panel_mode_override="auto",
     panel_max_motion=20.0,
     panel_min_area=0.03,
     panel_max_variance=2.5,
     panel_stability=0.60,
-    # v6.2: tracking box overlay toggle
-    draw_tracking_boxes=True,
 )
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -321,8 +317,8 @@ st.markdown("""
  </div>
  <span class="rf-name">Reframe</span>
  </div>
- <span class="rf-tag">AI Vertical Video · v6.2</span>
-</div>
+ <span class="rf-tag">AI Vertical Video</span>
+ </div>
 """, unsafe_allow_html=True)
 st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
@@ -362,7 +358,8 @@ else:
  <div class="rf-mode-h pur">Auto-Clip   <span style="background:var(--acc);color:#fff;font-size:9px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;padding:2px 6px;border-radius:99px;">AI</span></div>
  <div class="rf-mode-s">
 Upload a 30–90 min video. AI scans for saliency peaks, detects
-narrative arcs, identifies SOI per clip, enforces the lower-third safe zone,
+narrative arcs (beginning · middle · end), identifies the SOI
+coordinate region per clip, enforces the lower-third safe zone,
 then verticalizes every selected clip.
  </div>
  </div>
@@ -373,7 +370,7 @@ st.markdown("</div>", unsafe_allow_html=True)
 st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tracking mode
+# Tracking mode + settings
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("<div style='padding:0 20px'>", unsafe_allow_html=True)
 st.markdown('<div class="rf-sec">Tracking Mode</div>', unsafe_allow_html=True)
@@ -385,6 +382,7 @@ with tm2:
     if st.button("👤  Talking Head  ✦", type="secondary", use_container_width=True):
         st.session_state.tracking_mode = "talking_head"
 
+# NEW v4.0: Sports Action mode
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 tm3, tm4 = st.columns(2, gap="small")
 with tm3:
@@ -396,6 +394,7 @@ with tm4:
 
 tracking_mode = st.session_state.tracking_mode
 
+# Show sport type selector when in sports mode
 if tracking_mode == "sports_action":
     st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
     sport_type = st.selectbox(
@@ -410,7 +409,7 @@ if tracking_mode == "sports_action":
 else:
     sport_type = st.session_state.get("sport_type", "auto")
 
-# Active tracking mode badge
+# Show active tracking mode badge
 if tracking_mode == "sports_action":
     sport_display = st.session_state.get("sport_type", "auto").title()
     st.markdown(f"""
@@ -419,7 +418,7 @@ if tracking_mode == "sports_action":
                     letter-spacing:.1em;text-transform:uppercase;padding:3px 10px;border-radius:99px;">
             🏀 Sports Action · {sport_display}
         </span>
-        <span style="font-size:11px;color:var(--ink3);">Ball-aware · Kalman · Exact sync</span>
+        <span style="font-size:11px;color:var(--ink3);">Ball-aware · Kalman tracking</span>
     </div>
     """, unsafe_allow_html=True)
 elif tracking_mode == "talking_head":
@@ -441,7 +440,7 @@ else:
     </div>
     """, unsafe_allow_html=True)
 
-# Panel mode (subject only)
+# ── v4.1: Panel Mode Controls (only for Subject Tracking) ──
 if tracking_mode == "subject":
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     with st.expander("🎛 Panel Mode Settings", expanded=False):
@@ -457,44 +456,70 @@ if tracking_mode == "subject":
             index=["auto", "force_on", "force_off"].index(
                 st.session_state.get("panel_mode_override", "auto")
             ),
+            help="Auto = detect panel layout automatically. Force ON = always use 2-row split. Force OFF = never use split.",
         )
         st.session_state.panel_mode_override = panel_mode_override
+
         if panel_mode_override == "auto":
+            st.markdown("<div style='font-size:11px;color:var(--ink3);margin-bottom:8px;'>Adjust detection sensitivity:</div>", unsafe_allow_html=True)
             c1, c2 = st.columns(2)
             with c1:
-                st.session_state.panel_max_motion = st.slider("Max motion (px)", 5.0, 40.0, float(st.session_state.get("panel_max_motion", 20.0)), 1.0)
-                st.session_state.panel_min_area   = st.slider("Min person area (%)", 0.01, 0.10, float(st.session_state.get("panel_min_area", 0.03)), 0.01, format="%.2f")
+                st.session_state.panel_max_motion = st.slider(
+                    "Max motion (px)", 5.0, 40.0,
+                    float(st.session_state.get("panel_max_motion", 20.0)), 1.0,
+                    help="Higher = allow more movement (gesturing, leaning)"
+                )
+                st.session_state.panel_min_area = st.slider(
+                    "Min person area (%)", 0.01, 0.10,
+                    float(st.session_state.get("panel_min_area", 0.03)), 0.01,
+                    format="%.2f",
+                    help="Lower = detect smaller people in wide shots"
+                )
             with c2:
-                st.session_state.panel_max_variance = st.slider("Max count variance", 0.5, 5.0, float(st.session_state.get("panel_max_variance", 2.5)), 0.5)
-                st.session_state.panel_stability    = st.slider("Stability fraction", 0.30, 0.90, float(st.session_state.get("panel_stability", 0.60)), 0.05, format="%.2f")
+                st.session_state.panel_max_variance = st.slider(
+                    "Max count variance", 0.5, 5.0,
+                    float(st.session_state.get("panel_max_variance", 2.5)), 0.5,
+                    help="Higher = tolerate people entering/exiting frame"
+                )
+                st.session_state.panel_stability = st.slider(
+                    "Stability fraction", 0.30, 0.90,
+                    float(st.session_state.get("panel_stability", 0.60)), 0.05,
+                    format="%.2f",
+                    help="Lower = require less consistent positioning"
+                )
         elif panel_mode_override == "force_on":
-            st.markdown('<div class="rf-info">Panel mode will split the frame into top/bottom strips.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="rf-info">Panel mode will split the frame into top/bottom strips, each cropped to 9:16. Best for 2-4 people seated side-by-side.</div>', unsafe_allow_html=True)
         else:
             st.markdown('<div class="rf-info">Standard single-crop tracking will be used.</div>', unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Settings tabs
-# ─────────────────────────────────────────────────────────────────────────────
 tab_list = ["🎞 Output", "🎯 Tracking", "📝 Subtitles", "⚙ Advanced"]
 if app_mode == "autoClip":
-    tab_list += ["✂️ Clips", "📊 Analytics"]
+    tab_list.append("✂️ Clips")
+    tab_list.append("📊 Analytics")
+
+if app_mode == "autoClip":
     tab_out, tab_trk, tab_sub, tab_adv, tab_clip, tab_analytics = st.tabs(tab_list)
 else:
     tab_out, tab_trk, tab_sub, tab_adv = st.tabs(tab_list)
-    tab_clip = tab_analytics = None
+    tab_clip = None  # not used in single mode
+    tab_analytics = None
 
 with tab_out:
     st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
     o1, o2 = st.columns(2, gap="medium")
     with o1:
         resolution_label = st.selectbox("Resolution", list(RESOLUTION_PRESETS.keys()), index=0)
-        fps_label = st.selectbox("Frame rate", ["Source (keep original)", "60 fps", "30 fps", "25 fps", "24 fps"], index=0)
+        fps_label = st.selectbox("Frame rate",
+                                 ["Source (keep original)", "60 fps", "30 fps", "25 fps", "24 fps"], index=0)
     with o2:
         crf = st.slider("Quality (CRF)", 15, 35, 23, 1)
         st.caption("18 = near-lossless  ·  28 = compact")
-        encoder_preset_label = st.selectbox("Speed", ["ultrafast", "fast", "medium", "slow"], index=1)
+        encoder_preset_label = st.selectbox("Speed",
+                                            ["ultrafast", "fast", "medium", "slow"], index=1)
 
-_fps_map = {"Source (keep original)": None, "60 fps": 60.0, "30 fps": 30.0, "25 fps": 25.0, "24 fps": 24.0}
+_fps_map = {"Source (keep original)": None,
+            "60 fps": 60.0, "30 fps": 30.0, "25 fps": 25.0, "24 fps": 24.0}
 output_fps = _fps_map[fps_label]
 
 with tab_trk:
@@ -502,21 +527,20 @@ with tab_trk:
     if tracking_mode == "talking_head":
         th1, th2 = st.columns(2, gap="medium")
         with th1:
-            talking_head_bias   = st.slider("Upper-third pull", 0.0, 1.0, 0.30, 0.05)
-            smooth_window       = st.slider("Smoothness", 3, 31, 21, 2)
+            talking_head_bias = st.slider("Upper-third pull", 0.0, 1.0, 0.30, 0.05)
+            st.caption("0 = centered face  ·  1 = upper third")
+            smooth_window = st.slider("Smoothness", 3, 31, 21, 2)
         with th2:
             adaptive_smoothing  = st.toggle("Adaptive smoothing", value=False)
             use_optical_flow    = st.toggle("Optical flow bridge", value=True)
             rule_of_thirds      = st.toggle("Horizontal rule-of-thirds", value=True)
             confidence          = 0.5
             scene_cut_threshold = 0.35
-        use_ball_tracking = False
-        use_kalman        = False
-
     elif tracking_mode == "sports_action":
+        # v4.0 SPORTS TRACKING SETTINGS
         st.markdown("""
         <div class="rf-info" style="margin-bottom:12px;">
-        🏀 <b>Sports Mode v6.2</b> — Exact ball sync: output frame N carries the ball detected in source frame N.
+        🏀 <b>Sports Mode Active</b> — Ball-aware tracking with Kalman predictive smoothing.
         </div>
         """, unsafe_allow_html=True)
         t1, t2 = st.columns(2, gap="medium")
@@ -524,59 +548,18 @@ with tab_trk:
             adaptive_smoothing  = st.toggle("Adaptive smoothing", value=True)
             smooth_window       = st.slider("Smoothness", 3, 15, 5, 1)
             confidence          = st.slider("Detection confidence", 0.10, 0.95, 0.45, 0.05)
-            use_ball_tracking   = st.toggle("Ball tracking", value=True,
-                                            help="Prioritizes ball carrier for framing")
+            use_ball_tracking   = st.toggle("Ball tracking", value=True, help="Prioritize ball carrier")
         with t2:
             use_optical_flow    = st.toggle("Optical flow fallback", value=True)
             rule_of_thirds      = st.toggle("Look-room / Rule-of-thirds", value=True)
             scene_cut_threshold = st.slider("Scene-cut sensitivity", 0.10, 0.60, 0.22, 0.05)
-            use_kalman          = st.toggle("Kalman prediction", value=True,
-                                            help="Predictive smoothing during occlusion")
-
-        # ── v6.2: Tracking box overlay toggle (independent of ball tracking) ──
-        st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-        st.markdown("""
-        <div style="font-size:10px;font-weight:700;letter-spacing:0.1em;
-                    text-transform:uppercase;color:var(--ink3);margin-bottom:6px;">
-            Overlay Options
-        </div>
-        """, unsafe_allow_html=True)
-        draw_tracking_boxes = st.toggle(
-            "Show tracking brackets",
-            value=st.session_state.get("draw_tracking_boxes", True),
-            help=(
-                "Draw yellow corner-tick brackets around the ball and white outlines "
-                "around players in the output video. "
-                "Turn off for a clean output with no overlays. "
-                "Ball tracking still works for framing even when brackets are hidden."
-            ),
-        )
-        st.session_state.draw_tracking_boxes = draw_tracking_boxes
-
-        if draw_tracking_boxes:
-            st.markdown("""
-            <div style="display:flex;gap:12px;margin-top:4px;flex-wrap:wrap;">
-              <span style="font-size:11px;color:var(--ink3);">
-                🟡 <b style="color:var(--ink2);">Ball</b> — yellow corner ticks
-                (bright=YOLO · dim=ROI · faded=predicted)
-              </span>
-              <span style="font-size:11px;color:var(--ink3);">
-                ⬜ <b style="color:var(--ink2);">Players</b> — white 1px outline
-              </span>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.markdown("""
-            <div class="rf-info" style="margin-top:4px;">
-              Brackets hidden — ball tracking still active for framing.
-            </div>
-            """, unsafe_allow_html=True)
-
+            use_kalman          = st.toggle("Kalman prediction", value=True, help="Zero-lag predictive tracking")
         talking_head_bias = 0.30
+        # Sports-specific defaults
+        ken_burns = False
         vignette_strength = 0.275
-        sharpen_strength  = 0.3
-        ffmpeg_sharpen    = True
-
+        sharpen_strength = 0.3
+        ffmpeg_sharpen = True
     else:
         t1, t2 = st.columns(2, gap="medium")
         with t1:
@@ -587,51 +570,60 @@ with tab_trk:
             use_optical_flow    = st.toggle("Optical flow fallback", value=True)
             rule_of_thirds      = st.toggle("Look-room / Rule-of-thirds", value=True)
             scene_cut_threshold = st.slider("Scene-cut sensitivity", 0.10, 0.60, 0.35, 0.05)
-        talking_head_bias   = 0.30
-        use_ball_tracking   = False
-        use_kalman          = False
-        draw_tracking_boxes = False
-
-# Ensure draw_tracking_boxes is always defined
-if tracking_mode != "sports_action":
-    draw_tracking_boxes = False
+        talking_head_bias = 0.30
 
 with tab_sub:
     st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
     if not _whisper_ok:
-        st.markdown('<div class="rf-purp">⚠️ Install <code>openai-whisper</code> to enable subtitles.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="rf-purp">⚠️ Install <code>openai-whisper</code> to enable subtitles.</div>',
+                    unsafe_allow_html=True)
     s1, s2 = st.columns(2, gap="medium")
     with s1:
-        burn_subtitles      = st.toggle("Burn subtitles", value=False, disabled=not _whisper_ok)
-        if not _whisper_ok: burn_subtitles = False
+        burn_subtitles = st.toggle("Burn subtitles", value=False, disabled=not _whisper_ok)
+        if not _whisper_ok:
+            burn_subtitles = False
         translate_subtitles = st.toggle("Translate 🌐", value=False,
                                         disabled=(not _whisper_ok or not _translate_ok or not burn_subtitles))
-        if not burn_subtitles or not _translate_ok: translate_subtitles = False
-        whisper_model       = st.selectbox("Whisper model", ["tiny", "base", "small", "medium"], index=1, disabled=not _whisper_ok)
+        if not burn_subtitles or not _translate_ok:
+            translate_subtitles = False
+        whisper_model = st.selectbox("Whisper model",
+                                     ["tiny", "base", "small", "medium"], index=1, disabled=not _whisper_ok)
     with s2:
-        subtitle_style_name    = st.selectbox("Style", list(SUBTITLE_STYLES.keys()), disabled=not _whisper_ok)
-        whisper_language_raw   = st.selectbox("Audio language", ["Auto-detect","en","hi","es","fr","de","ja","zh","pt","ar"], disabled=not _whisper_ok)
-        whisper_language       = None if whisper_language_raw == "Auto-detect" else whisper_language_raw
-        subtitle_max_chars     = st.slider("Max chars/line", 20, 60, 42, 2, disabled=not _whisper_ok)
-        subtitle_translate_label = st.selectbox("Translate to", list(TRANSLATION_LANGUAGES.keys()), index=0,
-                                                disabled=(not _whisper_ok or not _translate_ok or not burn_subtitles or not translate_subtitles))
-        subtitle_translate_to  = TRANSLATION_LANGUAGES[subtitle_translate_label] or None
-        if not translate_subtitles: subtitle_translate_to = None
+        subtitle_style_name = st.selectbox("Style", list(SUBTITLE_STYLES.keys()),
+                                           disabled=not _whisper_ok)
+        whisper_language_raw = st.selectbox("Audio language",
+                                            ["Auto-detect", "en", "hi", "es", "fr", "de", "ja", "zh", "pt", "ar"],
+                                            disabled=not _whisper_ok)
+        whisper_language = None if whisper_language_raw == "Auto-detect" else whisper_language_raw
+        subtitle_max_chars = st.slider("Max chars/line", 20, 60, 42, 2, disabled=not _whisper_ok)
+        subtitle_translate_label = st.selectbox("Translate to",
+                                                list(TRANSLATION_LANGUAGES.keys()), index=0,
+                                                disabled=(not _whisper_ok or not _translate_ok
+                                                          or not burn_subtitles or not translate_subtitles))
+        subtitle_translate_to = TRANSLATION_LANGUAGES[subtitle_translate_label] or None
+        if not translate_subtitles:
+            subtitle_translate_to = None
 
 with tab_adv:
     st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
     a1, a2 = st.columns(2, gap="medium")
     with a1:
-        audio_bitrate_label = st.selectbox("Audio bitrate", ["64k","96k","128k","192k"], index=2)
+        audio_bitrate_label = st.selectbox("Audio bitrate",
+                                           ["64k", "96k", "128k", "192k"], index=2)
     with a2:
         if tracking_mode == "subject":
-            yolo_weights = st.selectbox("YOLO model", ["yolov8n.pt","yolov8s.pt","yolov8m.pt"], index=0)
+            yolo_weights = st.selectbox("YOLO model",
+                                        ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt"], index=0)
         else:
             yolo_weights = "yolov8n.pt"
-        st.markdown('<div class="rf-purp">Talking Head uses OpenCV face detector — YOLO not needed.</div>', unsafe_allow_html=True)
-    st.markdown('<div class="rf-safe">✓ Lower-third guard — subjects kept above bottom 20% of frame</div>', unsafe_allow_html=True)
+        st.markdown("""
+ <div class="rf-purp">Talking Head uses OpenCV face detector — YOLO not needed.</div>
+ """, unsafe_allow_html=True)
+    st.markdown("""
+ <div class="rf-safe">✓ Lower-third guard — subjects kept above bottom 20% of frame</div>
+ """, unsafe_allow_html=True)
 
-# Clip / Analytics tabs (auto-clip mode only)
+# Clip settings (auto-clip mode only)
 _CLIP_PRESETS = {
     "15 sec  (snappy highlight)": (13, 17),
     "30 sec  (short reel)":       (25, 35),
@@ -646,57 +638,114 @@ if app_mode == "autoClip" and tab_clip is not None:
         st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
         cl1, cl2 = st.columns(2, gap="medium")
         with cl1:
-            preset_label = st.radio("Clip length preset", list(_CLIP_PRESETS.keys()), index=2)
+            preset_label = st.radio(
+                "Clip length preset",
+                list(_CLIP_PRESETS.keys()),
+                index=2,
+                help="Sets the target duration window for each detected clip",
+            )
             clip_min_dur, clip_max_dur = _CLIP_PRESETS[preset_label]
-            st.markdown(f"<div style='font-size:10px;color:var(--ink3);margin-top:4px;'>Window: {clip_min_dur}s – {clip_max_dur}s</div>", unsafe_allow_html=True)
+            st.markdown(
+                f"<div style='font-size:10px;color:var(--ink3);margin-top:4px;'>Window: {clip_min_dur}s – {clip_max_dur}s</div>",
+                unsafe_allow_html=True)
         with cl2:
             clip_target_n = st.slider("Target # clips", 3, 20, 8, 1)
-        st.markdown('<div class="rf-info" style="margin-top:8px;">💡 AI detects saliency peaks + scene boundaries to find narrative arcs.</div>', unsafe_allow_html=True)
+        st.markdown("""
+ <div class="rf-info" style="margin-top:8px;">
+💡 AI detects saliency peaks + scene boundaries to find narrative arcs
+(beginning · middle · end) in your video.
+ </div>
+ """, unsafe_allow_html=True)
 
+# Analytics Tab (Auto-Clip Mode)
 if app_mode == "autoClip" and tab_analytics is not None:
     with tab_analytics:
         st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
         if st.session_state.clip_results:
             results = st.session_state.clip_results
             valid_results = [r for r in results if not r.get("error") and "analytics" in r]
+            
             if valid_results:
-                total_in  = sum(r["analytics"]["input_size_mb"] for r in valid_results)
+                total_in = sum(r["analytics"]["input_size_mb"] for r in valid_results)
                 total_out = sum(r["analytics"]["output_size_mb"] for r in valid_results)
                 avg_ratio = sum(r["analytics"]["compression_ratio"] for r in valid_results) / len(valid_results)
+                
                 st.markdown(f"""
-                <div class="rf-analytics">
-                  <div class="rf-an-title">📊 Batch Analytics</div>
-                  <div class="rf-an-grid">
-                    <div class="rf-an-item"><div class="rf-an-label">Total Input</div><div class="rf-an-val">{total_in:.1f} MB</div></div>
-                    <div class="rf-an-item"><div class="rf-an-label">Total Output</div><div class="rf-an-val good">{total_out:.1f} MB</div><div class="rf-an-sub">{((1-total_out/total_in)*100):.1f}% smaller</div></div>
-                    <div class="rf-an-item"><div class="rf-an-label">Avg Compression</div><div class="rf-an-val">{avg_ratio:.2f}x</div></div>
-                  </div>
-                </div>
-                """, unsafe_allow_html=True)
+             <div class="rf-analytics">
+               <div class="rf-an-title">📊 Batch Analytics</div>
+               <div class="rf-an-grid">
+                 <div class="rf-an-item">
+                   <div class="rf-an-label">Total Input</div>
+                   <div class="rf-an-val">{total_in:.1f} MB</div>
+                 </div>
+                 <div class="rf-an-item">
+                   <div class="rf-an-label">Total Output</div>
+                   <div class="rf-an-val good">{total_out:.1f} MB</div>
+                   <div class="rf-an-sub">{((1 - total_out/total_in)*100):.1f}% smaller</div>
+                 </div>
+                 <div class="rf-an-item">
+                   <div class="rf-an-label">Avg Compression</div>
+                   <div class="rf-an-val">{avg_ratio:.2f}x</div>
+                 </div>
+               </div>
+             </div>
+             """, unsafe_allow_html=True)
+                
+                st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+                st.markdown("<div style='font-size:11px;font-weight:700;color:var(--ink3);margin-bottom:8px;'>CLIP BREAKDOWN</div>", unsafe_allow_html=True)
+                
                 for i, r in enumerate(valid_results):
                     a = r["analytics"]
-                    sp = a.get("smoothness_pct", 0)
-                    sc = "var(--grn)" if sp > 80 else ("var(--amb)" if sp > 50 else "var(--acc)")
+                    
+                    # Extract smoothness metrics if available
+                    jitter_raw = a.get('jitter_raw', 0)
+                    jitter_smooth = a.get('jitter_smooth', 0)
+                    smoothness_pct = a.get('smoothness_pct', 0)
+                    
+                    # Determine color for smoothness score
+                    smooth_color_var = "var(--grn)" if smoothness_pct > 80 else ("var(--amb)" if smoothness_pct > 50 else "var(--acc)")
+
                     st.markdown(f"""
-                    <div style="background:var(--surf);border:1px solid var(--bdr);border-radius:var(--rs);padding:10px 12px;margin-bottom:8px;">
-                      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-                        <div style="font-size:11px;font-weight:700;">Clip {i+1}</div>
-                        <span style="color:var(--ink2);font-size:10px;">{a['input_size_mb']:.1f} MB → <b>{a['output_size_mb']:.1f} MB</b>
-                        <span style="color:var(--grn);font-weight:600;">{a['compression_ratio']:.2f}x</span></span>
-                      </div>
-                      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">
-                        <div style="text-align:center;"><div style="font-size:10px;color:var(--ink2);">Smoothness</div><div style="font-size:13px;color:{sc};font-weight:600;">{sp:.1f}%</div></div>
-                        <div style="text-align:center;"><div style="font-size:10px;color:var(--ink2);">Raw Jitter</div><div style="font-size:13px;">{a.get('jitter_raw',0):.2f}px</div></div>
-                        <div style="text-align:center;"><div style="font-size:10px;color:var(--ink2);">Smoothed</div><div style="font-size:13px;">{a.get('jitter_smooth',0):.2f}px</div></div>
-                      </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                 <div style="background:var(--surf);border:1px solid var(--bdr);border-radius:var(--rs);
+                padding:10px 12px;margin-bottom:8px;">
+                   <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                     <div style="font-size:11px;font-weight:700;color:var(--ink);">Clip {i+1}</div>
+                     <div style="display:flex; gap:10px; font-size:10px;">
+                       <span style="color:var(--ink2);">{a['input_size_mb']:.1f} MB → <b>{a['output_size_mb']:.1f} MB</b></span>
+                       <span style="color:var(--grn); font-weight:600;">{a['compression_ratio']:.2f}x</span>
+                     </div>
+                   </div>
+                   
+                   <!-- Smoothness Metrics Row -->
+                   <div style="margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--bdr);">
+                     <div style="font-size:9px; font-weight:700; color:var(--ink3); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:4px;">
+                       Camera Stability {st.session_state.get('sport_type', '').title() + ' · ' if st.session_state.get('sport_type') else ''}Kalman: {a.get('kalman_predictions', 0)}
+                     </div>
+                     <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:8px;">
+                       <div style="text-align:center;">
+                         <div style="font-size:10px; color:var(--ink2);">Smoothness</div>
+                         <div style="font-family:'DM Serif Display',serif; font-size:13px; color:{smooth_color_var}; font-weight:600;">{smoothness_pct:.1f}%</div>
+                       </div>
+                       <div style="text-align:center;">
+                         <div style="font-size:10px; color:var(--ink2);">Raw Jitter</div>
+                         <div style="font-family:'DM Serif Display',serif; font-size:13px; color:var(--ink);">{jitter_raw:.2f}px</div>
+                       </div>
+                       <div style="text-align:center;">
+                         <div style="font-size:10px; color:var(--ink2);">Smoothed</div>
+                         <div style="font-family:'DM Serif Display',serif; font-size:13px; color:var(--ink);">{jitter_smooth:.2f}px</div>
+                       </div>
+                     </div>
+                   </div>
+                 </div>
+                 """, unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="rf-info">No analytics data available yet. Process clips to see stats.</div>', unsafe_allow_html=True)
         else:
             st.markdown('<div class="rf-empty" style="min-height:120px;padding:20px;"><div class="rf-empty-s">Process clips to view analytics</div></div>', unsafe_allow_html=True)
 
-st.markdown("</div>", unsafe_allow_html=True)
+st.markdown("</div>", unsafe_allow_html=True)  # close settings div
 
-# Settings fingerprint
+# Settings fingerprint for change detection
 current_settings = dict(
     app_mode=app_mode, tracking_mode=tracking_mode,
     sport_type=st.session_state.get("sport_type", "auto"),
@@ -709,7 +758,7 @@ current_settings = dict(
     burn_subtitles=burn_subtitles,
     whisper_model=whisper_model if burn_subtitles else "",
     audio_bitrate_label=audio_bitrate_label,
-    draw_tracking_boxes=draw_tracking_boxes,
+    # v4.1 panel settings
     panel_mode_override=st.session_state.get("panel_mode_override", "auto"),
     panel_max_motion=st.session_state.get("panel_max_motion", 20.0),
     panel_min_area=st.session_state.get("panel_min_area", 0.03),
@@ -718,7 +767,8 @@ current_settings = dict(
 )
 _invalidate_if_changed(current_settings)
 
-st.markdown("<div style='height:2px;background:var(--bdr);margin:10px 0 0'></div>", unsafe_allow_html=True)
+st.markdown("<div style='height:2px;background:var(--bdr);margin:10px 0 0'></div>",
+            unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Two-column layout: source | output
@@ -730,15 +780,18 @@ with col_src:
     st.markdown("<div class='rf-panel'>", unsafe_allow_html=True)
     st.markdown('<div class="rf-sec">Source Video</div>', unsafe_allow_html=True)
     max_mb = 2000 if app_mode == "autoClip" else 500
-    uploaded_file = st.file_uploader("Drop video", type=["mp4","mov","avi","mkv"], label_visibility="collapsed")
+    uploaded_file = st.file_uploader("Drop video",
+                                     type=["mp4", "mov", "avi", "mkv"], label_visibility="collapsed")
 
     if uploaded_file is not None:
-        mb = len(uploaded_file.getvalue()) / (1024**2)
+        mb = len(uploaded_file.getvalue()) / (1024 ** 2)
         if mb > max_mb:
-            st.markdown(f'<div class="rf-warn">⚠ {mb:.1f} MB — max {max_mb} MB.</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="rf-warn">⚠ {mb:.1f} MB — max {max_mb} MB.</div>',
+                        unsafe_allow_html=True)
             uploaded_file = None
 
-    if (uploaded_file is not None and st.session_state.uploaded_file_name != uploaded_file.name):
+    if (uploaded_file is not None
+            and st.session_state.uploaded_file_name != uploaded_file.name):
         _cleanup()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
             tmp.write(uploaded_file.getvalue())
@@ -753,285 +806,376 @@ with col_src:
     if uploaded_file is not None and st.session_state.input_path:
         info = st.session_state.video_info
         if info and not info["is_landscape"]:
-            st.markdown('<div class="rf-warn">⚠ Video is already vertical. Upload a landscape video.</div>', unsafe_allow_html=True)
-        mb_str = f"{len(uploaded_file.getvalue())/(1024**2):.1f} MB"
-        st.markdown(f'<div class="rf-chip"><span>🎬</span><strong>{uploaded_file.name}</strong><span style="color:var(--bdr2)">·</span><span>{mb_str}</span></div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div class="rf-warn">⚠ Video is already vertical. Upload a landscape video.</div>',
+                unsafe_allow_html=True)
+        mb_str = f"{len(uploaded_file.getvalue()) / (1024**2):.1f} MB"
+        st.markdown(
+            f'<div class="rf-chip"><span>🎬</span>'
+            f'<strong>{uploaded_file.name}</strong>'
+            f'<span style="color:var(--bdr2)">·</span>'
+            f'<span>{mb_str}</span></div>',
+            unsafe_allow_html=True)
         st.video(uploaded_file)
+
         if info:
-            dur = info["duration_seconds"]; mins, secs = int(dur//60), int(dur%60)
+            dur = info["duration_seconds"]
+            mins, secs = int(dur // 60), int(dur % 60)
             dur_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
-            eff_w, eff_h = resolve_target_size(resolution_label, info["width"], info["height"])
+            eff_w, eff_h = resolve_target_size(
+                resolution_label, info["width"], info["height"])
             st.markdown(f"""
-            <div class='rf-metrics' style='margin-top:10px;'>
-              <div class='rf-m'><div class='rf-ml'>Duration</div><div class='rf-mv'>{dur_str}</div></div>
-              <div class='rf-m'><div class='rf-ml'>Source</div><div class='rf-mv'>{info['width']}×{info['height']}</div></div>
-              <div class='rf-m'><div class='rf-ml'>Output</div><div class='rf-mv a'>{eff_w}×{eff_h}</div></div>
-              <div class='rf-m'><div class='rf-ml'>FPS</div><div class='rf-mv'>{info['fps']:.0f}</div></div>
-            </div>
-            """, unsafe_allow_html=True)
+         <div class='rf-metrics' style='margin-top:10px;'>
+           <div class='rf-m'><div class='rf-ml'>Duration</div>
+             <div class='rf-mv'>{dur_str}</div></div>
+           <div class='rf-m'><div class='rf-ml'>Source</div>
+             <div class='rf-mv'>{info['width']}×{info['height']}</div></div>
+           <div class='rf-m'><div class='rf-ml'>Output</div>
+             <div class='rf-mv a'>{eff_w}×{eff_h}</div></div>
+           <div class='rf-m'><div class='rf-ml'>FPS</div>
+             <div class='rf-mv'>{info['fps']:.0f}</div></div>
+         </div>
+         """, unsafe_allow_html=True)
+
             if app_mode == "autoClip" and dur < 60:
-                st.markdown('<div class="rf-warn" style="margin-top:8px;">⚠ Auto-Clip works best on videos ≥ 2 minutes.</div>', unsafe_allow_html=True)
+                st.markdown(
+                    '<div class="rf-warn" style="margin-top:8px;">⚠ Auto-Clip works best on videos ≥ 2 minutes.</div>',
+                    unsafe_allow_html=True)
+
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ─── Output column ─────────────────────────────────────────────────────────────
 with col_out:
     st.markdown("<div class='rf-panelr'>", unsafe_allow_html=True)
-
-    # ── SINGLE CLIP OUTPUT ────────────────────────────────────────────────────
+    
+    # ─── SINGLE CLIP OUTPUT ───────────────────────────────────────────────
     if app_mode == "single":
         st.markdown('<div class="rf-sec">Output · 9:16</div>', unsafe_allow_html=True)
-        if st.session_state.processing_done and st.session_state.output_bytes:
-            out_mb = len(st.session_state.output_bytes) / (1024**2)
-            st.markdown(f'<div class="rf-ok">✓ Done — {out_mb:.1f} MB</div>', unsafe_allow_html=True)
-            st.video(st.session_state.output_bytes, format="video/mp4")
 
+        if st.session_state.processing_done and st.session_state.output_bytes:
+            out_mb = len(st.session_state.output_bytes) / (1024 ** 2)
+            st.markdown(f'<div class="rf-ok">✓ Done — {out_mb:.1f} MB</div>',
+                        unsafe_allow_html=True)
+            st.video(st.session_state.output_bytes, format="video/mp4")
+            
+            # ANALYTICS SECTION
             if st.session_state.analytics_data:
                 a = st.session_state.analytics_data
-                red_pct = a["file_size_reduction_pct"]; ratio = a["compression_ratio"]
-                if a.get("panel_mode"):
-                    st.markdown('<div class="rf-ok">🎛 Panel mode active — 2-row vertical split</div>', unsafe_allow_html=True)
-                sp = a.get("smoothness_pct", 0)
-                sc = "var(--grn)" if sp > 80 else ("var(--amb)" if sp > 50 else "var(--acc)")
+                red_pct = a['file_size_reduction_pct']
+                ratio = a['compression_ratio']
 
-                # Show tracking box status for sports
-                if tracking_mode == "sports_action":
-                    box_status = "ON" if draw_tracking_boxes else "OFF"
-                    box_color  = "var(--acc)" if draw_tracking_boxes else "var(--ink3)"
-                    st.markdown(f"""
-                    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;font-size:11px;">
-                      <span style="color:var(--ink3);">Tracking brackets:</span>
-                      <span style="font-weight:700;color:{box_color};">{box_status}</span>
-                      <span style="color:var(--ink3);">·</span>
-                      <span style="color:var(--ink3);">Ball sync: exact per-frame (v6.2)</span>
-                    </div>
-                    """, unsafe_allow_html=True)
+                # v4.1: Show panel mode status
+                if a.get('panel_mode'):
+                    st.markdown('<div class="rf-ok">🎛 Panel mode active — 2-row vertical split</div>', unsafe_allow_html=True)
+                elif st.session_state.get('panel_mode_override') == 'force_on':
+                    st.markdown('<div class="rf-warn">🎛 Panel mode forced ON but not detected in output</div>', unsafe_allow_html=True)
+                
+                # Extract smoothness metrics if available
+                jitter_raw = a.get('jitter_raw', 0)
+                jitter_smooth = a.get('jitter_smooth', 0)
+                smoothness_pct = a.get('smoothness_pct', 0)
+                
+                # Determine color for smoothness score
+                smooth_class = "good" if smoothness_pct > 80 else ("amb" if smoothness_pct > 50 else "bad")
+                smooth_color_var = "var(--grn)" if smoothness_pct > 80 else ("var(--amb)" if smoothness_pct > 50 else "var(--acc)")
 
                 st.markdown(f"""
-                <div class="rf-analytics">
-                  <div class="rf-an-title">📊 Conversion Analytics</div>
-                  <div class="rf-an-grid">
-                    <div class="rf-an-item">
-                      <div class="rf-an-label">Size Reduction</div>
-                      <div class="rf-an-val {'good' if red_pct>0 else 'bad'}">{red_pct:.1f}%</div>
-                      <div class="rf-an-sub">{a['input_size_mb']:.1f} MB → {a['output_size_mb']:.1f} MB</div>
-                    </div>
-                    <div class="rf-an-item">
-                      <div class="rf-an-label">Compression</div>
-                      <div class="rf-an-val">{ratio:.2f}x</div>
-                      <div class="rf-an-sub">{a['input_bitrate_kbps']} kbps → {a['output_bitrate_kbps']} kbps</div>
-                    </div>
-                    <div class="rf-an-item">
-                      <div class="rf-an-label">Resolution</div>
-                      <div class="rf-an-val">{a['output_resolution']}</div>
-                      <div class="rf-an-sub">{a['input_resolution']} source</div>
-                    </div>
-                  </div>
-                  <div style="margin-top:12px;border-top:1px solid var(--bdr);padding-top:12px;">
-                    <div style="font-size:10px;font-weight:700;color:var(--ink3);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px;">
-                      Camera Stability {f"· 🏀 {st.session_state.get('sport_type','').title()}" if st.session_state.get('sport_type') else ""}
-                    </div>
-                    <div class="rf-an-grid">
-                      <div class="rf-an-item">
-                        <div class="rf-an-label">Smoothness Score</div>
-                        <div class="rf-an-val" style="color:{sc}">{sp:.1f}%</div>
-                        <div class="rf-an-sub">Jitter reduction</div>
-                      </div>
-                      <div class="rf-an-item">
-                        <div class="rf-an-label">Raw Jitter</div>
-                        <div class="rf-an-val">{a.get('jitter_raw',0):.2f} px</div>
-                        <div class="rf-an-sub">Avg frame-to-frame</div>
-                      </div>
-                      <div class="rf-an-item">
-                        <div class="rf-an-label">Smoothed Jitter</div>
-                        <div class="rf-an-val">{a.get('jitter_smooth',0):.2f} px</div>
-                        <div class="rf-an-sub">After processing</div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-                """, unsafe_allow_html=True)
+             <div class="rf-analytics">
+               <div class="rf-an-title">📊 Conversion Analytics</div>
+               <div class="rf-an-grid">
+                 <div class="rf-an-item">
+                   <div class="rf-an-label">Size Reduction</div>
+                   <div class="rf-an-val {'good' if red_pct > 0 else 'bad'}">{red_pct:.1f}%</div>
+                   <div class="rf-an-sub">{a['input_size_mb']:.1f} MB → {a['output_size_mb']:.1f} MB</div>
+                 </div>
+                 <div class="rf-an-item">
+                   <div class="rf-an-label">Compression</div>
+                   <div class="rf-an-val">{ratio:.2f}x</div>
+                   <div class="rf-an-sub">{a['input_bitrate_kbps']} kbps → {a['output_bitrate_kbps']} kbps</div>
+                 </div>
+                 <div class="rf-an-item">
+                   <div class="rf-an-label">Resolution</div>
+                   <div class="rf-an-val">{a['output_resolution']}</div>
+                   <div class="rf-an-sub">{a['input_resolution']} source</div>
+                 </div>
+               </div>
+               
+               <!-- New Smoothness Metrics Row -->
+               <div style="margin-top: 12px; border-top: 1px solid var(--bdr); padding-top: 12px;">
+                 <div style="font-size: 10px; font-weight: 700; color: var(--ink3); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px;">
+                   Camera Stability {f"· 🏀 {st.session_state.get('sport_type', '').title()}" if st.session_state.get('sport_type') else ""}
+                 </div>
+                 <div class="rf-an-grid">
+                   <div class="rf-an-item">
+                     <div class="rf-an-label">Smoothness Score</div>
+                     <div class="rf-an-val" style="color: {smooth_color_var}">{smoothness_pct:.1f}%</div>
+                     <div class="rf-an-sub">Jitter reduction</div>
+                   </div>
+                   <div class="rf-an-item">
+                     <div class="rf-an-label">Raw Jitter</div>
+                     <div class="rf-an-val">{jitter_raw:.2f} px</div>
+                     <div class="rf-an-sub">Avg frame-to-frame</div>
+                   </div>
+                   <div class="rf-an-item">
+                     <div class="rf-an-label">Smoothed Jitter</div>
+                     <div class="rf-an-val">{jitter_smooth:.2f} px</div>
+                     <div class="rf-an-sub">After processing {f"(Kalman: {a.get('kalman_predictions', 0)})" if a.get('kalman_predictions', 0) else ""}</div>
+                   </div>
+                 </div>
+               </div>
+             </div>
+             """, unsafe_allow_html=True)
 
             st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
             stem = os.path.splitext(st.session_state.uploaded_file_name or "video")[0]
-            st.download_button("↓  Download vertical video", data=st.session_state.output_bytes,
-                               file_name=f"{stem}_vertical.mp4", mime="video/mp4", use_container_width=True)
+            st.download_button(
+                "↓  Download vertical video",
+                data=st.session_state.output_bytes,
+                file_name=f"{stem}_vertical.mp4",
+                mime="video/mp4",
+                use_container_width=True)
             if st.session_state.srt_bytes:
-                st.download_button("↓  Download subtitles (.srt)", data=st.session_state.srt_bytes,
-                                   file_name=f"{stem}.srt", mime="text/plain", use_container_width=True)
+                st.download_button(
+                    "↓  Download subtitles (.srt)",
+                    data=st.session_state.srt_bytes,
+                    file_name=f"{stem}.srt",
+                    mime="text/plain",
+                    use_container_width=True)
         else:
             st.markdown("""
-            <div class="rf-empty">
-              <div class="rf-empty-icon">📱</div>
-              <div class="rf-empty-h">Vertical output</div>
-              <div class="rf-empty-s">appears here after conversion</div>
-            </div>
-            """, unsafe_allow_html=True)
+         <div class="rf-empty">
+           <div class="rf-empty-icon">📱</div>
+           <div class="rf-empty-h">Vertical output</div>
+           <div class="rf-empty-s">appears here after conversion</div>
+         </div>
+         """, unsafe_allow_html=True)
 
-    # ── AUTO-CLIP PANEL ────────────────────────────────────────────────────────
+    # ─── AUTO-CLIP PANEL ──────────────────────────────────────────────────
     else:
         st.markdown('<div class="rf-sec">Detected Clips</div>', unsafe_allow_html=True)
 
         if not st.session_state.scan_done:
             st.markdown("""
-            <div class="rf-empty">
-              <div class="rf-empty-icon">🔍</div>
-              <div class="rf-empty-h">Scan first</div>
-              <div class="rf-empty-s">AI will detect high-engagement segments</div>
-            </div>
-            """, unsafe_allow_html=True)
+         <div class="rf-empty">
+           <div class="rf-empty-icon">🔍</div>
+           <div class="rf-empty-h">Scan first</div>
+           <div class="rf-empty-s">AI will detect high-engagement segments</div>
+         </div>
+         """, unsafe_allow_html=True)
 
         elif st.session_state.detected_clips:
             clips = st.session_state.detected_clips
             if st.session_state.selected_clip_indices is None:
                 st.session_state.selected_clip_indices = set(range(len(clips)))
             sel = st.session_state.selected_clip_indices
-            st.markdown(f"<div style='font-size:11px;color:var(--ink3);margin-bottom:8px;'>{len(clips)} clips found · {len(sel)} selected</div>", unsafe_allow_html=True)
 
+            st.markdown(
+                f"<div style='font-size:11px;color:var(--ink3);margin-bottom:8px;'>{len(clips)} clips found · {len(sel)} selected</div>",
+                unsafe_allow_html=True)
+
+            # Build index-based results map: clip_index -> result dict
+            # (reliable across reruns unlike id())
             clip_results_map: dict = {}
             if st.session_state.clip_results:
+                # clip_results are stored in selection order; map by start_sec key
                 for r in st.session_state.clip_results:
                     clip_obj = r.get("clip")
                     if clip_obj is not None:
-                        clip_results_map[(round(clip_obj.start_sec,1), round(clip_obj.end_sec,1))] = r
+                        # Key = (start_sec, end_sec) tuple — stable across reruns
+                        clip_results_map[(round(clip_obj.start_sec, 1),
+                                          round(clip_obj.end_sec, 1))] = r
 
             playing_idx = st.session_state.playing_clip_idx
-            for ci, clip in enumerate(clips):
+
+            for ci, clip in enumerate(clips): 
                 score_pct = int(clip.score * 100)
                 score_cls = "h" if clip.score > 0.7 else ("m" if clip.score > 0.4 else "")
                 is_sel    = ci in sel
                 is_playing = (playing_idx == ci)
-                clip_key  = (round(clip.start_sec,1), round(clip.end_sec,1))
+
+                # Stable key lookup
+                clip_key = (round(clip.start_sec, 1), round(clip.end_sec, 1))
                 result_for_clip = clip_results_map.get(clip_key)
-                is_done = (result_for_clip is not None and not result_for_clip.get("error")
-                           and result_for_clip.get("output_path")
-                           and os.path.exists(result_for_clip["output_path"]))
-                mins_s = int(clip.start_sec//60); secs_s = int(clip.start_sec%60)
-                mins_e = int(clip.end_sec//60);   secs_e = int(clip.end_sec%60)
+                is_done = (
+                    result_for_clip is not None
+                    and not result_for_clip.get("error")
+                    and result_for_clip.get("output_path")
+                    and os.path.exists(result_for_clip["output_path"])
+                )
+
+                mins_s   = int(clip.start_sec // 60)
+                secs_s   = int(clip.start_sec % 60)
+                mins_e   = int(clip.end_sec // 60)
+                secs_e   = int(clip.end_sec % 60)
                 time_str = f"{mins_s}:{secs_s:02d} → {mins_e}:{secs_e:02d}"
+
                 card_cls = "rf-ccard" + (" done" if is_done else (" sel" if is_sel else ""))
-                done_tag = ("<div style='margin-top:5px;font-size:10px;color:var(--grn);font-weight:700;'>✓ Converted</div>" if is_done else "")
+                done_tag = ("<div style='margin-top:5px;font-size:10px;"
+                            "color:var(--grn);font-weight:700;'>✓ Converted</div>"
+                            if is_done else "")
+
                 st.markdown(f"""
-                <div class="{card_cls}">
-                  <span class="rf-cscore {score_cls}">{score_pct}%</span>
-                  <div class="rf-ctitle">Clip {ci+1}</div>
-                  <div class="rf-cmeta">{time_str}</div>
-                  <span class="rf-cdur">{clip.duration:.0f}s</span>
-                  <span class="rf-csoi">SOI: {clip.soi_region}</span>
-                  {done_tag}
-                </div>
-                """, unsafe_allow_html=True)
+             <div class="{card_cls}">
+               <span class="rf-cscore {score_cls}">{score_pct}%</span>
+               <div class="rf-ctitle">Clip {ci+1}</div>
+               <div class="rf-cmeta">{time_str}</div>
+               <span class="rf-cdur">{clip.duration:.0f}s</span>
+               <span class="rf-csoi">SOI: {clip.soi_region}</span>
+              {done_tag}
+             </div>
+             """, unsafe_allow_html=True)
 
                 if is_done:
-                    btn_col, dl_col = st.columns([1,1])
+                    # Buttons row: Play toggle | Download
+                    btn_col, dl_col = st.columns([1, 1])
                     with btn_col:
                         play_label = "⏹ Close" if is_playing else "▶ Play 9:16"
-                        if st.button(play_label, key=f"play_{ci}", type="secondary", use_container_width=True):
+                        if st.button(play_label, key=f"play_{ci}",
+                                     type="secondary", use_container_width=True):
                             st.session_state.playing_clip_idx = -1 if is_playing else ci
                             st.rerun()
                     with dl_col:
                         try:
                             with open(result_for_clip["output_path"], "rb") as f:
                                 clip_bytes = f.read()
-                            st.download_button("↓ Download", data=clip_bytes,
-                                               file_name=f"clip_{ci+1}_vertical.mp4", mime="video/mp4",
-                                               key=f"dl_{ci}", use_container_width=True)
+                            st.download_button(
+                                "↓ Download",
+                                data=clip_bytes,
+                                file_name=f"clip_{ci+1}_vertical.mp4",
+                                mime="video/mp4",
+                                key=f"dl_{ci}",
+                                use_container_width=True)
                         except Exception:
                             pass
+
+                    # Vertical player — only for the active clip, same height as landscape player
                     if is_playing:
                         try:
                             with open(result_for_clip["output_path"], "rb") as f:
                                 clip_bytes_play = f.read()
+                            # Use columns: narrow (9:16 width) | spacer
+                            # 202px ≈ 360px * 9/16   so it matches horizontal player height
                             vcol, _ = st.columns([202, 400])
                             with vcol:
-                                st.markdown('<div class="rf-vplayer">', unsafe_allow_html=True)
+                                st.markdown('<div class="rf-vplayer">',
+                                            unsafe_allow_html=True)
                                 st.video(clip_bytes_play, format="video/mp4")
                                 st.markdown('</div>', unsafe_allow_html=True)
                         except Exception:
                             pass
+
                 else:
-                    cb_col, _ = st.columns([2,1])
+                    # Not yet converted — show include checkbox
+                    cb_col, _ = st.columns([2, 1])
                     with cb_col:
-                        toggled = st.checkbox("✓ Selected" if is_sel else "Include", value=is_sel, key=f"csel_{ci}")
+                        toggled = st.checkbox(
+                            "✓ Selected" if is_sel else "Include",
+                            value=is_sel, key=f"csel_{ci}")
                         if toggled != is_sel:
-                            if toggled: st.session_state.selected_clip_indices.add(ci)
-                            else:       st.session_state.selected_clip_indices.discard(ci)
+                            if toggled:
+                                st.session_state.selected_clip_indices.add(ci)
+                            else:
+                                st.session_state.selected_clip_indices.discard(ci)
                             st.rerun()
         else:
             st.markdown("""
-            <div class="rf-empty">
-              <div class="rf-empty-icon">🔍</div>
-              <div class="rf-empty-h">No clips found</div>
-              <div class="rf-empty-s">try adjusting clip duration in the Clips tab</div>
-            </div>
-            """, unsafe_allow_html=True)
+         <div class="rf-empty">
+           <div class="rf-empty-icon">🔍</div>
+           <div class="rf-empty-h">No clips found</div>
+           <div class="rf-empty-s">try adjusting clip duration in the Clips tab</div>
+         </div>
+         """, unsafe_allow_html=True)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Action bar
+# Action bar (only shown when a file is uploaded)
 # ─────────────────────────────────────────────────────────────────────────────
 if uploaded_file is not None and st.session_state.input_path:
     info = st.session_state.video_info
     can_go = bool(info and info.get("is_landscape", True))
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-    st.markdown("<div style='height:1px;background:var(--bdr);margin:0 20px'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:1px;background:var(--bdr);margin:0 20px'></div>",
+                unsafe_allow_html=True)
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
-    # ── SINGLE CLIP ACTIONS ───────────────────────────────────────────────────
+    # ─── SINGLE CLIP ACTIONS ──────────────────────────────────────────────
     if app_mode == "single":
         if not st.session_state.processing_done:
             a1, a2, a3 = st.columns([4, 5, 2])
             with a1:
-                go = st.button("▶  Convert to Vertical", type="primary", use_container_width=True, disabled=not can_go)
+                go = st.button("▶  Convert to Vertical",
+                               type="primary", use_container_width=True,
+                               disabled=not can_go)
             with a2:
                 if info:
-                    eff_w, eff_h = resolve_target_size(resolution_label, info["width"], info["height"])
-                    mode_t = {"talking_head": "Talking Head", "sports_action": "Sports Action"}.get(tracking_mode, "Subject")
-                    st.markdown(f"<p style='color:var(--ink3);font-size:11px;margin-top:12px;'>{mode_t} · {eff_w}×{eff_h} · CRF {crf}</p>", unsafe_allow_html=True)
+                    eff_w, eff_h = resolve_target_size(
+                        resolution_label, info["width"], info["height"])
+                    mode_t = "Talking Head" if tracking_mode == "talking_head" else "Subject"
+                    st.markdown(
+                        f"<p style='color:var(--ink3);font-size:11px;margin-top:12px;'>{mode_t} · {eff_w}×{eff_h} · CRF {crf}</p>",
+                        unsafe_allow_html=True)
             with a3:
                 if st.button("Clear", type="secondary", use_container_width=True):
-                    _cleanup(); st.session_state.uploaded_file_name = None; st.rerun()
+                    _cleanup()
+                    st.session_state.uploaded_file_name = None
+                    st.rerun()
 
             if go:
                 st.session_state.last_settings = current_settings
-                prog = st.progress(0.0); status = st.empty(); status.info("⚡ Starting…")
-                process_start_time = time.time()
-                process_start_mem  = psutil.Process(os.getpid()).memory_info().rss / (1024*1024)
+                prog   = st.progress(0.0)
+                status = st.empty()
+                status.info("⚡ Starting…")
                 try:
-                    def _cb(v, msg=""): prog.progress(min(v, 1.0)); msg and status.info(msg)
+                    def _cb(v: float, msg: str = "") -> None:
+                        prog.progress(min(v, 1.0))
+                        if msg: status.info(msg)
 
+                    # v4.0: Use process_sports_video for sports mode
                     if tracking_mode == "sports_action":
                         meta = process_sports_video(
-                            st.session_state.input_path, st.session_state.output_path,
+                            st.session_state.input_path,
+                            st.session_state.output_path,
                             sport_type=st.session_state.get("sport_type", "auto"),
                             target_preset_label=resolution_label,
-                            confidence=confidence, output_fps=output_fps,
-                            crf=crf, encoder_preset=encoder_preset_label,
-                            audio_bitrate=audio_bitrate_label, yolo_weights=yolo_weights,
-                            burn_subtitles=burn_subtitles, whisper_model=whisper_model,
+                            confidence=confidence,
+                            output_fps=output_fps,
+                            crf=crf,
+                            encoder_preset=encoder_preset_label,
+                            audio_bitrate=audio_bitrate_label,
+                            yolo_weights=yolo_weights,
+                            burn_subtitles=burn_subtitles,
+                            whisper_model=whisper_model,
                             subtitle_style_name=subtitle_style_name,
                             subtitle_max_chars=subtitle_max_chars,
-                            use_ball_tracking=use_ball_tracking,
-                            use_kalman=use_kalman,
-                            draw_tracking_boxes=draw_tracking_boxes,   # v6.2
                             progress_callback=_cb,
                         )
                     else:
                         meta = process_video(
-                            st.session_state.input_path, st.session_state.output_path,
+                            st.session_state.input_path,
+                            st.session_state.output_path,
                             target_preset_label=resolution_label,
-                            tracking_mode=tracking_mode, talking_head_bias=talking_head_bias,
-                            confidence=confidence, smooth_window=smooth_window,
-                            adaptive_smoothing=adaptive_smoothing, use_optical_flow=use_optical_flow,
-                            rule_of_thirds=rule_of_thirds, scene_cut_threshold=scene_cut_threshold,
-                            output_fps=output_fps, crf=crf, encoder_preset=encoder_preset_label,
-                            audio_bitrate=audio_bitrate_label, yolo_weights=yolo_weights,
-                            burn_subtitles=burn_subtitles, whisper_model=whisper_model,
+                            tracking_mode=tracking_mode,
+                            talking_head_bias=talking_head_bias,
+                            confidence=confidence,
+                            smooth_window=smooth_window,
+                            adaptive_smoothing=adaptive_smoothing,
+                            use_optical_flow=use_optical_flow,
+                            rule_of_thirds=rule_of_thirds,
+                            scene_cut_threshold=scene_cut_threshold,
+                            output_fps=output_fps,
+                            crf=crf,
+                            encoder_preset=encoder_preset_label,
+                            audio_bitrate=audio_bitrate_label,
+                            yolo_weights=yolo_weights,
+                            burn_subtitles=burn_subtitles,
+                            whisper_model=whisper_model,
                             whisper_language=whisper_language,
                             subtitle_style_name=subtitle_style_name,
                             subtitle_max_chars=subtitle_max_chars,
                             subtitle_translate_to=subtitle_translate_to,
                             progress_callback=_cb,
+                            # v4.1 panel mode params
                             panel_config=PanelModeConfig(
                                 split_mode=st.session_state.get("panel_mode_override", "auto"),
                                 max_person_motion=st.session_state.get("panel_max_motion", 20.0),
@@ -1045,11 +1189,11 @@ if uploaded_file is not None and st.session_state.input_path:
                     if os.path.exists(out_p) and os.path.getsize(out_p) > 0:
                         with open(out_p, "rb") as f:
                             st.session_state.output_bytes = f.read()
+                        
+                        # Store Analytics
                         if "analytics" in meta:
                             st.session_state.analytics_data = meta["analytics"]
-                            end_mem  = psutil.Process(os.getpid()).memory_info().rss / (1024*1024)
-                            st.session_state.analytics_data["system_ram_mb"]      = round(max(process_start_mem, end_mem), 1)
-                            st.session_state.analytics_data["system_cpu_avg_pct"] = round(psutil.cpu_percent(interval=None), 1)
+
                         srt_p = meta.get("subtitle_path")
                         if srt_p and os.path.exists(srt_p):
                             with open(srt_p, "rb") as f:
@@ -1067,104 +1211,168 @@ if uploaded_file is not None and st.session_state.input_path:
             r1, _, r2 = st.columns([2, 5, 2])
             with r1:
                 if st.button("← Start over", type="secondary", use_container_width=True):
-                    _cleanup(); st.session_state.uploaded_file_name = None
-                    st.session_state.processing_done = False; st.rerun()
+                    _cleanup()
+                    st.session_state.uploaded_file_name = None
+                    st.session_state.processing_done = False
+                    st.rerun()
             with r2:
                 if info and st.session_state.output_bytes:
-                    in_mb  = len(uploaded_file.getvalue()) / (1024**2)
-                    out_mb = len(st.session_state.output_bytes) / (1024**2)
+                    in_mb  = len(uploaded_file.getvalue()) / (1024 ** 2)
+                    out_mb = len(st.session_state.output_bytes) / (1024 ** 2)
                     delta  = out_mb - in_mb
                     dcol   = "var(--grn)" if delta < 0 else "var(--acc)"
-                    st.markdown(f"<p style='color:var(--ink3);font-size:11px;text-align:right;margin-top:12px;'>{out_mb:.1f} MB <span style='color:{dcol}'>({delta:+.1f} MB)</span></p>", unsafe_allow_html=True)
+                    st.markdown(
+                        f"<p style='color:var(--ink3);font-size:11px;"
+                        f"text-align:right;margin-top:12px;'>{out_mb:.1f} MB "
+                        f"<span style='color:{dcol}'>({delta:+.1f} MB)</span></p>",
+                        unsafe_allow_html=True)
 
-    # ── AUTO-CLIP ACTIONS ──────────────────────────────────────────────────────
+    # ─── AUTO-CLIP ACTIONS ────────────────────────────────────────────────
     else:
+        # Check if we have detected clips. 
+        # Note: [] is falsy, so we check specifically for None to distinguish 
+        # between "not scanned yet" and "scanned but found nothing".
         if st.session_state.detected_clips is None:
             st.session_state.scan_done = False
-
+            st.warning("Clip data missing. Please scan again.")
+            # Don't stop here, let the flow continue to the "not scan_done" block below
+            # which will render the Scan button.
+        
         if not st.session_state.scan_done:
             b1, b2, b3 = st.columns([4, 4, 2])
             with b1:
-                scan_btn = st.button("🔍  Scan for Clips", type="primary", use_container_width=True, disabled=not can_go)
+                scan_btn = st.button("🔍  Scan for Clips",
+                                     type="primary", use_container_width=True,
+                                     disabled=not can_go)
             with b2:
                 if info:
-                    dur = info["duration_seconds"]; est = max(10, dur*0.05)
-                    est_s = (f"~{int(est//60)}m {int(est%60):02d}s" if est >= 60 else f"~{int(est)}s")
-                    st.markdown(f"<p style='color:var(--ink3);font-size:11px;margin-top:12px;'>Scan est. {est_s}</p>", unsafe_allow_html=True)
+                    dur = info["duration_seconds"]
+                    est = max(10, dur * 0.05)
+                    est_s = (f"~{int(est//60)}m {int(est%60):02d}s"
+                             if est >= 60 else f"~{int(est)}s")
+                    st.markdown(
+                        f"<p style='color:var(--ink3);font-size:11px;margin-top:12px;'>Scan est. {est_s}</p>", unsafe_allow_html=True)
             with b3:
                 if st.button("Clear", type="secondary", use_container_width=True):
-                    _cleanup(); st.session_state.uploaded_file_name = None; st.rerun()
+                    _cleanup()
+                    st.session_state.uploaded_file_name = None
+                    st.rerun()
 
             if scan_btn:
-                prog = st.progress(0.0); status = st.empty(); status.info("🔍 Scanning…")
+                prog   = st.progress(0.0)
+                status = st.empty()
+                status.info("🔍 Scanning for high-engagement segments…")
                 try:
-                    def _scan_cb(v, msg=""): prog.progress(min(v, 1.0)); msg and status.info(msg)
-                    clips = detect_clips(st.session_state.input_path,
-                                        min_duration_sec=float(clip_min_dur),
-                                        max_duration_sec=float(clip_max_dur),
-                                        target_n_clips=int(clip_target_n),
-                                        model=None, confidence=confidence,
-                                        progress_callback=_scan_cb)
+                    def _scan_cb(v: float, msg: str = "") -> None:
+                        prog.progress(min(v, 1.0))
+                        if msg: status.info(msg)
+
+                    clips = detect_clips(
+                        st.session_state.input_path,
+                        min_duration_sec=float(clip_min_dur),
+                        max_duration_sec=float(clip_max_dur),
+                        target_n_clips=int(clip_target_n),
+                        model=None,
+                        confidence=confidence,
+                        progress_callback=_scan_cb,
+                    )
+                    
                     prog.progress(1.0)
+                    
+                    # Handle empty results gracefully
                     if not clips:
-                        status.warning("⚠ No clips detected. Try adjusting settings.")
+                        status.warning("⚠ No clips detected. Try adjusting clip duration settings.")
                         st.session_state.detected_clips = []
                         st.session_state.selected_clip_indices = set()
+                        st.session_state.scan_done = True
                     else:
-                        st.session_state.detected_clips        = clips
-                        st.session_state.selected_clip_indices = set(range(len(clips)))
-                        st.session_state.clip_results          = None
+                        st.session_state.detected_clips          = clips
+                        st.session_state.selected_clip_indices   = set(range(len(clips)))
+                        st.session_state.scan_done               = True
+                        # Clear old results when scanning new clips
+                        st.session_state.clip_results            = None 
                         status.success(f"✅ Found {len(clips)} clips!")
-                    st.session_state.scan_done = True
+                    
                     st.rerun()
                 except Exception as exc:
                     status.error(f"Scan error: {exc}")
-                    import traceback; print(traceback.format_exc())
+                    import traceback
+                    print(traceback.format_exc())
+
         else:
             clips = st.session_state.detected_clips or []
+            
+            # If clips list is empty, show a message and allow re-scan
             if not clips:
-                st.markdown('<div class="rf-warn">⚠ No clips detected. Adjust settings and scan again.</div>', unsafe_allow_html=True)
-                if st.button("🔄 Re-scan", type="secondary"):
-                    st.session_state.scan_done = False; st.session_state.detected_clips = None; st.rerun()
+                st.markdown('<div class="rf-warn">⚠ No clips were detected during the last scan. Please adjust settings and scan again.</div>', unsafe_allow_html=True)
+                if st.button("🔄 Adjust Settings & Re-scan", type="secondary"):
+                    st.session_state.scan_done = False
+                    st.session_state.detected_clips = None
+                    st.rerun()
                 st.stop()
 
+            # Initialize selection if not present
             if st.session_state.selected_clip_indices is None:
                 st.session_state.selected_clip_indices = set(range(len(clips)))
-            sel = st.session_state.selected_clip_indices
+            
+            sel   = st.session_state.selected_clip_indices
 
             if not st.session_state.clip_results:
                 p1, p2, p3 = st.columns([4, 3, 2])
                 with p1:
                     n_sel = len(sel)
-                    process_btn = st.button(f"▶  Verticalize {n_sel} Clip{'s' if n_sel!=1 else ''}",
-                                            type="primary", use_container_width=True, disabled=n_sel==0)
+                    process_btn = st.button(
+                        f"▶  Verticalize {n_sel} Clip{'s' if n_sel != 1 else ''}",
+                        type="primary", use_container_width=True,
+                        disabled=n_sel == 0)
                 with p2:
                     if st.button("🔄 Re-scan", type="secondary", use_container_width=True):
-                        st.session_state.scan_done = False; st.session_state.detected_clips = None
-                        st.session_state.clip_results = None; st.rerun()
+                        st.session_state.scan_done       = False
+                        st.session_state.detected_clips  = None
+                        st.session_state.clip_results    = None
+                        st.rerun()
                 with p3:
                     if st.button("Clear", type="secondary", use_container_width=True):
-                        _cleanup(); st.session_state.uploaded_file_name = None; st.rerun()
+                        _cleanup()
+                        st.session_state.uploaded_file_name = None
+                        st.rerun()
 
                 if process_btn and sel:
                     selected_clips = [clips[i] for i in sorted(sel)]
-                    out_dir = tempfile.mkdtemp(); st.session_state.clip_out_dir = out_dir
-                    prog = st.progress(0.0); status = st.empty(); status.info(f"⚡ Processing {len(selected_clips)} clips…")
-                    def _batch_cb(v, msg=""): prog.progress(min(v, 1.0)); msg and status.info(msg)
+                    out_dir = tempfile.mkdtemp()
+                    st.session_state.clip_out_dir = out_dir
+
+                    prog   = st.progress(0.0)
+                    status = st.empty()
+                    status.info(f"⚡ Processing {len(selected_clips)} clips…")
+
+                    def _batch_cb(v: float, msg: str = "") -> None:
+                        prog.progress(min(v, 1.0))
+                        if msg: status.info(msg)
+
                     try:
                         results = process_clips_batch(
-                            input_path=st.session_state.input_path, output_dir=out_dir,
-                            clips=selected_clips, target_preset_label=resolution_label,
-                            tracking_mode=tracking_mode, talking_head_bias=talking_head_bias,
-                            confidence=confidence, smooth_window=smooth_window,
-                            adaptive_smoothing=adaptive_smoothing, rule_of_thirds=rule_of_thirds,
-                            crf=crf, encoder_preset=encoder_preset_label,
-                            audio_bitrate=audio_bitrate_label, yolo_weights=yolo_weights,
-                            burn_subtitles=burn_subtitles, whisper_model=whisper_model,
+                            input_path=st.session_state.input_path,
+                            output_dir=out_dir,
+                            clips=selected_clips,
+                            target_preset_label=resolution_label,
+                            tracking_mode=tracking_mode,
+                            talking_head_bias=talking_head_bias,
+                            confidence=confidence,
+                            smooth_window=smooth_window,
+                            adaptive_smoothing=adaptive_smoothing,
+                            rule_of_thirds=rule_of_thirds,
+                            crf=crf,
+                            encoder_preset=encoder_preset_label,
+                            audio_bitrate=audio_bitrate_label,
+                            yolo_weights=yolo_weights,
+                            burn_subtitles=burn_subtitles,
+                            whisper_model=whisper_model,
                             subtitle_style_name=subtitle_style_name,
                             subtitle_max_chars=subtitle_max_chars,
+                            progress_callback=_batch_cb,
                             sport_type=st.session_state.get("sport_type", "auto"),
-                            draw_tracking_boxes=draw_tracking_boxes,  # v6.2
+                            # v4.1 panel mode params
                             panel_config=PanelModeConfig(
                                 split_mode=st.session_state.get("panel_mode_override", "auto"),
                                 max_person_motion=st.session_state.get("panel_max_motion", 20.0),
@@ -1172,57 +1380,82 @@ if uploaded_file is not None and st.session_state.input_path:
                                 max_count_variance=st.session_state.get("panel_max_variance", 2.5),
                                 stability_frac=st.session_state.get("panel_stability", 0.60),
                             ),
-                            progress_callback=_batch_cb,
                         )
-                        prog.progress(1.0); st.session_state.clip_results = results
+                        prog.progress(1.0)
+                        st.session_state.clip_results = results
                         n_ok = sum(1 for r in results if not r.get("error"))
                         status.success(f"✅ {n_ok}/{len(results)} clips converted!")
                         st.rerun()
                     except Exception as exc:
                         status.error(f"Error: {exc}")
-                        import traceback; print(traceback.format_exc())
+                        import traceback
+                        print(traceback.format_exc())
+
             else:
                 results = st.session_state.clip_results
                 n_ok = sum(1 for r in results if not r.get("error"))
+                
+                # Only show the "Ready" banner if we actually have clips detected
                 if clips:
-                    st.markdown(f'<div class="rf-ok">✓ {n_ok} clip{"s" if n_ok!=1 else ""} ready — download from the cards above</div>', unsafe_allow_html=True)
+                    st.markdown(
+                        f'<div class="rf-ok">✓ {n_ok} clip{"s" if n_ok!=1 else ""} ready — download from the cards above</div>',
+                        unsafe_allow_html=True)
+
                 rc1, rc2, rc3 = st.columns(3)
                 with rc1:
                     if st.button("← New scan", type="secondary", use_container_width=True):
-                        st.session_state.scan_done = False; st.session_state.detected_clips = None
-                        st.session_state.clip_results = None; st.session_state.playing_clip_idx = -1; st.rerun()
+                        st.session_state.scan_done      = False
+                        st.session_state.detected_clips = None
+                        st.session_state.clip_results   = None
+                        st.session_state.playing_clip_idx = -1
+                        st.rerun()
                 with rc2:
                     if st.button("← New video", type="secondary", use_container_width=True):
-                        _cleanup(); st.session_state.uploaded_file_name = None; st.rerun()
+                        _cleanup()
+                        st.session_state.uploaded_file_name = None
+                        st.rerun()
                 with rc3:
                     if st.button("🗑 Clear cache", type="secondary", use_container_width=True):
-                        _cleanup(); st.session_state.uploaded_file_name = None
-                        st.cache_data.clear(); st.rerun()
+                        _cleanup()
+                        st.session_state.uploaded_file_name = None
+                        st.cache_data.clear()
+                        st.rerun()
 else:
+    # Welcome / empty state
     st.markdown("""
-    <div style='padding:0 20px 44px;margin-top:16px;'>
-    <div style='background:var(--surf);border:2px dashed var(--bdr);border-radius:var(--r);padding:48px 28px;text-align:center;'>
-      <div style='font-family:"DM Serif Display",serif;font-size:clamp(1.5rem,3.5vw,2.2rem);
-font-weight:400;color:var(--bdr2);letter-spacing:-0.03em;margin-bottom:10px;line-height:1.1;'>
-        Drop a video to begin.
-      </div>
-      <p style='font-size:12px;color:var(--ink3);margin-bottom:16px;'>Landscape MP4 · MOV · AVI · MKV</p>
-      <div style='display:flex;gap:6px;justify-content:center;flex-wrap:wrap;'>
-        <span style='font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--ink3);padding:4px 9px;border:1px solid var(--bdr);border-radius:4px;'>MP4</span>
-        <span style='font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--ink3);padding:4px 9px;border:1px solid var(--bdr);border-radius:4px;'>MOV</span>
-        <span style='font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--ink3);padding:4px 9px;border:1px solid var(--bdr);border-radius:4px;'>AVI</span>
-        <span style='font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--ink3);padding:4px 9px;border:1px solid var(--bdr);border-radius:4px;'>MKV</span>
-      </div>
-    </div>
-    </div>
-    """, unsafe_allow_html=True)
+ <div style='padding:0 20px 44px;margin-top:16px;'>
+ <div style='background:var(--surf);border:2px dashed var(--bdr);
+border-radius:var(--r);padding:48px 28px;text-align:center;'>
+ <div style='font-family:"DM Serif Display",serif;
+font-size:clamp(1.5rem,3.5vw,2.2rem);font-weight:400;
+color:var(--bdr2);letter-spacing:-0.03em;
+margin-bottom:10px;line-height:1.1;'>
+Drop a video to begin.
+ </div>
+ <p style='font-size:12px;color:var(--ink3);margin-bottom:16px;'>
+Landscape MP4 · MOV · AVI · MKV
+ </p>
+ <div style='display:flex;gap:6px;justify-content:center;flex-wrap:wrap;'>
+ <span style='font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+color:var(--ink3);padding:4px 9px;border:1px solid var(--bdr);border-radius:4px;'>MP4</span>
+ <span style='font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+color:var(--ink3);padding:4px 9px;border:1px solid var(--bdr);border-radius:4px;'>MOV</span>
+ <span style='font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+color:var(--ink3);padding:4px 9px;border:1px solid var(--bdr);border-radius:4px;'>AVI</span>
+ <span style='font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+color:var(--ink3);padding:4px 9px;border:1px solid var(--bdr);border-radius:4px;'>MKV</span>
+ </div>
+ </div>
+ </div>
+ """, unsafe_allow_html=True)
 
 # Footer
 st.markdown("""
 <div class="rf-foot">
-  <div class="rf-tech">
-    <span>YOLOv8</span> <span>OpenCV</span> <span>Whisper</span> <span>FFmpeg</span>
-  </div>
-  <div style='font-size:10px;color:var(--bdr2);'>Reframe v6.2 · Exact ball sync</div>
-</div>
-""", unsafe_allow_html=True)
+ <div class="rf-tech">
+ <span>YOLOv8</span> <span>OpenCV</span>
+ <span>Whisper</span> <span>FFmpeg</span>
+ </div>
+ <div style='font-size:10px;color:var(--bdr2);'>Reframe · AI Vertical Video</div>
+ </div>
+ """, unsafe_allow_html=True)
