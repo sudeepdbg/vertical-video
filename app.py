@@ -269,8 +269,6 @@ _DEFAULTS = dict(
     panel_min_area=0.03,
     panel_max_variance=2.5,
     panel_stability=0.60,
-    # v6.3: tracking box toggle
-    draw_tracking_boxes=True,
 )
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -539,7 +537,7 @@ with tab_trk:
             confidence          = 0.5
             scene_cut_threshold = 0.35
     elif tracking_mode == "sports_action":
-        # v6.3 SPORTS TRACKING SETTINGS
+        # v4.0 SPORTS TRACKING SETTINGS
         st.markdown("""
         <div class="rf-info" style="margin-bottom:12px;">
         🏀 <b>Sports Mode Active</b> — Ball-aware tracking with Kalman predictive smoothing.
@@ -551,8 +549,6 @@ with tab_trk:
             smooth_window       = st.slider("Smoothness", 3, 15, 5, 1)
             confidence          = st.slider("Detection confidence", 0.10, 0.95, 0.45, 0.05)
             use_ball_tracking   = st.toggle("Ball tracking", value=True, help="Prioritize ball carrier")
-            draw_tracking_boxes = st.toggle("Show tracking boxes", value=st.session_state.get("draw_tracking_boxes", True), help="Draw ball & player overlays")
-            st.session_state.draw_tracking_boxes = draw_tracking_boxes
         with t2:
             use_optical_flow    = st.toggle("Optical flow fallback", value=True)
             rule_of_thirds      = st.toggle("Look-room / Rule-of-thirds", value=True)
@@ -674,12 +670,6 @@ if app_mode == "autoClip" and tab_analytics is not None:
                 total_out = sum(r["analytics"]["output_size_mb"] for r in valid_results)
                 avg_ratio = sum(r["analytics"]["compression_ratio"] for r in valid_results) / len(valid_results)
                 
-                # Resource Stats Aggregation
-                avg_cpu = sum(r["analytics"].get("cpu_avg_pct", 0) for r in valid_results) / len(valid_results)
-                max_cpu = max(r["analytics"].get("cpu_max_pct", 0) for r in valid_results)
-                avg_ram = sum(r["analytics"].get("ram_avg_mb", 0) for r in valid_results) / len(valid_results)
-                max_ram = max(r["analytics"].get("ram_max_mb", 0) for r in valid_results)
-
                 st.markdown(f"""
              <div class="rf-analytics">
                <div class="rf-an-title">📊 Batch Analytics</div>
@@ -697,10 +687,6 @@ if app_mode == "autoClip" and tab_analytics is not None:
                    <div class="rf-an-label">Avg Compression</div>
                    <div class="rf-an-val">{avg_ratio:.2f}x</div>
                  </div>
-               </div>
-               <div class="rf-an-grid" style="margin-top:12px; border-top:1px solid var(--bdr); padding-top:12px;">
-                    <div class="rf-an-item"><div class="rf-an-label">Avg CPU Usage</div><div class="rf-an-val">{avg_cpu:.1f}%</div><div class="rf-an-sub">Peak: {max_cpu:.1f}%</div></div>
-                    <div class="rf-an-item"><div class="rf-an-label">Avg RAM Usage</div><div class="rf-an-val">{avg_ram:.0f} MB</div><div class="rf-an-sub">Peak: {max_ram:.0f} MB</div></div>
                </div>
              </div>
              """, unsafe_allow_html=True)
@@ -750,10 +736,6 @@ if app_mode == "autoClip" and tab_analytics is not None:
                        </div>
                      </div>
                    </div>
-                   <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px; margin-top:8px; border-top:1px solid var(--bdr); padding-top:8px;">
-                         <div style="text-align:center;"><div style="font-size:10px;color:var(--ink2);">CPU Avg</div><div style="font-size:12px;">{a.get('cpu_avg_pct', 0):.1f}%</div></div>
-                         <div style="text-align:center;"><div style="font-size:10px;color:var(--ink2);">RAM Avg</div><div style="font-size:12px;">{a.get('ram_avg_mb', 0):.0f} MB</div></div>
-                      </div>
                  </div>
                  """, unsafe_allow_html=True)
             else:
@@ -782,8 +764,6 @@ current_settings = dict(
     panel_min_area=st.session_state.get("panel_min_area", 0.03),
     panel_max_variance=st.session_state.get("panel_max_variance", 2.5),
     panel_stability=st.session_state.get("panel_stability", 0.60),
-    # v6.3 tracking box toggle
-    draw_tracking_boxes=st.session_state.get("draw_tracking_boxes", True),
 )
 _invalidate_if_changed(current_settings)
 
@@ -899,12 +879,6 @@ with col_out:
                 smooth_class = "good" if smoothness_pct > 80 else ("amb" if smoothness_pct > 50 else "bad")
                 smooth_color_var = "var(--grn)" if smoothness_pct > 80 else ("var(--amb)" if smoothness_pct > 50 else "var(--acc)")
 
-                # Resource Stats
-                cpu_avg = a.get("cpu_avg_pct", 0)
-                cpu_max = a.get("cpu_max_pct", 0)
-                ram_avg = a.get("ram_avg_mb", 0)
-                ram_max = a.get("ram_max_mb", 0)
-
                 st.markdown(f"""
              <div class="rf-analytics">
                <div class="rf-an-title">📊 Conversion Analytics</div>
@@ -949,23 +923,6 @@ with col_out:
                    </div>
                  </div>
                </div>
-               <div style="margin-top: 12px; border-top: 1px solid var(--bdr); padding-top: 12px;">
-                    <div style="font-size: 10px; font-weight: 700; color: var(--ink3); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px;">
-                      System Resources
-                    </div>
-                    <div class="rf-an-grid">
-                      <div class="rf-an-item">
-                        <div class="rf-an-label">CPU Usage</div>
-                        <div class="rf-an-val">{cpu_avg:.1f}%</div>
-                        <div class="rf-an-sub">Peak: {cpu_max:.1f}%</div>
-                      </div>
-                      <div class="rf-an-item">
-                        <div class="rf-an-label">RAM Usage</div>
-                        <div class="rf-an-val">{ram_avg:.0f} MB</div>
-                        <div class="rf-an-sub">Peak: {ram_max:.0f} MB</div>
-                      </div>
-                    </div>
-                  </div>
              </div>
              """, unsafe_allow_html=True)
 
@@ -1053,7 +1010,7 @@ with col_out:
                 time_str = f"{mins_s}:{secs_s:02d} → {mins_e}:{secs_e:02d}"
 
                 card_cls = "rf-ccard" + (" done" if is_done else (" sel" if is_sel else ""))
-                done_tag = ("<<div style='margin-top:5px;font-size:10px;"
+                done_tag = ("<div style='margin-top:5px;font-size:10px;"
                             "color:var(--grn);font-weight:700;'>✓ Converted</div>"
                             if is_done else "")
 
@@ -1174,7 +1131,7 @@ if uploaded_file is not None and st.session_state.input_path:
                         prog.progress(min(v, 1.0))
                         if msg: status.info(msg)
 
-                    # v6.3: Use process_sports_video for sports mode
+                    # v4.0: Use process_sports_video for sports mode
                     if tracking_mode == "sports_action":
                         meta = process_sports_video(
                             st.session_state.input_path,
@@ -1191,7 +1148,6 @@ if uploaded_file is not None and st.session_state.input_path:
                             whisper_model=whisper_model,
                             subtitle_style_name=subtitle_style_name,
                             subtitle_max_chars=subtitle_max_chars,
-                            draw_tracking_boxes=st.session_state.get("draw_tracking_boxes", True),
                             progress_callback=_cb,
                         )
                     else:
@@ -1285,10 +1241,7 @@ if uploaded_file is not None and st.session_state.input_path:
         if not st.session_state.scan_done:
             b1, b2, b3 = st.columns([4, 4, 2])
             with b1:
-                scan_btn = st.button(" Let me continue with the rest of the file that was cut off:
-
-```python
-🔍  Scan for Clips",
+                scan_btn = st.button("🔍  Scan for Clips",
                                      type="primary", use_container_width=True,
                                      disabled=not can_go)
             with b2:
@@ -1419,7 +1372,6 @@ if uploaded_file is not None and st.session_state.input_path:
                             subtitle_max_chars=subtitle_max_chars,
                             progress_callback=_batch_cb,
                             sport_type=st.session_state.get("sport_type", "auto"),
-                            draw_tracking_boxes=st.session_state.get("draw_tracking_boxes", True) if tracking_mode == "sports_action" else False,
                             # v4.1 panel mode params
                             panel_config=PanelModeConfig(
                                 split_mode=st.session_state.get("panel_mode_override", "auto"),
