@@ -1152,7 +1152,8 @@ if uploaded_file is not None and st.session_state.input_path:
                 p1, p2, p3 = st.columns([4, 3, 2])
                 with p1:
                     n_sel = len(sel)
-                    process_btn = st.button(f"▶  Verticalize {n_sel} Clip{'s' if n_sel!=1 else ''}",
+                    clip_plural = "s" if n_sel != 1 else ""
+                    process_btn = st.button(f"▶  Verticalize {n_sel} Clip{clip_plural}",
                                             type="primary", use_container_width=True, disabled=n_sel==0)
                 with p2:
                     if st.button("🔄 Re-scan", type="secondary", use_container_width=True):
@@ -1201,7 +1202,8 @@ if uploaded_file is not None and st.session_state.input_path:
                 results = st.session_state.clip_results
                 n_ok = sum(1 for r in results if not r.get("error"))
                 if clips:
-                    st.markdown(f'<div class="rf-ok">✓ {n_ok} clip{"s" if n_ok!=1 else ""} ready — download from the cards above</div>', unsafe_allow_html=True)
+                    ok_plural = "s" if n_ok != 1 else ""
+                    st.markdown(f'<div class="rf-ok">✓ {n_ok} clip{ok_plural} ready — download from the cards above</div>', unsafe_allow_html=True)
                 rc1, rc2, rc3 = st.columns(3)
                 with rc1:
                     if st.button("← New scan", type="secondary", use_container_width=True):
