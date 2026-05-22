@@ -675,19 +675,24 @@ if app_mode == "autoClip" and tab_analytics is not None:
                 """, unsafe_allow_html=True)
                 for i, r in enumerate(valid_results):
                     a = r["analytics"]
-                    sp = a.get("smoothness_pct", 0)
-                    sc = "var(--grn)" if sp > 80 else ("var(--amb)" if sp > 50 else "var(--acc)")
+                    sp        = a.get("smoothness_pct", 0)
+                    sc        = "var(--grn)" if sp > 80 else ("var(--amb)" if sp > 50 else "var(--acc)")
+                    in_mb     = a.get("input_size_mb", 0)
+                    out_mb_a  = a.get("output_size_mb", 0)
+                    comp      = a.get("compression_ratio", 0)
+                    jit_raw   = a.get("jitter_raw", 0)
+                    jit_smo   = a.get("jitter_smooth", 0)
                     st.markdown(f"""
                     <div style="background:var(--surf);border:1px solid var(--bdr);border-radius:var(--rs);padding:10px 12px;margin-bottom:8px;">
                       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
                         <div style="font-size:11px;font-weight:700;">Clip {i+1}</div>
-                        <span style="color:var(--ink2);font-size:10px;">{a['input_size_mb']:.1f} MB → <b>{a['output_size_mb']:.1f} MB</b>
-                        <span style="color:var(--grn);font-weight:600;">{a['compression_ratio']:.2f}x</span></span>
+                        <span style="color:var(--ink2);font-size:10px;">{in_mb:.1f} MB &rarr; <b>{out_mb_a:.1f} MB</b>
+                        &nbsp;<span style="color:var(--grn);font-weight:600;">{comp:.2f}x</span></span>
                       </div>
                       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">
                         <div style="text-align:center;"><div style="font-size:10px;color:var(--ink2);">Smoothness</div><div style="font-size:13px;color:{sc};font-weight:600;">{sp:.1f}%</div></div>
-                        <div style="text-align:center;"><div style="font-size:10px;color:var(--ink2);">Raw Jitter</div><div style="font-size:13px;">{a.get('jitter_raw',0):.2f}px</div></div>
-                        <div style="text-align:center;"><div style="font-size:10px;color:var(--ink2);">Smoothed</div><div style="font-size:13px;">{a.get('jitter_smooth',0):.2f}px</div></div>
+                        <div style="text-align:center;"><div style="font-size:10px;color:var(--ink2);">Raw Jitter</div><div style="font-size:13px;">{jit_raw:.2f}px</div></div>
+                        <div style="text-align:center;"><div style="font-size:10px;color:var(--ink2);">Smoothed</div><div style="font-size:13px;">{jit_smo:.2f}px</div></div>
                       </div>
                     </div>
                     """, unsafe_allow_html=True)
@@ -806,29 +811,40 @@ with col_out:
                     </div>
                     """, unsafe_allow_html=True)
 
+                a_in_mb   = a.get("input_size_mb", 0)
+                a_out_mb  = a.get("output_size_mb", 0)
+                a_in_kbps = a.get("input_bitrate_kbps", 0)
+                a_out_kbps= a.get("output_bitrate_kbps", 0)
+                a_out_res = a.get("output_resolution", "")
+                a_in_res  = a.get("input_resolution", "")
+                a_jit_raw = a.get("jitter_raw", 0)
+                a_jit_smo = a.get("jitter_smooth", 0)
+                size_cls  = "good" if red_pct > 0 else "bad"
+                sport_lbl = st.session_state.get("sport_type", "")
+                sport_str = f"&nbsp;&middot; 🏀 {sport_lbl.title()}" if sport_lbl else ""
                 st.markdown(f"""
                 <div class="rf-analytics">
                   <div class="rf-an-title">📊 Conversion Analytics</div>
                   <div class="rf-an-grid">
                     <div class="rf-an-item">
                       <div class="rf-an-label">Size Reduction</div>
-                      <div class="rf-an-val {'good' if red_pct>0 else 'bad'}">{red_pct:.1f}%</div>
-                      <div class="rf-an-sub">{a['input_size_mb']:.1f} MB → {a['output_size_mb']:.1f} MB</div>
+                      <div class="rf-an-val {size_cls}">{red_pct:.1f}%</div>
+                      <div class="rf-an-sub">{a_in_mb:.1f} MB &rarr; {a_out_mb:.1f} MB</div>
                     </div>
                     <div class="rf-an-item">
                       <div class="rf-an-label">Compression</div>
                       <div class="rf-an-val">{ratio:.2f}x</div>
-                      <div class="rf-an-sub">{a['input_bitrate_kbps']} kbps → {a['output_bitrate_kbps']} kbps</div>
+                      <div class="rf-an-sub">{a_in_kbps} kbps &rarr; {a_out_kbps} kbps</div>
                     </div>
                     <div class="rf-an-item">
                       <div class="rf-an-label">Resolution</div>
-                      <div class="rf-an-val">{a['output_resolution']}</div>
-                      <div class="rf-an-sub">{a['input_resolution']} source</div>
+                      <div class="rf-an-val">{a_out_res}</div>
+                      <div class="rf-an-sub">{a_in_res} source</div>
                     </div>
                   </div>
                   <div style="margin-top:12px;border-top:1px solid var(--bdr);padding-top:12px;">
                     <div style="font-size:10px;font-weight:700;color:var(--ink3);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px;">
-                      Camera Stability {f"· 🏀 {st.session_state.get('sport_type','').title()}" if st.session_state.get('sport_type') else ""}
+                      Camera Stability {sport_str}
                     </div>
                     <div class="rf-an-grid">
                       <div class="rf-an-item">
@@ -838,12 +854,12 @@ with col_out:
                       </div>
                       <div class="rf-an-item">
                         <div class="rf-an-label">Raw Jitter</div>
-                        <div class="rf-an-val">{a.get('jitter_raw',0):.2f} px</div>
+                        <div class="rf-an-val">{a_jit_raw:.2f} px</div>
                         <div class="rf-an-sub">Avg frame-to-frame</div>
                       </div>
                       <div class="rf-an-item">
                         <div class="rf-an-label">Smoothed Jitter</div>
-                        <div class="rf-an-val">{a.get('jitter_smooth',0):.2f} px</div>
+                        <div class="rf-an-val">{a_jit_smo:.2f} px</div>
                         <div class="rf-an-sub">After processing</div>
                       </div>
                     </div>
