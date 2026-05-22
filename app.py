@@ -269,6 +269,8 @@ _DEFAULTS = dict(
     panel_min_area=0.03,
     panel_max_variance=2.5,
     panel_stability=0.60,
+    # v6.3: tracking box toggle
+    draw_tracking_boxes=True,
 )
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -537,7 +539,7 @@ with tab_trk:
             confidence          = 0.5
             scene_cut_threshold = 0.35
     elif tracking_mode == "sports_action":
-        # v4.0 SPORTS TRACKING SETTINGS
+        # v6.3 SPORTS TRACKING SETTINGS
         st.markdown("""
         <div class="rf-info" style="margin-bottom:12px;">
         🏀 <b>Sports Mode Active</b> — Ball-aware tracking with Kalman predictive smoothing.
@@ -549,6 +551,8 @@ with tab_trk:
             smooth_window       = st.slider("Smoothness", 3, 15, 5, 1)
             confidence          = st.slider("Detection confidence", 0.10, 0.95, 0.45, 0.05)
             use_ball_tracking   = st.toggle("Ball tracking", value=True, help="Prioritize ball carrier")
+            draw_tracking_boxes = st.toggle("Show tracking boxes", value=st.session_state.get("draw_tracking_boxes", True), help="Draw ball & player overlays")
+            st.session_state.draw_tracking_boxes = draw_tracking_boxes
         with t2:
             use_optical_flow    = st.toggle("Optical flow fallback", value=True)
             rule_of_thirds      = st.toggle("Look-room / Rule-of-thirds", value=True)
@@ -778,6 +782,8 @@ current_settings = dict(
     panel_min_area=st.session_state.get("panel_min_area", 0.03),
     panel_max_variance=st.session_state.get("panel_max_variance", 2.5),
     panel_stability=st.session_state.get("panel_stability", 0.60),
+    # v6.3 tracking box toggle
+    draw_tracking_boxes=st.session_state.get("draw_tracking_boxes", True),
 )
 _invalidate_if_changed(current_settings)
 
@@ -1047,7 +1053,7 @@ with col_out:
                 time_str = f"{mins_s}:{secs_s:02d} → {mins_e}:{secs_e:02d}"
 
                 card_cls = "rf-ccard" + (" done" if is_done else (" sel" if is_sel else ""))
-                done_tag = ("<div style='margin-top:5px;font-size:10px;"
+                done_tag = ("<<div style='margin-top:5px;font-size:10px;"
                             "color:var(--grn);font-weight:700;'>✓ Converted</div>"
                             if is_done else "")
 
@@ -1168,7 +1174,7 @@ if uploaded_file is not None and st.session_state.input_path:
                         prog.progress(min(v, 1.0))
                         if msg: status.info(msg)
 
-                    # v4.0: Use process_sports_video for sports mode
+                    # v6.3: Use process_sports_video for sports mode
                     if tracking_mode == "sports_action":
                         meta = process_sports_video(
                             st.session_state.input_path,
@@ -1185,6 +1191,7 @@ if uploaded_file is not None and st.session_state.input_path:
                             whisper_model=whisper_model,
                             subtitle_style_name=subtitle_style_name,
                             subtitle_max_chars=subtitle_max_chars,
+                            draw_tracking_boxes=st.session_state.get("draw_tracking_boxes", True),
                             progress_callback=_cb,
                         )
                     else:
@@ -1278,7 +1285,10 @@ if uploaded_file is not None and st.session_state.input_path:
         if not st.session_state.scan_done:
             b1, b2, b3 = st.columns([4, 4, 2])
             with b1:
-                scan_btn = st.button("🔍  Scan for Clips",
+                scan_btn = st.button(" Let me continue with the rest of the file that was cut off:
+
+```python
+🔍  Scan for Clips",
                                      type="primary", use_container_width=True,
                                      disabled=not can_go)
             with b2:
@@ -1409,6 +1419,7 @@ if uploaded_file is not None and st.session_state.input_path:
                             subtitle_max_chars=subtitle_max_chars,
                             progress_callback=_batch_cb,
                             sport_type=st.session_state.get("sport_type", "auto"),
+                            draw_tracking_boxes=st.session_state.get("draw_tracking_boxes", True) if tracking_mode == "sports_action" else False,
                             # v4.1 panel mode params
                             panel_config=PanelModeConfig(
                                 split_mode=st.session_state.get("panel_mode_override", "auto"),
