@@ -663,6 +663,13 @@ if app_mode == "autoClip" and tab_analytics is not None:
                 total_in  = sum(r["analytics"]["input_size_mb"] for r in valid_results)
                 total_out = sum(r["analytics"]["output_size_mb"] for r in valid_results)
                 avg_ratio = sum(r["analytics"]["compression_ratio"] for r in valid_results) / len(valid_results)
+                
+                # Resource Stats Aggregation
+                avg_cpu = sum(r["analytics"].get("cpu_avg_pct", 0) for r in valid_results) / len(valid_results)
+                max_cpu = max(r["analytics"].get("cpu_max_pct", 0) for r in valid_results)
+                avg_ram = sum(r["analytics"].get("ram_avg_mb", 0) for r in valid_results) / len(valid_results)
+                max_ram = max(r["analytics"].get("ram_max_mb", 0) for r in valid_results)
+
                 st.markdown(f"""
                 <div class="rf-analytics">
                   <div class="rf-an-title">📊 Batch Analytics</div>
@@ -670,6 +677,10 @@ if app_mode == "autoClip" and tab_analytics is not None:
                     <div class="rf-an-item"><div class="rf-an-label">Total Input</div><div class="rf-an-val">{total_in:.1f} MB</div></div>
                     <div class="rf-an-item"><div class="rf-an-label">Total Output</div><div class="rf-an-val good">{total_out:.1f} MB</div><div class="rf-an-sub">{((1-total_out/total_in)*100):.1f}% smaller</div></div>
                     <div class="rf-an-item"><div class="rf-an-label">Avg Compression</div><div class="rf-an-val">{avg_ratio:.2f}x</div></div>
+                  </div>
+                  <div class="rf-an-grid" style="margin-top:12px; border-top:1px solid var(--bdr); padding-top:12px;">
+                    <div class="rf-an-item"><div class="rf-an-label">Avg CPU Usage</div><div class="rf-an-val">{avg_cpu:.1f}%</div><div class="rf-an-sub">Peak: {max_cpu:.1f}%</div></div>
+                    <div class="rf-an-item"><div class="rf-an-label">Avg RAM Usage</div><div class="rf-an-val">{avg_ram:.0f} MB</div><div class="rf-an-sub">Peak: {max_ram:.0f} MB</div></div>
                   </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -682,6 +693,11 @@ if app_mode == "autoClip" and tab_analytics is not None:
                     comp      = a.get("compression_ratio", 0)
                     jit_raw   = a.get("jitter_raw", 0)
                     jit_smo   = a.get("jitter_smooth", 0)
+                    
+                    # Per-clip resource stats
+                    cpu_avg_c = a.get("cpu_avg_pct", 0)
+                    ram_avg_c = a.get("ram_avg_mb", 0)
+
                     st.markdown(f"""
                     <div style="background:var(--surf);border:1px solid var(--bdr);border-radius:var(--rs);padding:10px 12px;margin-bottom:8px;">
                       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
@@ -693,6 +709,10 @@ if app_mode == "autoClip" and tab_analytics is not None:
                         <div style="text-align:center;"><div style="font-size:10px;color:var(--ink2);">Smoothness</div><div style="font-size:13px;color:{sc};font-weight:600;">{sp:.1f}%</div></div>
                         <div style="text-align:center;"><div style="font-size:10px;color:var(--ink2);">Raw Jitter</div><div style="font-size:13px;">{jit_raw:.2f}px</div></div>
                         <div style="text-align:center;"><div style="font-size:10px;color:var(--ink2);">Smoothed</div><div style="font-size:13px;">{jit_smo:.2f}px</div></div>
+                      </div>
+                      <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px; margin-top:8px; border-top:1px solid var(--bdr); padding-top:8px;">
+                         <div style="text-align:center;"><div style="font-size:10px;color:var(--ink2);">CPU Avg</div><div style="font-size:12px;">{cpu_avg_c:.1f}%</div></div>
+                         <div style="text-align:center;"><div style="font-size:10px;color:var(--ink2);">RAM Avg</div><div style="font-size:12px;">{ram_avg_c:.0f} MB</div></div>
                       </div>
                     </div>
                     """, unsafe_allow_html=True)
@@ -822,6 +842,13 @@ with col_out:
                 size_cls  = "good" if red_pct > 0 else "bad"
                 sport_lbl = st.session_state.get("sport_type", "")
                 sport_str = f"&nbsp;&middot; 🏀 {sport_lbl.title()}" if sport_lbl else ""
+                
+                # Resource Stats
+                cpu_avg = a.get("cpu_avg_pct", 0)
+                cpu_max = a.get("cpu_max_pct", 0)
+                ram_avg = a.get("ram_avg_mb", 0)
+                ram_max = a.get("ram_max_mb", 0)
+
                 st.markdown(f"""
                 <div class="rf-analytics">
                   <div class="rf-an-title">📊 Conversion Analytics</div>
@@ -861,6 +888,23 @@ with col_out:
                         <div class="rf-an-label">Smoothed Jitter</div>
                         <div class="rf-an-val">{a_jit_smo:.2f} px</div>
                         <div class="rf-an-sub">After processing</div>
+                      </div>
+                    </div>
+                  </div>
+                  <div style="margin-top:12px;border-top:1px solid var(--bdr);padding-top:12px;">
+                    <div style="font-size:10px;font-weight:700;color:var(--ink3);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px;">
+                      System Resources
+                    </div>
+                    <div class="rf-an-grid">
+                      <div class="rf-an-item">
+                        <div class="rf-an-label">CPU Usage</div>
+                        <div class="rf-an-val">{cpu_avg:.1f}%</div>
+                        <div class="rf-an-sub">Peak: {cpu_max:.1f}%</div>
+                      </div>
+                      <div class="rf-an-item">
+                        <div class="rf-an-label">RAM Usage</div>
+                        <div class="rf-an-val">{ram_avg:.0f} MB</div>
+                        <div class="rf-an-sub">Peak: {ram_max:.0f} MB</div>
                       </div>
                     </div>
                   </div>
@@ -1063,9 +1107,6 @@ if uploaded_file is not None and st.session_state.input_path:
                             st.session_state.output_bytes = f.read()
                         if "analytics" in meta:
                             st.session_state.analytics_data = meta["analytics"]
-                            end_mem  = psutil.Process(os.getpid()).memory_info().rss / (1024*1024)
-                            st.session_state.analytics_data["system_ram_mb"]      = round(max(process_start_mem, end_mem), 1)
-                            st.session_state.analytics_data["system_cpu_avg_pct"] = round(psutil.cpu_percent(interval=None), 1)
                         srt_p = meta.get("subtitle_path")
                         if srt_p and os.path.exists(srt_p):
                             with open(srt_p, "rb") as f:
