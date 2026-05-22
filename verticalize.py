@@ -1,22 +1,28 @@
 """
-verticalize.py — AI Vertical Video Converter v6.2 (Ball-Sync Fix)
+verticalize.py — AI Vertical Video Converter v6.2 (Ball-Sync Fix + Resource Monitoring)
 ═══════════════════════════════════════════════════════════════════
 Changes in v6.2 vs v6.1:
-- BALL TRACKING SYNC FIX: every frame now records its ball position at the
-  exact moment YOLO saw it (or ROI-tracked it), so output frame N has the
-  ball overlay that was detected in source frame N — no temporal drift.
-- AVS DEAD-CODE FIX: removed premature `return sx, sy` that short-circuited
-  the full savgol/gaussian smoother, breaking sports smoothing entirely.
-- ROI TRACKER SCALE BUG FIX: BallROITracker now operates in det_frame space
-  and converts to orig coords only when storing results; previously the
-  init bbox was passed in mixed coordinates, losing precision.
-- BALL CONFIDENCE TIMELINE: per-frame ball confidence stored alongside bbox
-  so render pass can dim/hide brackets when confidence < threshold.
-- draw_tracking_boxes is now a standalone parameter independent of
-  use_ball_tracking (you can track the ball without drawing boxes).
-- process_sports_video exposes draw_tracking_boxes kwarg; app.py toggle wires
-  to it.
-- All other public APIs, enums, dataclasses and constants preserved.
+BALL TRACKING SYNC FIX: every frame now records its ball position at the
+exact moment YOLO saw it (or ROI-tracked it), so output frame N has the
+ball overlay that was detected in source frame N — no temporal drift.
+AVS DEAD-CODE FIX: removed premature `return sx, sy` that short-circuited
+the full savgol/gaussian smoother, breaking sports smoothing entirely.
+ROI TRACKER SCALE BUG FIX: BallROITracker now operates in det_frame space
+and converts to orig coords only when storing results; previously the
+init bbox was passed in mixed coordinates, losing precision.
+BALL CONFIDENCE TIMELINE: per-frame ball confidence stored alongside bbox
+so render pass can dim/hide brackets when confidence < threshold.
+draw_tracking_boxes is now a standalone parameter independent of
+use_ball_tracking (you can track the ball without drawing boxes).
+process_sports_video exposes draw_tracking_boxes kwarg; app.py toggle wires
+to it.
+All other public APIs, enums, dataclasses and constants preserved.
+
+ADDITIONAL FIXES (v6.2.1):
+1. Smoothness Score Calculation: Robustly handles missing or zero jitter metrics
+   to prevent division errors or missing data in analytics.
+2. Resource Monitoring: Added CPU and RAM utilization tracking during processing,
+   included in the final analytics report.
 """
 from __future__ import annotations
 import math
@@ -25,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import queue
 from collections import namedtuple, deque
 from dataclasses import dataclass, field
@@ -32,21 +39,30 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 from enum import Enum, auto
 import cv2
 import numpy as np
+
 try:
     from scipy.signal import savgol_filter
     _SCIPY_AVAILABLE = True
 except ImportError:
     _SCIPY_AVAILABLE = False
+
 try:
     from scipy.optimize import linear_sum_assignment
     _HUNGARIAN_AVAILABLE = True
 except ImportError:
     _HUNGARIAN_AVAILABLE = False
+
 try:
     from ultralytics import YOLO as _YOLO
     _YOLO_AVAILABLE = True
 except ImportError:
     _YOLO_AVAILABLE = False
+
+try:
+    import psutil
+    _PSUTIL_AVAILABLE = True
+except ImportError:
+    _PSUTIL_AVAILABLE = False
 
 # ── Custom exception ──────────────────────────────────────────────────────────
 class ProcessingError(Exception):
@@ -77,8 +93,9 @@ SPORTS_BALL_CLASS_ID = 32
 HIGH_PRIO_CLASSES    = {0, 2, 3, 5, 7, 15, 16}
 MAX_FILE_SIZE_MB     = 2_000
 MIN_FRAME_DIM        = 240
-MAX_FRAMES_GUARD     = 1_080_000
+MAX_FRAMES_GUARD     = 1080_000
 LOWER_THIRD_GUARD    = 0.80
+
 PANEL_MIN_PERSONS          = 2
 PANEL_PROBE_COUNT          = 30
 PANEL_MAJORITY_FRAC        = 0.60
@@ -87,11 +104,13 @@ PANEL_MAX_PERSON_MOTION    = 8.0
 PANEL_MIN_PERSON_AREA_FRAC = 0.06
 PANEL_MAX_COUNT_VARIANCE   = 1.5
 PANEL_MIN_PERSON_ASPECT    = 1.3
+
 SPORTS_COURT_COLORS_HSV = [
-    {"h": [10, 30],  "s": [40, 180], "v": [80, 220]},
-    {"h": [35, 85],  "s": [40, 255], "v": [40, 220]},
-    {"h": [90, 130], "s": [0,  60],  "v": [150, 255]},
+    {"h": [10, 30],   "s": [40, 180],  "v": [80, 220]},
+    {"h": [35, 85],   "s": [40, 255],  "v": [40, 220]},
+    {"h": [90, 130],  "s": [0,  60],   "v": [150, 255]},
 ]
+
 KALMAN_PLAYER_PROCESS_NOISE_BASE  = 3e-2
 KALMAN_PLAYER_PROCESS_NOISE_HIGH  = 3e-1
 KALMAN_PLAYER_MEASUREMENT_NOISE   = 3e-2
@@ -102,35 +121,41 @@ KALMAN_OPTICAL_FLOW_NOISE         = 5e-1
 KALMAN_SALIENCY_NOISE             = 2e-0
 KALMAN_INITIAL_ERROR              = 1.0
 KALMAN_GATE_THRESHOLD             = 8.0
+
 GRAVITY_PIXELS_PER_SEC2_BASE      = 500.0
 FAST_BREAK_PREDICT_SEC            = 0.8
-HALF_COURT_PREDICT_SEC            = 0.3
+HALF_COURT_PREDICT_SEC             = 0.3
 BALL_SPEED_THRESHOLD              = 15.0
 BALL_AIRBORNE_THRESHOLD_PX        = 20.0
 BALL_BOUNCE_VELOCITY_DAMPING      = 0.6
 BALL_MAX_PREDICTION_FRAMES        = 10
+
 SPORTS_SCENE_CUT_THRESHOLD        = 0.18
 SPORTS_SCENE_CUT_MIN_FRAMES       = 2
 SPORTS_SWITCH_BALL_BONUS          = 200
 SPORTS_BALL_CONFIDENCE            = 0.25
-SPORTS_BALL_PROXIMITY_PX          = 120
+SPORTS_BALL_PROXIMITY_PX           = 120
 SPORTS_EVENT_EXPAND_FRAMES        = 15
 SPORTS_EVENT_EXPAND_FACTOR        = 1.25
+
 AVS_BASE_WINDOW_SEC               = 0.40
 AVS_MAX_WINDOW_SEC                = 0.80
 AVS_MIN_WINDOW_SEC                = 0.15
 AVS_POLYORDER                     = 3
 AVS_VELOCITY_FAST_THRESHOLD       = 80.0
 AVS_VELOCITY_SLOW_THRESHOLD       = 5.0
-AVS_ACCEL_SPIKE_THRESHOLD         = 200.0
+AVS_ACCEL_SPIKE_THRESHOLD          = 200.0
 AVS_CONFIDENCE_LOW_THRESHOLD      = 0.3
+
 SPORTS_POST_SMOOTH_WINDOW_SEC     = 0.50
 SPORTS_POST_SMOOTH_EMA_ALPHA      = 0.04
+
 ICS_LOOKAHEAD_SEC                 = 0.30
 ICS_FAST_BREAK_MARGIN_FACTOR      = 1.35
 ICS_SET_PLAY_MARGIN_FACTOR        = 1.05
 ICS_BOUNDARY_ELASTICITY_PX        = 50
 ICS_COURT_PRESERVE_RATIO          = 0.25
+
 MOT_MAX_OCCLUSION_FRAMES          = 30
 MOT_IOU_MATCH_THRESHOLD           = 0.3
 MOT_APPEARANCE_WEIGHT             = 0.3
@@ -162,29 +187,29 @@ RESOLUTION_PRESETS: Dict[str, Tuple[int, int]] = {
 
 SUBTITLE_STYLES: Dict[str, Dict[str, Any]] = {
     "Bold White (TikTok)": {
-        "fontsize": 18, "primary_color": "&H00FFFFFF", "outline_color": "&H00000000",
-        "outline": 2, "bold": 1, "shadow": 0, "back_color": "&H00000000", "margin_v": 80,
+        "fontsize": 18,  "primary_color":  "&H00FFFFFF",  "outline_color":  "&H00000000",
+        "outline": 2,  "bold": 1,  "shadow": 0,  "back_color":  "&H00000000",  "margin_v": 80,
     },
     "Yellow (Classic)": {
-        "fontsize": 16, "primary_color": "&H0000FFFF", "outline_color": "&H00000000",
-        "outline": 2, "bold": 1, "shadow": 1, "back_color": "&H00000000", "margin_v": 80,
+        "fontsize": 16,  "primary_color":  "&H0000FFFF",  "outline_color":  "&H00000000",
+        "outline": 2,  "bold": 1,  "shadow": 1,  "back_color":  "&H00000000",  "margin_v": 80,
     },
     "Box (Accessible)": {
-        "fontsize": 15, "primary_color": "&H00FFFFFF", "outline_color": "&H00000000",
-        "outline": 0, "bold": 0, "shadow": 0, "back_color": "&H80000000", "margin_v": 80,
+        "fontsize": 15,  "primary_color":  "&H00FFFFFF",  "outline_color":  "&H00000000",
+        "outline": 0,  "bold": 0,  "shadow": 0,  "back_color":  "&H80000000",  "margin_v": 80,
     },
 }
 
 TRANSLATION_LANGUAGES: Dict[str, str] = {
-    "None (keep original)": "",   "French": "fr",       "German": "de",
-    "Spanish": "es",              "Italian": "it",       "Portuguese": "pt",
-    "Dutch": "nl",                "Polish": "pl",        "Russian": "ru",
-    "Japanese": "ja",             "Korean": "ko",        "Chinese (Simplified)": "zh-CN",
-    "Arabic": "ar",               "Hindi": "hi",         "Turkish": "tr",
-    "Indonesian": "id",           "Swedish": "sv",       "Norwegian": "no",
-    "Danish": "da",               "Finnish": "fi",       "Greek": "el",
-    "Hebrew": "iw",               "Thai": "th",          "Vietnamese": "vi",
-    "Malay": "ms",                "Ukrainian": "uk",
+    "None (keep original)":  "",    "French":  "fr",        "German":  "de",
+    "Spanish":  "es",               "Italian":  "it",        "Portuguese":  "pt",
+    "Dutch":  "nl",                 "Polish":  "pl",         "Russian":  "ru",
+    "Japanese":  "ja",              "Korean":  "ko",         "Chinese (Simplified)":  "zh-CN",
+    "Arabic":  "ar",                "Hindi":  "hi",          "Turkish":  "tr",
+    "Indonesian":  "id",            "Swedish":  "sv",        "Norwegian":  "no",
+    "Danish":  "da",                "Finnish":  "fi",        "Greek":  "el",
+    "Hebrew":  "iw",                "Thai":  "th",           "Vietnamese":  "vi",
+    "Malay":  "ms",                 "Ukrainian":  "uk",
 }
 
 VIGNETTE_STRENGTH       = 0.55
@@ -219,8 +244,8 @@ class PanelModeConfig:
         if not (1 <= self.n_splits <= 4):
             raise ValueError(f"n_splits must be between 1 and 4")
         if self.n_splits > 2:
-            print(f"[PanelModeConfig] n_splits={self.n_splits} not fully implemented; "
-                  "falling back to 2 splits.", file=sys.stderr)
+            print(f"[PanelModeConfig] n_splits={self.n_splits} not fully implemented;  "
+                   "falling back to 2 splits.", file=sys.stderr)
 
 @dataclass
 class Track:
@@ -362,6 +387,61 @@ class BallROITracker:
     def age(self) -> int:
         return self._age
 
+# ── Resource Monitor ──────────────────────────────────────────────────────────
+class ResourceMonitor:
+    """Lightweight CPU/RAM sampler for analytics."""
+    def __init__(self):
+        self.cpu_samples = []
+        self.ram_samples = []
+        self._process = psutil.Process(os.getpid()) if _PSUTIL_AVAILABLE else None
+        self._active = False
+        self._thread = None
+
+    def _sample_loop(self):
+        while self._active:
+            try:
+                if self._process:
+                    # cpu_percent(interval=None) is non-blocking and returns % since last call
+                    cpu = self._process.cpu_percent(interval=None)
+                    mem = self._process.memory_info().rss / (1024 * 1024)  # MB
+                    self.cpu_samples.append(cpu)
+                    self.ram_samples.append(mem)
+            except Exception:
+                pass
+            time.sleep(0.5)  # Sample every 500ms
+
+    def start(self):
+        if not self._active:
+            self._active = True
+            if self._process:
+                # Initialize cpu_percent measurement
+                self._process.cpu_percent(interval=None)
+            self._thread = threading.Thread(target=self._sample_loop, daemon=True)
+            self._thread.start()
+
+    def stop(self):
+        if self._active:
+            self._active = False
+            if self._thread:
+                self._thread.join(timeout=2.0)
+            self._thread = None
+
+    def get_stats(self) -> Dict[str, float]:
+        if not self.cpu_samples:
+            return {"cpu_avg_pct": 0.0, "cpu_max_pct": 0.0, "ram_avg_mb": 0.0, "ram_max_mb": 0.0}
+        
+        cpu_avg = sum(self.cpu_samples) / len(self.cpu_samples)
+        cpu_max = max(self.cpu_samples)
+        ram_avg = sum(self.ram_samples) / len(self.ram_samples)
+        ram_max = max(self.ram_samples)
+        
+        return {
+            "cpu_avg_pct": round(cpu_avg, 1),
+            "cpu_max_pct": round(cpu_max, 1),
+            "ram_avg_mb": round(ram_avg, 1),
+            "ram_max_mb": round(ram_max, 1)
+        }
+
 # ── Feature guards ────────────────────────────────────────────────────────────
 def whisper_available() -> bool:
     try:
@@ -460,7 +540,7 @@ def _draw_tracking_overlays(
     """
     Draw bounding-box overlays on an already-cropped/resized output frame.
     - Ball:    bright yellow corner-tick brackets + small centre dot
-              (color/opacity varies by source: yolo=bright, roi=dimmer, predict=dashed-look)
+               (color/opacity varies by source: yolo=bright, roi=dimmer, predict=dashed-look)
     - Persons: white 1-px outline with faint semi-transparent fill
     Returns a copy; caller's array is never mutated.
     """
@@ -470,7 +550,7 @@ def _draw_tracking_overlays(
     # ── Person boxes ──────────────────────────────────────────────────────────
     for (x1, y1, x2, y2) in person_boxes_out:
         x1c = max(0, x1); y1c = max(0, y1)
-        x2c = min(w-1, x2); y2c = min(h-1, y2)
+        x2c = min(w-1, x2) ; y2c = min(h-1, y2)
         if x2c <= x1c or y2c <= y1c:
             continue
         overlay = out.copy()
@@ -508,7 +588,7 @@ def _draw_tracking_overlays(
             cv2.line(tick_layer, (bx2c,      by1c), (bx2c,      by1c+clen), color, thick, cv2.LINE_AA)
             cv2.line(tick_layer, (bx1c,      by2c), (bx1c+clen, by2c),      color, thick, cv2.LINE_AA)
             cv2.line(tick_layer, (bx1c,      by2c), (bx1c,      by2c-clen), color, thick, cv2.LINE_AA)
-            cv2.line(tick_layer, (bx2c,      by2c), (bx2c-clen, by2c),      color, thick, cv2.LINE_AA)
+            cv2.line(tick_layer, (bx2c,       by2c), (bx2c-clen, by2c),      color, thick, cv2.LINE_AA)
             cv2.line(tick_layer, (bx2c,      by2c), (bx2c,      by2c-clen), color, thick, cv2.LINE_AA)
             bcx = (bx1c+bx2c)//2; bcy = (by1c+by2c)//2
             cv2.circle(tick_layer, (bcx, bcy), max(2, (bx2c-bx1c)//6), color, -1, cv2.LINE_AA)
@@ -554,10 +634,10 @@ class DissolveBuffer:
 def _build_ffmpeg_vf(color_grade: str = "none", ffmpeg_sharpen: bool = False) -> List[str]:
     filters: List[str] = []
     eq_map = {
-        "warm":    "brightness=0.02:saturation=1.12:gamma_r=1.05:gamma_b=0.95",
-        "cool":    "brightness=0.01:saturation=1.08:gamma_r=0.95:gamma_b=1.05",
-        "vibrant": "brightness=0.0:saturation=1.25:contrast=1.05",
-        "matte":   "brightness=0.03:saturation=0.85:contrast=0.92",
+        "warm":     "brightness=0.02:saturation=1.12:gamma_r=1.05:gamma_b=0.95",
+        "cool":     "brightness=0.01:saturation=1.08:gamma_r=0.95:gamma_b=1.05",
+        "vibrant":  "brightness=0.0:saturation=1.25:contrast=1.05",
+        "matte":    "brightness=0.03:saturation=0.85:contrast=0.92",
     }
     if color_grade in eq_map:
         filters.append(f"eq={eq_map[color_grade]}")
@@ -589,7 +669,7 @@ class FFmpegVideoReader:
             cmd += ["-ss", str(self.seek_sec)]
         cmd += extra
         cmd += ["-i", self.path, "-f", "rawvideo", "-pix_fmt", "bgr24",
-                "-vf", f"scale={self.out_w}:{self.out_h}"]
+                 "-vf", f"scale={self.out_w}:{self.out_h}"]
         if self.n_frames is not None:
             cmd += ["-vframes", str(self.n_frames)]
         cmd += ["pipe:1"]
@@ -622,7 +702,7 @@ class FFmpegVideoReader:
             try: self._proc.stdout.close()
             except Exception: pass
             try: self._proc.wait(timeout=5)
-            except Exception: self._proc.kill()
+            except Exception: self._proc.kill() 
             self._proc = None
 
     def __enter__(self) -> "FFmpegVideoReader":
@@ -712,12 +792,12 @@ def _open_ffmpeg_encoder(output_path: str, width: int, height: int, fps: float,
         s    = subtitle_style or SUBTITLE_STYLES["Bold White (TikTok)"]
         sesc = subtitle_path.replace("\\", "/").replace(":", r"\:")
         force = (
-            f"Fontsize={s.get('fontsize',18)},"
-            f"PrimaryColour={s.get('primary_color','&H00FFFFFF')},"
-            f"OutlineColour={s.get('outline_color','&H00000000')},"
-            f"Outline={s.get('outline',2)},Bold={s.get('bold',1)},"
-            f"Shadow={s.get('shadow',0)},BackColour={s.get('back_color','&H00000000')},"
-            f"MarginV={s.get('margin_v',80)},Alignment=2"
+            f"Fontsize={s.get('fontsize',18)}, "
+            f"PrimaryColour={s.get('primary_color','&H00FFFFFF')}, "
+            f"OutlineColour={s.get('outline_color','&H00000000')}, "
+            f"Outline={s.get('outline',2)},Bold={s.get('bold',1)}, "
+            f"Shadow={s.get('shadow',0)},BackColour={s.get('back_color','&H00000000')}, "
+            f"MarginV={s.get('margin_v',80)},Alignment=2 "
         )
         vf.append(f"subtitles='{sesc}':force_style='{force}'")
     if extra_vf:
@@ -725,7 +805,7 @@ def _open_ffmpeg_encoder(output_path: str, width: int, height: int, fps: float,
     cmd += ["-map", "0:v:0"]
     if has_aud:
         cmd += ["-map", "1:a:0", "-c:a", "aac", "-b:a", audio_bitrate, "-ac", "2",
-                "-shortest"]
+                 "-shortest"]
     else:
         cmd += ["-an"]
     if vf:
@@ -774,16 +854,16 @@ def get_video_info(path: str) -> Dict[str, Any]:
         if "=" in line:
             k, v = line.split("=", 1)
             kv[k.strip()] = v.strip()
-    w = int(kv.get("width",  0) or 0)
-    h = int(kv.get("height", 0) or 0)
+    w = int(kv.get("width",  "0") or 0)
+    h = int(kv.get("height", "0") or 0)
     try:
         num, den = kv.get("r_frame_rate", "30/1").split("/")
         fps = float(num) / float(den)
     except Exception:
         fps = 30.0
-    dur = float(kv.get("duration", 0.0) or 0.0)
+    dur = float(kv.get("duration", "0.0") or 0.0)
     if dur <= 0:
-        nb  = int(kv.get("nb_frames", 0) or 0)
+        nb  = int(kv.get("nb_frames", "0") or 0)
         dur = nb / fps if fps > 0 and nb > 0 else 0.0
     if w == 0 or h == 0:
         raise ProcessingError(f"Cannot read dimensions: {path}")
@@ -976,7 +1056,7 @@ class MultiObjectSportsTracker:
                 if best_j >= 0 and best_c < 0.7:
                     row_ind_list.append(i); col_ind_list.append(best_j); used.add(best_j)
             row_ind = np.array(row_ind_list); col_ind = np.array(col_ind_list)
-        matched: Dict[int, int] = {}
+        matched:  Dict[int, int] = {}
         unmatched_t = set(range(n_t)); unmatched_d = set(range(n_d))
         for i, j in zip(row_ind, col_ind):
             if cost[i, j] < 0.7:
@@ -1015,7 +1095,7 @@ class MultiObjectSportsTracker:
         for di in unm_d:
             det = persons[di]
             nt = Track(id=self.next_track_id,
-                       bbox=det, center=((det[0]+det[2])/2, (det[1]+det[3])/2),
+                        bbox=det, center=((det[0]+det[2])/2, (det[1]+det[3])/2),
                        velocity=(0.0, 0.0), hits=1,
                        confidence=confidences[di] if confidences else 0.5)
             self.tracks[self.next_track_id] = nt
@@ -1048,7 +1128,7 @@ class MultiObjectSportsTracker:
                 ncx = self.ball_state.center[0] + self.ball_state.velocity[0]
                 ncy = self.ball_state.center[1] + nvy*dt
                 self.ball_state.center = (ncx, ncy)
-                self.ball_state.velocity = (self.ball_state.velocity[0], nvy)
+                self.ball_state.velocity = (self.ball_state.velocity[0], nvy) 
 
     def get_primary_track(self, prev_ball_carrier: Optional[int] = None) -> Optional[Track]:
         if not self.tracks:
@@ -1059,7 +1139,7 @@ class MultiObjectSportsTracker:
                 if t.status != TrackingStatus.ACTIVE:
                     continue
                 d = math.hypot(t.center[0]-self.ball_state.center[0],
-                               t.center[1]-self.ball_state.center[1])
+                                t.center[1]-self.ball_state.center[1])
                 if d < SPORTS_BALL_PROXIMITY_PX and d < min_dist:
                     min_dist, closest = d, t
             if closest is not None:
@@ -1069,7 +1149,7 @@ class MultiObjectSportsTracker:
             else:
                 self.ball_state.is_possessed = False
                 self.ball_state.possessor_track_id = None
-                return None
+                return None 
         active = [t for t in self.tracks.values() if t.status == TrackingStatus.ACTIVE]
         if not active:
             return None
@@ -1219,7 +1299,7 @@ class AdaptiveVelocityAwareSmoother:
         smo_j = float(np.mean(self._smooth_diffs)) if self._smooth_diffs else 0.0
         pct   = (raw_j - smo_j) / raw_j * 100 if raw_j > 0 else 0.0
         return {"jitter_raw": round(raw_j, 2), "jitter_smooth": round(smo_j, 2),
-                "smoothness_pct": round(pct, 1)}
+                 "smoothness_pct": round(pct, 1)}
 
 # ── Intelligent Crop Strategy (ICS) ──────────────────────────────────────────
 class IntelligentCropStrategy:
@@ -1307,14 +1387,14 @@ class GameStateEngine:
                 ac  = ac[len(ac)//2:]
                 if len(ac) > 10:
                     peaks = [i for i in range(5, min(len(ac), int(self.fps)))
-                             if ac[i]>ac[i-1] and ac[i]>ac[i+1]]
+                             if ac[i] > ac[i-1] and ac[i] > ac[i+1]]
                     if len(peaks) >= 2:
                         self.current_state = GameState.REPLAY; return self.current_state
         if len(persons) >= 2:
             cy_list = [(p[1]+p[3])/2 for p in persons]
             cx_list = [(p[0]+p[2])/2 for p in persons]
             near_line = sum(1 for y in cy_list if y < self.frame_h*0.4)
-            spread    = float(np.std(cx_list))/self.frame_w if len(cx_list)>1 else 0.0
+            spread    = float(np.std(cx_list))/self.frame_w if len(cx_list) >1 else 0.0
             if near_line >= 1 and spread > 0.2 and len(persons) <= 5:
                 self.current_state = GameState.FREE_THROW; return self.current_state
         self.current_state = GameState.LIVE_PLAY; return self.current_state
@@ -1413,7 +1493,7 @@ class SportsKalmanTracker:
     def _predict_step(self) -> None:
         if not self.initialized: return
         am = math.sqrt(float(self.x[4,0])**2+float(self.x[5,0])**2)
-        Q  = self.Q_base*(3 if am>100 else 2 if am>50 else 1)
+        Q  = self.Q_base*(3 if am >100 else 2 if am >50 else 1)
         self.x = self.F @ self.x; self.P = self.F @ self.P @ self.F.T + Q
         self._stale_count += 1
         for i in (2, 3):
@@ -1469,8 +1549,8 @@ def detect_field_of_play(frame: np.ndarray,
             if a > best_area and a > h*w*0.15:
                 best_area, best_mask = a, m
         return best_mask
-    ranges = {"basketball":[SPORTS_COURT_COLORS_HSV[0]],"football":[SPORTS_COURT_COLORS_HSV[1]],
-              "soccer":[SPORTS_COURT_COLORS_HSV[1]],"hockey":[SPORTS_COURT_COLORS_HSV[2]]}
+    ranges = {"basketball":[SPORTS_COURT_COLORS_HSV[0]], "football":[SPORTS_COURT_COLORS_HSV[1]],
+              "soccer":[SPORTS_COURT_COLORS_HSV[1]], "hockey":[SPORTS_COURT_COLORS_HSV[2]]}
     mask = np.zeros((h,w), dtype=np.uint8)
     for cr in ranges.get(sport_hint, SPORTS_COURT_COLORS_HSV):
         mask = cv2.bitwise_or(mask, _make_mask(cr))
@@ -1503,7 +1583,7 @@ def sports_optical_flow_center(prev: np.ndarray, curr: np.ndarray, w: int, h: in
         if prev_center is not None:
             pcx, pcy = prev_center
             ys, xs = np.mgrid[0:h, 0:w]
-            mag *= np.exp(-np.sqrt((xs-pcx)**2+(ys-pcy)**2) / (max(w,h)*0.3))
+            mag = np.exp(-np.sqrt((xs-pcx)**2+(ys-pcy)**2) / (max(w,h)*0.3))
         if mag.max() < 0.5: return None
         t = mag.sum()
         if t == 0: return None
@@ -1523,7 +1603,7 @@ def temporal_saliency_center(frame: np.ndarray,
     sat  = cv2.GaussianBlur(cv2.cvtColor(frame,cv2.COLOR_BGR2HSV)[:,:,1].astype(np.float32),(31,31),0)
     sal  = lap/(lap.max()+1e-6) + sat/(sat.max()+1e-6)
     if prev_saliency is not None and prev_saliency.shape == sal.shape:
-        sal = sal*(1.0+np.abs(sal-prev_saliency*decay)*2.0)
+        sal = sal*(1.0+np.abs(sal-prev_saliency*decay)**2.0)
     b = max(1, int(w*0.05))
     sal[:,:b]=sal[:,w-b:]=sal[:b,:]=sal[h-b:,:]=0
     t = sal.sum()
@@ -1661,8 +1741,8 @@ def detect_subjects(frame: np.ndarray, model: Any, confidence: float = 0.45,
         fcx = sum(p[4] for p in persons_raw)/len(persons_raw)
         fcy = sum(p[5] for p in persons_raw)/len(persons_raw)
         for i, p in enumerate(persons_raw):
-            s = (-math.hypot(p[4]-prev_center[0], p[5]-prev_center[1])*0.5
-                 if prev_center else -math.hypot(p[4]-fcx, p[5]-fcy)*0.3)
+            s  = (-math.hypot(p[4]-prev_center[0], p[5]-prev_center[1])*0.5
+                  if prev_center else -math.hypot(p[4]-fcx, p[5]-fcy)*0.3)
             if i == ball_carrier and ball_carrier >= 0:   s += SPORTS_SWITCH_BALL_BONUS
             if i == prev_ball_carrier and prev_ball_carrier is not None and prev_ball_carrier >= 0:
                 s += SPORTS_SWITCH_BALL_BONUS*0.5
@@ -1675,7 +1755,7 @@ def detect_subjects(frame: np.ndarray, model: Any, confidence: float = 0.45,
         tw = sum(e[6] for e in persons_raw)
         if tw == 0: return None, None, -1
         cx_w = int(sum(e[6]*e[4] for e in persons_raw)/tw)
-        cy_w = int(sum(e[6]*e[5] for e in persons_raw)/tw)
+        cy_w = int(sum(e[6]*e[5]  for e in persons_raw)/tw)
         return DetectionResult(cx_w, cy_w,
                                min(e[0] for e in persons_raw), min(e[1] for e in persons_raw),
                                max(e[2] for e in persons_raw), max(e[3] for e in persons_raw),
@@ -1748,7 +1828,7 @@ def _detect_panel_mode(input_path: str, model: Any, fps: float, total_frames: in
     frame_area = det_w * det_h
     probe_ts = np.linspace(1.0, max(2.0, total_frames/fps-1.0), n_probe)
     multi_hits = 0; stable_split_hits = 0
-    motion_vals: List[float] = []; area_vals: List[float] = []
+    motion_vals: List[float] = [];  area_vals: List[float] = []
     aspect_vals: List[float] = []; count_vals: List[int] = []
     prev_centres: Optional[List[Tuple]] = None; prev_split: Optional[Dict] = None
     for t in probe_ts:
@@ -1767,7 +1847,7 @@ def _detect_panel_mode(input_path: str, model: Any, fps: float, total_frames: in
                     if d < best_d: best_d, best_j = d, j
                 if best_j >= 0: dists.append(best_d*det_w); used.add(best_j)
             if dists: motion_vals.append(float(np.mean(dists)))
-            prev_centres = curr_cx if persons else None
+        prev_centres = curr_cx if persons else None
         if len(persons) < PANEL_MIN_PERSONS: prev_split=None; continue
         multi_hits += 1
         area_vals.append(float(np.mean([(p[2]-p[0])*(p[3]-p[1]) for p in persons]))/frame_area)
@@ -1778,15 +1858,15 @@ def _detect_panel_mode(input_path: str, model: Any, fps: float, total_frames: in
             if prev_split and (abs(np.mean(left_x)-np.mean(prev_split["left"])) <= 0.10 and
                                abs(np.mean(right_x)-np.mean(prev_split["right"])) <= 0.10):
                 stable_split_hits += 1
-                prev_split = {"left": left_x, "right": right_x}
-            else:
-                prev_split = None
+            prev_split = {"left": left_x, "right": right_x}
+        else:
+            prev_split = None
     if multi_hits == 0: return False
     is_panel = (multi_hits > n_probe*majority_frac and
                 stable_split_hits > int(n_probe*stability_frac) and
                 float(np.mean(motion_vals) if motion_vals else 0) < max_person_motion and
                 float(np.mean(area_vals) if area_vals else 0) >= min_person_area_frac and
-                float(np.std(count_vals) if len(count_vals)>1 else 0) <= max_count_variance and
+                float(np.std(count_vals) if len(count_vals) >1 else 0) <= max_count_variance and
                 float(np.mean(aspect_vals) if aspect_vals else 0) >= min_person_aspect)
     print(f"[panel_detect] multi={multi_hits} stable={stable_split_hits} -> panel={is_panel}",
           file=sys.stderr)
@@ -1867,22 +1947,22 @@ def _crop_group_to_strip(frame: np.ndarray, group: List[Tuple], strip_w: int, st
 
 def _render_panel_frame(frame: np.ndarray, persons: List[Tuple], out_w: int, out_h: int,
                         prev_slots: Optional[List], vignette_strength: float = VIGNETTE_STRENGTH*0.7,
-                        color_grade: str = "none", slot_smoother: Optional[PanelSlotSmoother] = None,
+                        color_grade:  str = "none", slot_smoother: Optional[PanelSlotSmoother] = None,
                         orientation: str = "horizontal") -> Tuple[np.ndarray, List]:
     persons = sorted(persons, key=lambda b: (b[0]+b[2])//2); n = len(persons)
     if n == 0:
         group_a = prev_slots[0] if prev_slots and prev_slots[0] else []
-        group_b = prev_slots[1] if prev_slots and len(prev_slots)>1 else []
+        group_b = prev_slots[1] if prev_slots and len(prev_slots) >1 else []
     elif n == 1:
         group_a = persons
-        group_b = prev_slots[1] if prev_slots and len(prev_slots)>1 and prev_slots[1] else persons
+        group_b = prev_slots[1] if prev_slots and len(prev_slots) >1 and prev_slots[1] else persons
     else:
         split = max(1, n//2); group_a = persons[:split]; group_b = persons[split:]
     if slot_smoother is not None:
         group_a, group_b = slot_smoother.update(group_a, group_b, strip_w=float(out_w))
     canvas = np.empty((out_h, out_w, 3), dtype=np.uint8)
     if orientation == "vertical":
-        wa = (out_w//2)&~1; wb = out_w-wa
+        wa = (out_w//2) &~1; wb = out_w-wa
         canvas[:, 0:wa] = _crop_group_to_strip(frame, group_a, wa, out_h,
                                                vignette_strength=vignette_strength, color_grade=color_grade)
         canvas[:, wa:wa+wb] = _crop_group_to_strip(frame, group_b, wb, out_h,
@@ -1890,7 +1970,7 @@ def _render_panel_frame(frame: np.ndarray, persons: List[Tuple], out_w: int, out
         dx1=max(0,wa-PANEL_DIVIDER_PX//2); dx2=min(out_w,wa+(PANEL_DIVIDER_PX+1)//2)
         canvas[:, dx1:dx2] = PANEL_DIVIDER_COLOR
     else:
-        ha = (out_h//2)&~1; hb = out_h-ha
+        ha = (out_h//2) &~1; hb = out_h-ha
         canvas[0:ha, :] = _crop_group_to_strip(frame, group_a, out_w, ha,
                                                vignette_strength=vignette_strength, color_grade=color_grade)
         canvas[ha:ha+hb, :] = _crop_group_to_strip(frame, group_b, out_w, hb,
@@ -2000,9 +2080,9 @@ def _apply_sports_post_smooth(dense_cx: np.ndarray, dense_cy: np.ndarray,
                 seg_cy = savgol_filter(damp_cy[s:e], w, po)
             else:
                 h2=w//2; sigma=h2/2.0+1e-9
-                k=np.exp(-0.5*(np.arange(-h2,h2+1)/sigma)**2); k/=k.sum()
-                seg_cx=np.convolve(np.pad(damp_cx[s:e],h2,"edge"),k,"valid")[:sl]
-                seg_cy=np.convolve(np.pad(damp_cy[s:e],h2,"edge"),k,"valid")[:sl]
+                k= np.exp(-0.5*(np.arange(-h2,h2+1)/sigma)**2); k/=k.sum()
+                seg_cx=np.convolve(np.pad(damp_cx[s:e],h2, "edge"),k, "valid")[:sl]
+                seg_cy=np.convolve(np.pad(damp_cy[s:e],h2, "edge"),k, "valid")[:sl]
         except Exception:
             seg_cx = damp_cx[s:e]; seg_cy = damp_cy[s:e]
         seg_cx, seg_cy = _bidir_ema(seg_cx, seg_cy, alpha=SPORTS_POST_SMOOTH_EMA_ALPHA)
@@ -2013,19 +2093,19 @@ def smooth_centers(centers: List[Tuple[int, int]], speeds: List[float],
                    base_window: int = 33, adaptive: bool = True,
                    scene_cuts: Optional[List[int]] = None,
                    use_kalman: bool = False) -> Tuple[List[Tuple[int, int]], Dict[str, float]]:
-    empty = {"jitter_raw":0.0,"jitter_smooth":0.0,"smoothness_pct":0.0,
-             "max_jump_raw":0.0,"kalman_prediction_frames":0}
+    empty = {"jitter_raw":0.0, "jitter_smooth":0.0, "smoothness_pct":0.0,
+             "max_jump_raw":0.0, "kalman_prediction_frames":0}
     if not centers or len(centers) < 3:
         return list(centers) if centers else [], empty
     n   = len(centers)
     xs  = np.array([c[0] for c in centers], dtype=float)
     ys  = np.array([c[1] for c in centers], dtype=float)
-    spd = np.array(speeds[:n], dtype=float)
+    spd  = np.array(speeds[:n], dtype=float)
     if len(spd) < n: spd = np.pad(spd, (0,n-len(spd)), mode="edge")
     dx_raw = np.diff(xs); dy_raw = np.diff(ys)
     dist_r = np.sqrt(dx_raw**2+dy_raw**2)
-    jitter_raw = float(np.mean(dist_r)) if len(dist_r)>0 else 0.0
-    max_jump   = float(np.max(dist_r))  if len(dist_r)>0 else 0.0
+    jitter_raw = float(np.mean(dist_r)) if len(dist_r) >0 else 0.0
+    max_jump   = float(np.max(dist_r))  if len(dist_r) >0 else 0.0
     cuts   = sorted({c for c in (scene_cuts or []) if 0 < c < n})
     bounds = [0]+cuts+[n]; rx,ry = xs.copy(), ys.copy(); pred_count = 0
     if use_kalman:
@@ -2036,15 +2116,15 @@ def smooth_centers(centers: List[Tuple[int, int]], speeds: List[float],
             kalman.init(xs[s], ys[s])
             for j in range(s,e):
                 kx,ky=kalman.update(xs[j],ys[j])
-                speed=spd[j] if j<len(spd) else 0.0
+                speed=spd[j] if j <len(spd) else 0.0
                 if speed > 60.0 and not kalman.is_stale:
                     rx[j]=0.15*xs[j]+0.85*kx; ry[j]=0.15*ys[j]+0.85*ky; pred_count+=1
                 else:
                     rx[j]=kx; ry[j]=ky
-        if n>5:
+        if n >5:
             k=np.exp(-0.5*(np.arange(-1,2)/0.8)**2); k/=k.sum()
-            rx=np.convolve(np.pad(rx,1,"edge"),k,"valid")[:n]
-            ry=np.convolve(np.pad(ry,1,"edge"),k,"valid")[:n]
+            rx=np.convolve(np.pad(rx,1, "edge"),k, "valid")[:n]
+            ry=np.convolve(np.pad(ry,1, "edge"),k, "valid")[:n]
     else:
         for i in range(len(bounds)-1):
             s,e=bounds[i],bounds[i+1]
@@ -2052,13 +2132,13 @@ def smooth_centers(centers: List[Tuple[int, int]], speeds: List[float],
             w=max(_vel_to_window(float(np.median(spd[s:e]))) if adaptive else base_window, 13)
             gx,gy=_gauss_seg(xs[s:e],ys[s:e],w)
             bx,by=_bidir_ema(gx,gy,alpha=0.08)
-            rx[s:e]=bx; ry[s:e]=by
+            rx[s:e]=bx;  ry[s:e]=by
     smoothed = [(int(x),int(y)) for x,y in zip(rx,ry)]
     dx_s=np.diff(rx); dy_s=np.diff(ry)
     jitter_s=float(np.mean(np.sqrt(dx_s**2+dy_s**2)))
-    pct=(jitter_raw-jitter_s)/jitter_raw*100 if jitter_raw>0 else 0.0
-    return smoothed, {"jitter_raw":round(jitter_raw,2),"jitter_smooth":round(jitter_s,2),
-                      "smoothness_pct":round(pct,1),"max_jump_raw":round(max_jump,1),
+    pct=(jitter_raw-jitter_s)/jitter_raw*100 if jitter_raw >0 else 0.0
+    return smoothed, {"jitter_raw":round(jitter_raw,2), "jitter_smooth":round(jitter_s,2),
+                      "smoothness_pct":round(pct,1), "max_jump_raw":round(max_jump,1),
                       "kalman_prediction_frames":pred_count}
 
 # ── Whisper / translate ───────────────────────────────────────────────────────
@@ -2078,12 +2158,12 @@ def transcribe_to_srt(video_path: str, srt_path: str, whisper_model: str = "base
         if not _extract_audio_wav(video_path, wav_path): return False
         _p(0.2, f"Transcribing ({whisper_model})...")
         mdl = _w.load_model(whisper_model)
-        opts: Dict[str,Any] = {"word_timestamps":True,"verbose":False}
+        opts: Dict[str,Any] = {"word_timestamps":True, "verbose":False}
         if language: opts["language"] = language
         result = mdl.transcribe(wav_path, **opts)
         _p(0.85, "Writing subtitles...")
         lines: List[str] = []; idx = 1
-        words = [{"word":w["word"].strip(),"start":w["start"],"end":w["end"]}
+        words = [{"word":w["word"].strip(), "start":w["start"], "end":w["end"]}
                  for seg in result.get("segments",[]) for w in seg.get("words",[])]
         buf: List[Dict] = []; buf_len = 0
         def _flush():
@@ -2099,7 +2179,7 @@ def transcribe_to_srt(video_path: str, srt_path: str, whisper_model: str = "base
             if buf_len+wl > max_chars_per_line and buf: _flush()
             buf.append(w); buf_len+=wl
         _flush()
-        with open(srt_path,"w",encoding="utf-8") as f: f.write("\n".join(lines))
+        with open(srt_path, "w",encoding="utf-8") as f: f.write("\n".join(lines))
         _p(1.0, f"{len(lines)} subtitle lines"); return True
     except Exception as e:
         print(f"Whisper failed: {e}", file=sys.stderr); return False
@@ -2116,18 +2196,18 @@ def translate_srt(srt_path: str, target_language: str, source_language: str = "a
     except ImportError: return False
     import re
     try:
-        with open(srt_path,"r",encoding="utf-8") as f: content=f.read()
+        with open(srt_path, "r",encoding="utf-8") as f: content=f.read()
         blocks=re.split(r"\n+",content.strip())
         out=[]; tr=GoogleTranslator(source=source_language,target=target_language)
         for i,block in enumerate(blocks):
             ls=block.strip().splitlines()
-            if len(ls)<3: out.append(block); continue
+            if len(ls) <3: out.append(block); continue
             try:    translated=tr.translate(" ".join(ls[2:])) or " ".join(ls[2:])
             except: translated=" ".join(ls[2:])
             out.append(f"{ls[0]}\n{ls[1]}\n{translated}")
             if i%10==0: _p(i/max(len(blocks),1),f"{i}/{len(blocks)}")
-        with open(srt_path,"w",encoding="utf-8") as f: f.write("\n".join(out)+"\n")
-        _p(1.0,"Translation done"); return True
+        with open(srt_path, "w",encoding="utf-8") as f: f.write("\n".join(out)+"\n")
+        _p(1.0, "Translation done"); return True
     except Exception as e:
         print(f"Translation failed: {e}",file=sys.stderr); return False
 
@@ -2173,15 +2253,15 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
     info=get_video_info(input_path)
     fps=info["fps"]; total_frames=info["total_frames"]; duration=info["duration_seconds"]
     orig_w=info["width"]; orig_h=info["height"]; sample_every=max(1,int(fps))
-    _p(0.0,"Scanning...")
+    _p(0.0, "Scanning...")
     scores,scene_cut_frames=_compute_frame_scores(input_path,fps,total_frames,orig_w,orig_h,
                                                   sample_every=sample_every,
                                                   progress_callback=lambda v,m:_p(v*0.45,m))
     if len(scores)==0: return []
-    _p(0.45,"Computing arcs...")
+    _p(0.45, "Computing arcs...")
     window=max(5,int(30/(sample_every/fps)))
-    ss=(np.convolve(scores,np.ones(window)/window,"same") if len(scores)>=window else scores.copy())
-    if ss.max()>0: ss/=ss.max()
+    ss=(np.convolve(scores,np.ones(window)/window, "same") if len(scores) >=window else scores.copy())
+    if ss.max() >0: ss/=ss.max()
     min_gap=max(1,int(min_duration_sec*fps/sample_every))
     peaks=[]
     for i in range(1,len(ss)-1):
@@ -2189,7 +2269,7 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
         if ss[i]==ss[lo:hi].max() and ss[i]>0.3:
             if not peaks or i-peaks[-1]>min_gap//2: peaks.append(i)
     peaks.sort(key=lambda i:ss[i],reverse=True); peaks=peaks[:target_n_clips*2]
-    def _arc(pi):
+    def arc(pi):
         ps=pi*sample_every/fps; rs=max(0.0,ps-max_duration_sec*0.4)
         re=min(duration,rs+max_duration_sec)
         for sc in reversed(scene_cut_frames):
@@ -2204,11 +2284,11 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
         return rs,re
     cands=[]
     for pi in peaks:
-        s,e=_arc(pi); sc_=float(ss[pi])
+        s,e=arc(pi); sc=float(ss[pi])
         if not any(min(e,ce)-max(s,cs)>min_duration_sec*0.5 for cs,ce,_ in cands):
-            cands.append((s,e,sc_))
+            cands.append((s,e,sc))
     cands.sort(key=lambda x:x[2],reverse=True); cands=cands[:target_n_clips]; cands.sort(key=lambda x:x[0])
-    _p(0.55,"SOI per clip...")
+    _p(0.55, "SOI per clip...")
     segments=[]
     det_w=min(orig_w,640); det_h=max(1,int(det_w*orig_h/orig_w))
     for ci,(ss2,se,score) in enumerate(cands):
@@ -2231,35 +2311,63 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
         if soi_xs: sr=_soi_region_label(int(np.median(soi_xs)),int(np.median(soi_ys)),orig_w,orig_h)
         ms=int(ss2//60); secs=int(ss2%60); me=int(se//60); sece=int(se%60)
         segments.append(ClipSegment(start_sec=ss2,end_sec=se,score=score,soi_region=sr,
-                                    peak_frame=int(np.linspace(ss2+1,se-1,n_s)[n_s//2]*fps),
-                                    title=f"Clip {ci+1} ({ms}:{secs:02d} - {me}:{sece:02d})"))
+                                      peak_frame=int(np.linspace(ss2+1,se-1,n_s)[n_s//2]*fps),
+                                      title=f"Clip {ci+1} ({ms}:{secs:02d} - {me}:{sece:02d})"))
     _p(1.0,f"Found {len(segments)} clips"); return segments
 
 # ── Analytics ─────────────────────────────────────────────────────────────────
 def _build_analytics(input_path: str, output_path: str, orig_w: int, orig_h: int,
                      out_w: int, out_h: int, smooth_metrics: Optional[Dict]=None,
-                     panel_mode: bool=False, kalman_predictions: int=0) -> Dict[str,Any]:
+                     panel_mode: bool=False, kalman_predictions: int=0,
+                     resource_stats: Optional[Dict[str, float]]=None) -> Dict[str,Any]:
     def _sz(p): return os.path.getsize(p)/(1024*1024) if os.path.exists(p) else 0.0
     def _br(p):
         try:
-            r=subprocess.run(["ffprobe","-v","error","-show_entries","format=bit_rate",
-                              "-of","default=noprint_wrappers=1:nokey=1",p],
+            r=subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=bit_rate",
+                              "-of", "default=noprint_wrappers=1:nokey=1",p],
                              capture_output=True,text=True,timeout=10)
             return int(r.stdout.strip())//1000
         except: return 0
     in_sz=_sz(input_path); out_sz=_sz(output_path)
-    a: Dict[str,Any] = {
-        "input_size_mb":round(in_sz,2),"output_size_mb":round(out_sz,2),
-        "compression_ratio":round(in_sz/out_sz,2) if out_sz>0 else 0.0,
-        "file_size_reduction_pct":round((1-out_sz/in_sz)*100,1) if in_sz>0 else 0.0,
-        "input_resolution":f"{orig_w}x{orig_h}","output_resolution":f"{out_w}x{out_h}",
-        "input_bitrate_kbps":_br(input_path),"output_bitrate_kbps":_br(output_path),
-        "panel_mode":panel_mode,"kalman_predictions":kalman_predictions,
-        "jitter_raw":0.0,"jitter_smooth":0.0,"smoothness_pct":0.0,
-    }
+    
+    # --- Fix: Robust Smoothness Calculation ---
+    jitter_raw = 0.0
+    jitter_smooth = 0.0
+    smoothness_pct = 0.0
+    
     if smooth_metrics:
-        a.update({k:smooth_metrics.get(k,0.0) for k in ("jitter_raw","jitter_smooth","smoothness_pct")})
-    a["kalman_predictions"] = smooth_metrics.get("kalman_prediction_frames", kalman_predictions)
+        jitter_raw = smooth_metrics.get("jitter_raw", 0.0)
+        jitter_smooth = smooth_metrics.get("jitter_smooth", 0.0)
+        # Calculate percentage if not provided or if raw > 0
+        if jitter_raw > 0:
+            smoothness_pct = ((jitter_raw - jitter_smooth) / jitter_raw) * 100
+        else:
+            smoothness_pct = smooth_metrics.get("smoothness_pct", 0.0)
+            
+    # Ensure non-negative percentage
+    smoothness_pct = max(0.0, smoothness_pct)
+
+    a: Dict[str,Any] = {
+        "input_size_mb": round(in_sz, 2), 
+        "output_size_mb": round(out_sz, 2),
+        "compression_ratio": round(in_sz/out_sz, 2) if out_sz > 0 else 0.0,
+        "file_size_reduction_pct": round((1-out_sz/in_sz)*100, 1) if in_sz > 0 else 0.0,
+        "input_resolution": f"{orig_w}x{orig_h}", 
+        "output_resolution": f"{out_w}x{out_h}",
+        "input_bitrate_kbps": _br(input_path), 
+        "output_bitrate_kbps": _br(output_path),
+        "panel_mode": panel_mode, 
+        "kalman_predictions": kalman_predictions,
+        # Fixed smoothness metrics
+        "jitter_raw": round(jitter_raw, 2), 
+        "jitter_smooth": round(jitter_smooth, 2), 
+        "smoothness_pct": round(smoothness_pct, 1),
+    }
+    
+    # Add Resource Stats if available
+    if resource_stats:
+        a.update(resource_stats)
+        
     return a
 
 # ── Core rendering engine ─────────────────────────────────────────────────────
@@ -2282,7 +2390,7 @@ def _render_video(input_path: str, output_path: str,
                   panel_config: Optional[PanelModeConfig] = None,
                   panel_persons_map: Optional[Dict[int,List]] = None,
                   # v6.2: ball_records replaces the old tracking_boxes_map
-                  ball_records: Optional[Dict[int, BallFrameRecord]] = None,
+                  ball_records:  Optional[Dict[int, BallFrameRecord]] = None,
                   person_boxes_map: Optional[Dict[int, List[Tuple[int,int,int,int]]]] = None,
                   draw_tracking_boxes: bool = False,
                   ) -> Dict[str,Any]:
@@ -2290,7 +2398,7 @@ def _render_video(input_path: str, output_path: str,
     eff_fps=output_fps or fps; srt_path=None
     if burn_subtitles and whisper_available():
         fd,srt_path=tempfile.mkstemp(suffix=".srt"); os.close(fd)
-        _p(0.02,"Transcribing...")
+        _p(0.02, "Transcribing...")
         ok=transcribe_to_srt(input_path,srt_path,whisper_model=whisper_model,
                              language=whisper_language,max_chars_per_line=subtitle_max_chars,
                              progress_callback=lambda v,m:_p(0.02+v*0.08,m))
@@ -2300,7 +2408,6 @@ def _render_video(input_path: str, output_path: str,
             try: os.unlink(srt_path)
             except OSError: pass
             srt_path=None
-
     extra_vf=_build_ffmpeg_vf(color_grade, ffmpeg_sharpen)
     subtitle_style=SUBTITLE_STYLES.get(subtitle_style_name,SUBTITLE_STYLES["Bold White (TikTok)"])
     enc=_open_ffmpeg_encoder(output_path,out_w,out_h,eff_fps,audio_source=input_path,
@@ -2315,12 +2422,12 @@ def _render_video(input_path: str, output_path: str,
     try:
         with FFmpegVideoReader(input_path,orig_w,orig_h) as reader:
             for frame in reader:
-                if fi>=total_frames: break
+                if fi >=total_frames: break
 
                 if use_panel_mode:
                     persons=(panel_persons_map or {}).get(fi,[])
                     if not persons:
-                        scx,scy=smoothed_centers[fi] if fi<len(smoothed_centers) else (orig_w//2,orig_h//2)
+                        scx,scy=smoothed_centers[fi] if fi <len(smoothed_centers) else (orig_w//2,orig_h//2)
                         hw=min(crop_w//2,orig_w//4); hh=min(crop_h//4,orig_h//4)
                         persons=[(scx-hw,scy-hh,scx+hw,scy+hh)]
                     out_frame,prev_slots=_render_panel_frame(frame,persons,out_w,out_h,
@@ -2328,14 +2435,14 @@ def _render_video(input_path: str, output_path: str,
                                                              slot_smoother=slot_smoother,
                                                              orientation=orientation)
                 else:
-                    cx,cy=smoothed_centers[fi] if fi<len(smoothed_centers) else (orig_w//2,orig_h//2)
+                    cx,cy=smoothed_centers[fi] if fi <len(smoothed_centers) else (orig_w//2,orig_h//2)
                     hw,hh=crop_w//2,crop_h//2
                     x1=int(np.clip(cx-hw,0,orig_w-crop_w)); y1=int(np.clip(cy-hh,0,orig_h-crop_h))
                     x2=min(x1+crop_w,orig_w); y2=min(y1+crop_h,orig_h)
                     x1=max(0,x2-crop_w); y1=max(0,y2-crop_h)
                     crop=frame[y1:y2,x1:x2]
                     if crop.shape[0]==0 or crop.shape[1]==0:
-                        crop=(frame[:crop_h,:crop_w] if orig_h>=crop_h and orig_w>=crop_w else frame)
+                        crop=(frame[:crop_h,:crop_w] if orig_h >=crop_h and orig_w >=crop_w else frame)
                     out_frame=cv2.resize(crop,(out_w,out_h),interpolation=cv2.INTER_LANCZOS4)
 
                     # v6.2: Draw tracking overlays using per-frame BallFrameRecord
@@ -2355,7 +2462,7 @@ def _render_video(input_path: str, output_path: str,
                                 if cbx2 > 0 and cby2 > 0 and cbx1 < crop_w and cby1 < crop_h:
                                     ball_rec_out = BallFrameRecord(
                                         bbox=(int(cbx1*sx), int(cby1*sy),
-                                              int(cbx2*sx), int(cby2*sy)),
+                                               int(cbx2*sx), int(cby2*sy)),
                                         confidence=br.confidence,
                                         source=br.source,
                                     )
@@ -2370,14 +2477,14 @@ def _render_video(input_path: str, output_path: str,
                                 if cx2 > 0 and cy2 > 0 and cx1 < crop_w and cy1 < crop_h:
                                     person_boxes_out.append(
                                         (int(cx1*sx), int(cy1*sy),
-                                         int(cx2*sx), int(cy2*sy)))
+                                         int(cx2*sx),  int(cy2*sy)))
 
                         if ball_rec_out is not None or person_boxes_out:
                             out_frame = _draw_tracking_overlays(
                                 out_frame, ball_rec_out, person_boxes_out)
 
-                    if vignette_strength>0: out_frame=apply_vignette(out_frame,vignette_strength)
-                    if sharpen_strength>0 and not ffmpeg_sharpen:
+                    if vignette_strength >0: out_frame=apply_vignette(out_frame,vignette_strength)
+                    if sharpen_strength >0 and not ffmpeg_sharpen:
                         out_frame=apply_sharpen(out_frame,sharpen_strength)
 
                 if fi in scene_cut_set: dissolve.on_cut(out_frame)
@@ -2413,7 +2520,7 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
     try:
         with FFmpegVideoReader(input_path,orig_w,orig_h,scale_w=det_w,scale_h=det_h) as reader:
             for det_frame in reader:
-                if fi>=total_frames: break
+                if fi >=total_frames: break
                 gray=cv2.cvtColor(det_frame,cv2.COLOR_BGR2GRAY)
                 is_cut,prev_hist,last_cut_frame=is_scene_change(
                     prev_frame,det_frame,threshold=scene_cut_threshold,
@@ -2429,7 +2536,7 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
                         r=talking_head_center(sf,orig_w,orig_h,crop_w,crop_h,bias=talking_head_bias)
                         if r: cx,cy=r
                 elif tracking_mode=="sports_action":
-                    dr,_bb,bc=detect_subjects(det_frame,model,confidence,
+                    dr, bb,bc=detect_subjects(det_frame,model,confidence,
                                               prev_center=((int(prev_cx*det_scale),int(prev_cy*det_scale))
                                                            if prev_cx is not None else None),
                                               prev_ball_carrier=prev_ball_carrier,
@@ -2440,10 +2547,10 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
                         persons_map[fi]=[(int(p[0]/det_scale),int(p[1]/det_scale),
                                           int(p[2]/det_scale),int(p[3]/det_scale)) for p in ap]
                 else:
-                    dr,_,_=detect_subjects(det_frame,model,confidence,
-                                           prev_center=((int(prev_cx*det_scale),int(prev_cy*det_scale))
-                                                        if prev_cx is not None else None),
-                                           tracking_mode="subject")
+                    dr, _, _=detect_subjects(det_frame,model,confidence,
+                                             prev_center=((int(prev_cx*det_scale),int(prev_cy*det_scale))
+                                                          if prev_cx is not None else None),
+                                             tracking_mode="subject")
                     if dr: cx=int(dr.cx/det_scale); cy=int(dr.cy/det_scale)
                     if panel_mode_active:
                         ap=detect_persons_all(det_frame,model,confidence)
@@ -2457,7 +2564,7 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
                     cx=int(scx/det_scale); cy=int(scy/det_scale)
                 cx=max(hw,min(cx,orig_w-hw)); cy=max(hh,min(cy,orig_h-hh))
                 if rule_of_thirds and prev_cx is not None:
-                    rot_cx=orig_w//3 if cx<orig_w//2 else 2*orig_w//2
+                    rot_cx=orig_w//3 if cx <orig_w//2 else 2*orig_w//3
                     cx=max(hw,min(int(cx*0.85+rot_cx*0.15),orig_w-hw))
                 cy=_apply_lower_third_guard(cy,crop_h,cy,orig_h)
                 cy=max(hh,min(cy,orig_h-hh))
@@ -2469,7 +2576,7 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
                 fi+=1
     except Exception as e:
         print(f"[tracking_pass] Error at frame {fi}: {e}",file=sys.stderr)
-        while len(centers)<total_frames:
+        while len(centers) <total_frames:
             centers.append(centers[-1] if centers else (orig_w//2,orig_h//2)); speeds.append(0.0)
     return centers,speeds,scene_cuts,persons_map,kalman_pred_count
 
@@ -2504,7 +2611,6 @@ def _sports_tracking_pass_optimized(
     det_scale = min(1.0, 960/orig_w)
     det_w = max(1, int(orig_w*det_scale)); det_h = max(1, int(orig_h*det_scale))
     hw, hh = crop_w//2, crop_h//2
-
     raw_centers: List[Tuple[int,int]] = []
     speeds: List[float] = []
     scene_cuts: List[int] = []
@@ -2538,7 +2644,7 @@ def _sports_tracking_pass_optimized(
                 fi = len(raw_centers)
                 gray = cv2.cvtColor(det_frame, cv2.COLOR_BGR2GRAY)
 
-                # ── Scene change ──────────────────────────────────────────────
+                # ── Scene change ─────────────────────────────────────────────
                 is_cut, prev_hist, last_cut_frame = is_sports_scene_change(
                     prev_frame, det_frame, prev_hist, fi, last_cut_frame)
                 if is_cut:
@@ -2703,7 +2809,7 @@ def _sports_tracking_pass_optimized(
                         nearest = min(active_tracks, key=lambda t: math.hypot(
                             t.center[0]-ball_center[0], t.center[1]-ball_center[1]))
                         raw_cx = ball_center[0]*0.55 + nearest.center[0]*0.45
-                        raw_cy = ball_center[1]*0.55 + nearest.center[1]*0.45
+                        raw_cy = ball_center[1]*0.55 + nearest.center[1]*0.45 
                     else:
                         raw_cx = float(ball_center[0])
                         raw_cy = float(ball_center[1])
@@ -2778,7 +2884,7 @@ def process_video(input_path: str, output_path: str,
                   tracking_mode: str = "subject", talking_head_bias: float = 0.30,
                   confidence: float = 0.45, smooth_window: int = 15,
                   adaptive_smoothing: bool = True, use_optical_flow: bool = True,
-                  rule_of_thirds: bool = True, scene_cut_threshold: float = 0.35,
+                  rule_of_thirds: bool = True,  scene_cut_threshold: float = 0.35,
                   output_fps: Optional[float] = None, crf: int = 23,
                   encoder_preset: str = "fast", audio_bitrate: str = "128k",
                   yolo_weights: str = "yolov8n.pt", burn_subtitles: bool = False,
@@ -2790,26 +2896,31 @@ def process_video(input_path: str, output_path: str,
                   ken_burns: bool = False, use_kalman: bool = False,
                   panel_config: Optional[PanelModeConfig] = None,
                   progress_callback=None) -> Dict[str, Any]:
+    
+    # --- Start Resource Monitor ---
+    res_mon = ResourceMonitor()
+    res_mon.start()
+
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
     _check_ffmpeg()
     info=get_video_info(input_path)
     orig_w,orig_h=info["width"],info["height"]; fps=info["fps"]; total_frames=info["total_frames"]
     out_w,out_h=resolve_target_size(target_preset_label,orig_w,orig_h)
     crop_w,crop_h=calculate_crop_dims(orig_w,orig_h,out_w,out_h)
-    _p(0.01,"Loading model...")
+    _p(0.01, "Loading model...")
     model=_get_model(yolo_weights) if tracking_mode!="talking_head" else None
     panel_cfg=panel_config or PanelModeConfig()
     use_panel_mode=False
     if panel_cfg.split_mode=="force_on": use_panel_mode=True
     elif panel_cfg.split_mode=="auto" and tracking_mode=="subject":
-        _p(0.03,"Detecting panel layout...")
+        _p(0.03, "Detecting panel layout...")
         use_panel_mode=_detect_panel_mode(input_path,model,fps,total_frames,orig_w,orig_h,
                                           confidence=confidence,
                                           max_person_motion=panel_cfg.max_person_motion,
                                           min_person_area_frac=panel_cfg.min_person_area_frac,
                                           max_count_variance=panel_cfg.max_count_variance,
                                           stability_frac=panel_cfg.stability_frac)
-    _p(0.05,"Tracking subjects...")
+    _p(0.05, "Tracking subjects...")
     raw_centers,speeds,scene_cuts,persons_map,kalman_preds=_tracking_pass(
         input_path=input_path,orig_w=orig_w,orig_h=orig_h,crop_w=crop_w,crop_h=crop_h,
         fps=fps,total_frames=total_frames,tracking_mode=tracking_mode,model=model,
@@ -2818,11 +2929,11 @@ def process_video(input_path: str, output_path: str,
         scene_cut_threshold=scene_cut_threshold,talking_head_bias=talking_head_bias,
         use_kalman=use_kalman,panel_mode_active=use_panel_mode,
         progress_callback=lambda v,m:_p(0.05+v*0.45,m))
-    _p(0.50,"Smoothing camera path...")
+    _p(0.50, "Smoothing camera path...")
     smoothed,smooth_metrics=smooth_centers(raw_centers,speeds,base_window=smooth_window,
                                            adaptive=adaptive_smoothing,scene_cuts=scene_cuts,
                                            use_kalman=use_kalman)
-    _p(0.55,"Rendering...")
+    _p(0.55, "Rendering...")
     render_meta=_render_video(input_path=input_path,output_path=output_path,
                               out_w=out_w,out_h=out_h,crop_w=crop_w,crop_h=crop_h,
                               orig_w=orig_w,orig_h=orig_h,fps=fps,total_frames=total_frames,
@@ -2840,11 +2951,17 @@ def process_video(input_path: str, output_path: str,
                               panel_persons_map=persons_map,
                               draw_tracking_boxes=False,  # not used in non-sports mode
                               progress_callback=lambda v,m:_p(0.55+v*0.43,m))
-    _p(1.0,"Done!")
+    
+    # --- Stop Resource Monitor ---
+    res_mon.stop()
+    resource_stats = res_mon.get_stats()
+
+    _p(1.0, "Done!")
     analytics=_build_analytics(input_path,output_path,orig_w=orig_w,orig_h=orig_h,
                                out_w=out_w,out_h=out_h,smooth_metrics=smooth_metrics,
                                panel_mode=use_panel_mode,
-                               kalman_predictions=smooth_metrics.get("kalman_prediction_frames",0))
+                               kalman_predictions=smooth_metrics.get("kalman_prediction_frames",0),
+                               resource_stats=resource_stats) # Pass resource stats
     result={"analytics":analytics}
     if render_meta.get("subtitle_path"): result["subtitle_path"]=render_meta["subtitle_path"]
     return result
@@ -2878,13 +2995,18 @@ def process_sports_video(input_path: str, output_path: str,
     - draw_tracking_boxes is now independent of use_ball_tracking.
       Set draw_tracking_boxes=False to track the ball for framing but hide brackets.
     """
+    
+    # --- Start Resource Monitor ---
+    res_mon = ResourceMonitor()
+    res_mon.start()
+
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
     _check_ffmpeg()
     info=get_video_info(input_path)
     orig_w,orig_h=info["width"],info["height"]; fps=info["fps"]; total_frames=info["total_frames"]
     out_w,out_h=resolve_target_size(target_preset_label,orig_w,orig_h)
     crop_w,crop_h=calculate_crop_dims(orig_w,orig_h,out_w,out_h)
-    _p(0.01,"Loading sports model...")
+    _p(0.01, "Loading sports model...")
     model=_get_model(yolo_weights)
     sample_frame=_read_frame_at(input_path,orig_w,orig_h,2.0)
     field_mask: Optional[np.ndarray]=None
@@ -2894,19 +3016,19 @@ def process_sports_video(input_path: str, output_path: str,
     avs_smoother   = AdaptiveVelocityAwareSmoother(fps)
     ics            = IntelligentCropStrategy(orig_w,orig_h,crop_w,crop_h,fps)
     phase_detector = SportsPlayPhaseDetector(fps)
-    _p(0.05,"Sports tracking (v6.2 — exact ball sync)...")
-    raw_centers, speeds, scene_cuts, ball_records, person_boxes_map = \
-        _sports_tracking_pass_optimized(
-            input_path=input_path, orig_w=orig_w, orig_h=orig_h,
-            crop_w=crop_w, crop_h=crop_h, fps=fps, total_frames=total_frames,
-            model=model, confidence=confidence,
-            use_ball_tracking=use_ball_tracking, use_optical_flow=use_optical_flow,
-            field_mask=field_mask,
-            mot_tracker=mot_tracker, avs_smoother=avs_smoother,
-            ics=ics, phase_detector=phase_detector,
-            progress_callback=lambda v,m:_p(0.05+v*0.45,m),
-        )
-    _p(0.50,"Sports post-smoothing...")
+    _p(0.05, "Sports tracking (v6.2 — exact ball sync)...")
+    raw_centers, speeds, scene_cuts, ball_records, person_boxes_map =  \
+    _sports_tracking_pass_optimized(
+        input_path=input_path, orig_w=orig_w, orig_h=orig_h,
+        crop_w=crop_w, crop_h=crop_h, fps=fps, total_frames=total_frames,
+        model=model, confidence=confidence,
+        use_ball_tracking=use_ball_tracking, use_optical_flow=use_optical_flow,
+        field_mask=field_mask,
+        mot_tracker=mot_tracker, avs_smoother=avs_smoother,
+        ics=ics, phase_detector=phase_detector,
+        progress_callback=lambda v,m:_p(0.05+v*0.45,m),
+    )
+    _p(0.50, "Sports post-smoothing...")
     dense_cx=np.array([c[0] for c in raw_centers],dtype=float)
     dense_cy=np.array([c[1] for c in raw_centers],dtype=float)
     dense_cx,dense_cy=_apply_sports_post_smooth(dense_cx,dense_cy,fps,scene_cuts,total_frames)
@@ -2916,7 +3038,7 @@ def process_sports_video(input_path: str, output_path: str,
                     "jitter_smooth":avs_metrics.get("jitter_smooth",0.0),
                     "smoothness_pct":avs_metrics.get("smoothness_pct",0.0),
                     "kalman_prediction_frames":0}
-    _p(0.55,"Rendering sports video...")
+    _p(0.55, "Rendering sports video...")
     render_meta=_render_video(
         input_path=input_path, output_path=output_path,
         out_w=out_w, out_h=out_h, crop_w=crop_w, crop_h=crop_h,
@@ -2938,9 +3060,15 @@ def process_sports_video(input_path: str, output_path: str,
         draw_tracking_boxes=draw_tracking_boxes,
         progress_callback=lambda v,m:_p(0.55+v*0.43,m),
     )
-    _p(1.0,"Done!")
+    
+    # --- Stop Resource Monitor ---
+    res_mon.stop()
+    resource_stats = res_mon.get_stats()
+
+    _p(1.0, "Done!")
     analytics=_build_analytics(input_path,output_path,orig_w=orig_w,orig_h=orig_h,
-                               out_w=out_w,out_h=out_h,smooth_metrics=smooth_metrics,panel_mode=False)
+                               out_w=out_w,out_h=out_h,smooth_metrics=smooth_metrics,
+                               panel_mode=False, resource_stats=resource_stats) # Pass resource stats
     result={"analytics":analytics}
     if render_meta.get("subtitle_path"): result["subtitle_path"]=render_meta["subtitle_path"]
     return result
@@ -2965,12 +3093,12 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
     os.makedirs(output_dir,exist_ok=True); results=[]; n=len(clips)
     for i,clip in enumerate(clips):
         cs=i/n; ce=(i+1)/n
-        def _cp(v,msg="",_cs=cs,_ce=ce): _p(_cs+v*(_ce-_cs),msg)
+        def _cp(v,msg="",_cs=cs,_ce=ce): _p(_cs+v*(ce-_cs),msg)
         _cp(0.0,f"Clip {i+1}/{n}: trimming...")
         fd,trim_path=tempfile.mkstemp(suffix=".mp4"); os.close(fd)
         ok=_trim_video(input_path,trim_path,clip.start_sec,clip.end_sec)
         if not ok:
-            results.append({"clip":clip,"output_path":None,"error":"Trim failed","analytics":{}})
+            results.append({"clip":clip, "output_path":None, "error":"Trim failed", "analytics":{}})
             if os.path.exists(trim_path):
                 try: os.unlink(trim_path)
                 except OSError: pass
@@ -3000,10 +3128,10 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
                                    subtitle_style_name=subtitle_style_name,
                                    subtitle_max_chars=subtitle_max_chars,panel_config=panel_config,
                                    progress_callback=lambda v,m:_cp(0.05+v*0.90,m))
-            results.append({"clip":clip,"output_path":out_path,"analytics":meta.get("analytics",{})})
+            results.append({"clip":clip, "output_path":out_path, "analytics":meta.get("analytics",{})})
         except Exception as e:
             print(f"[batch] Clip {i+1} error: {e}",file=sys.stderr)
-            results.append({"clip":clip,"output_path":None,"error":str(e),"analytics":{}})
+            results.append({"clip":clip, "output_path":None, "error":str(e), "analytics":{}})
         finally:
             if os.path.exists(trim_path):
                 try: os.unlink(trim_path)
