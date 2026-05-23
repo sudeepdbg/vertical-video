@@ -110,9 +110,9 @@ SPORTS_COURT_COLORS_HSV = [
 KALMAN_PLAYER_PROCESS_NOISE_BASE  = 3e-2
 KALMAN_PLAYER_PROCESS_NOISE_HIGH  = 3e-1
 KALMAN_PLAYER_MEASUREMENT_NOISE   = 3e-2
-KALMAN_BALL_PROCESS_NOISE_BASE    = 1e-1
-KALMAN_BALL_PROCESS_NOISE_HIGH    = 8e-1
-KALMAN_BALL_MEASUREMENT_NOISE     = 8e-2
+KALMAN_BALL_PROCESS_NOISE_BASE    = 8.0    # px²/frame — must be large enough for fast-moving ball
+KALMAN_BALL_PROCESS_NOISE_HIGH    = 40.0
+KALMAN_BALL_MEASUREMENT_NOISE     = 4.0   # px² — YOLO centre jitter in det-space
 KALMAN_OPTICAL_FLOW_NOISE         = 5e-1
 KALMAN_SALIENCY_NOISE             = 2e-0
 KALMAN_INITIAL_ERROR              = 1.0
@@ -173,8 +173,8 @@ BALL_MIN_AREA_PX2           = 16
 BALL_MAX_AREA_PX2           = 14400
 BALL_MIN_ASPECT             = 0.40
 BALL_MAX_ASPECT             = 2.50
-BALL_MAX_GATE_PX            = 180
-BALL_COLOR_MATCH_THRESHOLD  = 0.45
+BALL_MAX_GATE_PX            = 90    # in det_frame pixel space (≈ 180px at orig scale)
+BALL_COLOR_MATCH_THRESHOLD  = 0.30  # relaxed: model needs time to build up
 BALL_COLOR_MODEL_BUILD_FRAMES = 8
 
 VELOCITY_SMOOTH_TABLE: List[Tuple[float, int]] = [
@@ -233,11 +233,9 @@ PANEL_TRANSITION_FRAMES = 6
 # ── Data Classes ──────────────────────────────────────────────────────────────
 @dataclass
 class OverlayConfig:
-    """v7.0: fully configurable overlay replacing the single draw_tracking_boxes bool."""
+    """v7.1: ball-only overlay config. Person boxes removed entirely."""
     show_ball_box:         bool  = True
-    show_person_boxes:     bool  = False   # off by default
     ball_box_style:        str   = "corners"   # corners | rect | dot | none
-    person_box_style:      str   = "rect"
     box_opacity:           float = 0.85
     min_ball_confidence:   float = BALL_OVERLAY_CONF_THRESHOLD
     show_confidence_label: bool  = False
@@ -245,13 +243,10 @@ class OverlayConfig:
     trail_length:          int   = 20
 
     def __post_init__(self) -> None:
-        valid_ball   = {"corners", "rect", "dot", "none"}
-        valid_person = {"corners", "rect", "none"}
+        valid_ball = {"corners", "rect", "dot", "none"}
         if self.ball_box_style not in valid_ball:
             raise ValueError(f"ball_box_style must be one of {valid_ball}")
-        if self.person_box_style not in valid_person:
-            raise ValueError(f"person_box_style must be one of {valid_person}")
-        self.box_opacity = float(np.clip(self.box_opacity, 0.0, 1.0))
+        self.box_opacity  = float(np.clip(self.box_opacity, 0.0, 1.0))
         self.trail_length = max(1, self.trail_length)
 
 
@@ -381,36 +376,53 @@ class BallKalmanFilter:
                             [0, 1, 0, 0]], dtype=np.float64)
 
         pn = KALMAN_BALL_PROCESS_NOISE_BASE
-        self.Q = np.diag([pn, pn, pn * 10, pn * 10]).astype(np.float64)
+        # position noise + velocity noise (velocity uncertainty much larger for fast ball)
+        self.Q = np.diag([pn, pn, pn * 20.0, pn * 20.0]).astype(np.float64)
         self.R = np.eye(2, dtype=np.float64) * KALMAN_BALL_MEASUREMENT_NOISE
 
         self.x = np.zeros((4, 1), dtype=np.float64)
-        self.P = np.eye(4, dtype=np.float64) * KALMAN_INITIAL_ERROR
+        # large initial uncertainty so first measurement dominates
+        self.P = np.eye(4, dtype=np.float64) * 500.0
         self.initialized = False
         self._stale_frames = 0
+        self._predicted_this_frame = False   # guard against double-predict
 
     # ------------------------------------------------------------------
     def init(self, cx: float, cy: float, vx: float = 0.0, vy: float = 0.0) -> None:
         self.x = np.array([[cx], [cy], [vx], [vy]], dtype=np.float64)
-        self.P = np.eye(4, dtype=np.float64) * KALMAN_INITIAL_ERROR
+        self.P = np.eye(4, dtype=np.float64) * 500.0
         self.initialized = True
         self._stale_frames = 0
+        self._predicted_this_frame = False
+
+    def new_frame(self) -> None:
+        """Call at the START of every frame to reset the predict-guard."""
+        self._predicted_this_frame = False
 
     def predict(self) -> Tuple[float, float]:
+        """Advance the prior by one time step.  Call once per frame before update()."""
         if not self.initialized:
             return float(self.x[0, 0]), float(self.x[1, 0])
-        # propagate state
+        if self._predicted_this_frame:
+            # already predicted this frame — just return current estimate
+            return float(self.x[0, 0]), float(self.x[1, 0])
         self.x = self.F @ self.x
-        # apply gravity to vy component
+        # inject gravity into the vy prior
         self.x[3, 0] += self.gravity * self.dt
         self.P = self.F @ self.P @ self.F.T + self.Q
         self._stale_frames += 1
+        self._predicted_this_frame = True
         return float(self.x[0, 0]), float(self.x[1, 0])
 
     def update(self, cx: float, cy: float) -> Tuple[float, float]:
+        """Correct state with a measurement.  Calls predict() first if not done yet."""
         if not self.initialized:
             self.init(cx, cy)
+            self._predicted_this_frame = False
             return cx, cy
+        # ensure predict happened before correcting
+        if not self._predicted_this_frame:
+            self.predict()
         z = np.array([[cx], [cy]], dtype=np.float64)
         y = z - self.H @ self.x
         S = self.H @ self.P @ self.H.T + self.R
@@ -418,6 +430,7 @@ class BallKalmanFilter:
         self.x = self.x + K @ y
         self.P = (np.eye(4, dtype=np.float64) - K @ self.H) @ self.P
         self._stale_frames = 0
+        self._predicted_this_frame = False  # reset for next frame
         return float(self.x[0, 0]), float(self.x[1, 0])
 
     def gate_distance(self, cx: float, cy: float) -> float:
@@ -610,20 +623,13 @@ class BallROITracker:
              velocity: Tuple[float, float] = (0.0, 0.0),
              confidence: float = 1.0) -> None:
         x1, y1, x2, y2 = bbox_det
-        # velocity-aware padding: expand ROI in direction of motion
-        vx, vy = velocity
-        speed   = math.hypot(vx, vy)
-        pad     = BALL_ROI_PAD_PX + int(min(speed * 0.5, 30))
-        px1 = max(0, x1 - pad); py1 = max(0, y1 - pad)
-        px2 = x2 + pad;         py2 = y2 + pad
-        h, w = det_frame.shape[:2]
-        px2 = min(w, px2); py2 = min(h, py2)
-        w_roi = max(px2 - px1, 1); h_roi = max(py2 - py1, 1)
+        # Use actual ball bbox for tracker init — padding caused drift
+        bw = max(x2 - x1, 1); bh = max(y2 - y1, 1)
         self._tracker = self._make_tracker()
-        self._tracker.init(det_frame, (px1, py1, w_roi, h_roi))
-        self._bbox_det = bbox_det
-        self._lost     = False
-        self._age      = 0
+        self._tracker.init(det_frame, (x1, y1, bw, bh))
+        self._bbox_det      = bbox_det
+        self._lost          = False
+        self._age           = 0
         self._last_velocity = velocity
         self._last_conf     = confidence
 
@@ -837,43 +843,13 @@ def apply_color_grade(frame: np.ndarray, grade: str = "none") -> np.ndarray:
 def _draw_tracking_overlays(
     frame: np.ndarray,
     ball_record: Optional[BallFrameRecord],
-    person_boxes_out: List[Tuple[int, int, int, int]],
     overlay_cfg: Optional[OverlayConfig] = None,
     ball_trail: Optional[List[Tuple[int, int]]] = None,
 ) -> np.ndarray:
+    """Draw ball box and optional trail.  Person boxes are not rendered."""
     cfg = overlay_cfg or OverlayConfig()
     out = frame.copy()
     h, w = out.shape[:2]
-
-    # ── person boxes ──────────────────────────────────────────────────
-    if cfg.show_person_boxes and person_boxes_out:
-        person_style = cfg.person_box_style
-        alpha        = cfg.box_opacity
-        for (x1, y1, x2, y2) in person_boxes_out:
-            x1c = max(0, x1); y1c = max(0, y1)
-            x2c = min(w-1, x2); y2c = min(h-1, y2)
-            if x2c <= x1c or y2c <= y1c:
-                continue
-            color = (255, 255, 255)
-            if person_style == "rect":
-                if alpha < 1.0:
-                    layer = out.copy()
-                    cv2.rectangle(layer, (x1c, y1c), (x2c, y2c), color, 1, cv2.LINE_AA)
-                    cv2.addWeighted(layer, alpha, out, 1.0 - alpha, 0, out)
-                else:
-                    cv2.rectangle(out, (x1c, y1c), (x2c, y2c), color, 1, cv2.LINE_AA)
-            elif person_style == "corners":
-                clen  = max(6, min((x2c-x1c)//4, (y2c-y1c)//4, 18))
-                thick = 1
-                layer = out.copy() if alpha < 1.0 else out
-                for (px, py, dx, dy) in [
-                    (x1c, y1c, clen, clen), (x2c, y1c, -clen, clen),
-                    (x1c, y2c, clen, -clen), (x2c, y2c, -clen, -clen),
-                ]:
-                    cv2.line(layer, (px, py), (px+dx, py), color, thick, cv2.LINE_AA)
-                    cv2.line(layer, (px, py), (px, py+dy), color, thick, cv2.LINE_AA)
-                if alpha < 1.0:
-                    cv2.addWeighted(layer, alpha, out, 1.0 - alpha, 0, out)
 
     # ── ball trail ────────────────────────────────────────────────────
     if cfg.show_ball_trail and ball_trail and len(ball_trail) >= 2:
@@ -2921,23 +2897,10 @@ def _render_video(input_path: str, output_path: str,
                                     trail_cy = (out_by1+out_by2)//2
                                     ball_trail_buf.append((trail_cx, trail_cy))
 
-                        # person boxes — translate
-                        person_boxes_out: List[Tuple[int,int,int,int]] = []
-                        if person_boxes_map and fi in person_boxes_map:
-                            for p in person_boxes_map[fi]:
-                                px1, py1, px2, py2 = p
-                                cx1 = px1 - x1; cy1 = py1 - y1
-                                cx2 = px2 - x1; cy2 = py2 - y1
-                                if cx2 > 0 and cy2 > 0 and cx1 < crop_w and cy1 < crop_h:
-                                    person_boxes_out.append(
-                                        (int(cx1*sx), int(cy1*sy),
-                                         int(cx2*sx), int(cy2*sy)))
-
-                        if ball_rec_out is not None or person_boxes_out:
+                        if ball_rec_out is not None:
                             out_frame = _draw_tracking_overlays(
                                 out_frame,
                                 ball_rec_out,
-                                person_boxes_out,
                                 overlay_cfg=eff_overlay,
                                 ball_trail=list(ball_trail_buf),
                             )
@@ -3123,9 +3086,8 @@ def _sports_tracking_pass_optimized(
                     ball_found_ever = False
                     ball_size_history.clear()
 
-                # Kalman predict every frame (step 1 per spec)
-                if ball_kalman.initialized:
-                    ball_kalman.predict()
+                # Reset per-frame predict guard; predict() is called lazily inside update()
+                ball_kalman.new_frame()
 
                 run_yolo = (
                     fi == 0
@@ -3186,14 +3148,9 @@ def _sports_tracking_pass_optimized(
                                     ball_kalman.update(bcx_det, bcy_det)
                                 # feed colour model
                                 ball_color_model.add_sample(det_frame, cand_bbox_det)
-                                # init ROI tracker (velocity-aware)
+                                # init ROI tracker on the actual ball bbox
                                 vkx, vky = ball_kalman.velocity
-                                pad = BALL_ROI_PAD_PX
-                                roi_bb_det = (
-                                    max(0, bb[0]-pad), max(0, bb[1]-pad),
-                                    min(det_w, bb[2]+pad), min(det_h, bb[3]+pad)
-                                )
-                                ball_tracker.init(det_frame, roi_bb_det,
+                                ball_tracker.init(det_frame, cand_bbox_det,
                                                   velocity=(vkx, vky),
                                                   confidence=ball_conf_yolo)
                                 break   # use best-conf passing candidate
