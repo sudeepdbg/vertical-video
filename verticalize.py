@@ -1,14 +1,16 @@
 """
-verticalize.py — AI Vertical Video Converter v7.1
+verticalize.py — AI Vertical Video Converter v7.2 (Ball-prioritising & reduced jitter)
 ═══════════════════════════════════════════════════════════════════
-v7.1 CHANGES vs v7.0
-• FIXED: Person boxes completely removed from overlay/render pipeline.
-• TUNED: AVS smoother base window reduced (0.40->0.25s) for tighter sports tracking.
-• TUNED: Post-smooth EMA alpha increased (0.04->0.12) to reduce lag/ghosting.
-• TUNED: Ball Kalman gate expanded (90->150px) to prevent rejecting fast moves.
-• TUNED: Ball Color Model allows early passes (<3 samples) to speed up init.
-• TUNED: Spike damping relaxed (0.65->0.85) to prevent camera sticking.
-• LOGIC: YOLO skip logic now forces run if ball confidence drops, not just frame count.
+v7.2 CHANGES vs v7.1
+• FIXED: Crop now prioritises ball when confidence >0.4 and ball is far from centre.
+• FIXED: Scene cut threshold raised (0.18→0.28) and min cut frames increased (2→5).
+• FIXED: Preserve ball Kalman filter and colour model across scene cuts.
+• FIXED: Lower initial ball confidence threshold for first 10 frames to acquire ball earlier.
+• TUNED: Larger ball margin in ICS (crop_w*0.15 → crop_w*0.35).
+• TUNED: Post-smooth EMA alpha increased (0.12→0.20) for less lag.
+• TUNED: AVS base window increased (0.25→0.35) for smoother slow motion.
+• TUNED: Post-smooth window increased (0.5→0.8s).
+• TUNED: Spike damping relaxed (spike_thresh 1.8→2.5, damp 0.85→0.9).
 """
 from __future__ import annotations
 import math
@@ -109,27 +111,27 @@ BALL_SPEED_THRESHOLD              = 15.0
 BALL_AIRBORNE_THRESHOLD_PX        = 20.0
 BALL_BOUNCE_VELOCITY_DAMPING      = 0.6
 BALL_MAX_PREDICTION_FRAMES        = 10
-SPORTS_SCENE_CUT_THRESHOLD        = 0.18
-SPORTS_SCENE_CUT_MIN_FRAMES       = 2
+SPORTS_SCENE_CUT_THRESHOLD        = 0.28   # FIX: raised from 0.18
+SPORTS_SCENE_CUT_MIN_FRAMES       = 5      # FIX: increased from 2
 SPORTS_SWITCH_BALL_BONUS          = 200
-SPORTS_BALL_CONFIDENCE            = 0.30   # v7.0: raised from 0.25
+SPORTS_BALL_CONFIDENCE            = 0.30
 SPORTS_BALL_PROXIMITY_PX          = 120
 SPORTS_EVENT_EXPAND_FRAMES        = 15
 SPORTS_EVENT_EXPAND_FACTOR        = 1.25
 
-# v7.1 Tuning: Reduced base window for tighter tracking
-AVS_BASE_WINDOW_SEC               = 0.25 
+# v7.2 Tuning: Increased base window for smoother slow motion
+AVS_BASE_WINDOW_SEC               = 0.35   # was 0.25
 AVS_MAX_WINDOW_SEC                = 0.80
 AVS_MIN_WINDOW_SEC                = 0.15
 AVS_POLYORDER                     = 3
 AVS_VELOCITY_FAST_THRESHOLD       = 80.0
 AVS_VELOCITY_SLOW_THRESHOLD       = 5.0
-AVS_ACCEL_SPIKE_THRESHOLD          = 200.0
+AVS_ACCEL_SPIKE_THRESHOLD         = 200.0
 AVS_CONFIDENCE_LOW_THRESHOLD      = 0.3
 
-# v7.1 Tuning: Increased alpha to reduce lag/ghosting
-SPORTS_POST_SMOOTH_WINDOW_SEC     = 0.50
-SPORTS_POST_SMOOTH_EMA_ALPHA      = 0.12 
+# v7.2 Tuning: Increased alpha for less lag, increased window for smoother path
+SPORTS_POST_SMOOTH_WINDOW_SEC     = 0.8    # was 0.5
+SPORTS_POST_SMOOTH_EMA_ALPHA      = 0.20   # was 0.12
 
 ICS_LOOKAHEAD_SEC                 = 0.30
 ICS_FAST_BREAK_MARGIN_FACTOR      = 1.35
@@ -158,9 +160,8 @@ BALL_MIN_AREA_PX2           = 16
 BALL_MAX_AREA_PX2           = 14400
 BALL_MIN_ASPECT             = 0.40
 BALL_MAX_ASPECT             = 2.50
-# v7.1 Tuning: Increased gate to prevent rejecting fast moves
-BALL_MAX_GATE_PX            = 150    
-BALL_COLOR_MATCH_THRESHOLD  = 0.30  
+BALL_MAX_GATE_PX            = 150
+BALL_COLOR_MATCH_THRESHOLD  = 0.30
 BALL_COLOR_MODEL_BUILD_FRAMES = 8
 
 VELOCITY_SMOOTH_TABLE: List[Tuple[float, int]] = [
@@ -216,12 +217,11 @@ PANEL_DIVIDER_COLOR     = (15, 15, 15)
 PANEL_CROP_EXPAND       = 1.55
 PANEL_TRANSITION_FRAMES = 6
 
-# ── Data Classes ──────────────────────────────────────────────────────────────
+# ── Data Classes (unchanged) ─────────────────────────────────────────────────
 @dataclass
 class OverlayConfig:
-    """v7.1: ball-only overlay config. Person boxes removed entirely."""
     show_ball_box:         bool  = True
-    ball_box_style:        str   = "corners"   # corners | rect | dot | none
+    ball_box_style:        str   = "corners"
     box_opacity:           float = 0.85
     min_ball_confidence:   float = BALL_OVERLAY_CONF_THRESHOLD
     show_confidence_label: bool  = False
@@ -299,16 +299,14 @@ class ClipSegment:
 
 @dataclass
 class BallFrameRecord:
-    """Per-frame ball data — exact, never shared/stale across frames."""
     bbox:       Optional[Tuple[int, int, int, int]] = None
     confidence: float = 0.0
-    source:     str   = "none"   # yolo | roi | kalman | color | none
+    source:     str   = "none"
 
-# ── Detection result cache ────────────────────────────────────────────────────
+# ── Detection cache (unchanged) ──────────────────────────────────────────────
 class DetectionCache:
     __slots__ = ("persons", "ball_box", "ball_carrier", "det_result",
                  "frame_idx", "confidences", "ball_confidence")
-
     def __init__(self) -> None:
         self.persons:     List[Tuple[int, int, int, int]] = []
         self.ball_box:    Optional[Tuple[int, int, int, int]] = None
@@ -317,7 +315,6 @@ class DetectionCache:
         self.frame_idx:   int = -1
         self.confidences: List[float] = []
         self.ball_confidence: float = 0.0
-
     def update(self, persons, ball_box, ball_carrier, det_result, confidences, fi,
                ball_confidence: float = 0.0):
         self.persons      = persons
@@ -328,20 +325,12 @@ class DetectionCache:
         self.frame_idx    = fi
         self.ball_confidence = ball_confidence
 
-# ── v7.0: Ball Kalman Filter ──────────────────────────────────────────────────
+# ── Ball Kalman Filter (unchanged) ───────────────────────────────────────────
 class BallKalmanFilter:
-    """
-    4-state Kalman filter [cx, cy, vx, vy] operating in det_frame pixel space.
-    Gravity is applied to vy in the predict step so that airborne arcs are
-    naturally modelled without external intervention.
-    """
     def __init__(self, fps: float, frame_h: int) -> None:
         self.fps      = max(fps, 1.0)
         self.dt       = 1.0 / self.fps
-        # gravity in det-space: scale to frame height relative to 1080p
         self.gravity  = GRAVITY_PIXELS_PER_SEC2_BASE * (frame_h / 1080.0)
-
-        # state transition F (constant velocity + gravity on vy)
         dt = self.dt
         self.F = np.array([
             [1, 0, dt, 0],
@@ -349,56 +338,40 @@ class BallKalmanFilter:
             [0, 0, 1,  0],
             [0, 0, 0,  1],
         ], dtype=np.float64)
-
         self.H = np.array([[1, 0, 0, 0],
                             [0, 1, 0, 0]], dtype=np.float64)
-
         pn = KALMAN_BALL_PROCESS_NOISE_BASE
-        # position noise + velocity noise (velocity uncertainty much larger for fast ball)
         self.Q = np.diag([pn, pn, pn * 20.0, pn * 20.0]).astype(np.float64)
         self.R = np.eye(2, dtype=np.float64) * KALMAN_BALL_MEASUREMENT_NOISE
-
         self.x = np.zeros((4, 1), dtype=np.float64)
-        # large initial uncertainty so first measurement dominates
         self.P = np.eye(4, dtype=np.float64) * 500.0
         self.initialized = False
         self._stale_frames = 0
-        self._predicted_this_frame = False   # guard against double-predict
-
-    # ------------------------------------------------------------------
+        self._predicted_this_frame = False
     def init(self, cx: float, cy: float, vx: float = 0.0, vy: float = 0.0) -> None:
         self.x = np.array([[cx], [cy], [vx], [vy]], dtype=np.float64)
         self.P = np.eye(4, dtype=np.float64) * 500.0
         self.initialized = True
         self._stale_frames = 0
         self._predicted_this_frame = False
-
     def new_frame(self) -> None:
-        """Call at the START of every frame to reset the predict-guard."""
         self._predicted_this_frame = False
-
     def predict(self) -> Tuple[float, float]:
-        """Advance the prior by one time step. Call once per frame before update()."""
         if not self.initialized:
             return float(self.x[0, 0]), float(self.x[1, 0])
         if self._predicted_this_frame:
-            # already predicted this frame — just return current estimate
             return float(self.x[0, 0]), float(self.x[1, 0])
         self.x = self.F @ self.x
-        # inject gravity into the vy prior
         self.x[3, 0] += self.gravity * self.dt
         self.P = self.F @ self.P @ self.F.T + self.Q
         self._stale_frames += 1
         self._predicted_this_frame = True
         return float(self.x[0, 0]), float(self.x[1, 0])
-
     def update(self, cx: float, cy: float) -> Tuple[float, float]:
-        """Correct state with a measurement. Calls predict() first if not done yet."""
         if not self.initialized:
             self.init(cx, cy)
             self._predicted_this_frame = False
             return cx, cy
-        # ensure predict happened before correcting
         if not self._predicted_this_frame:
             self.predict()
         z = np.array([[cx], [cy]], dtype=np.float64)
@@ -408,43 +381,31 @@ class BallKalmanFilter:
         self.x = self.x + K @ y
         self.P = (np.eye(4, dtype=np.float64) - K @ self.H) @ self.P
         self._stale_frames = 0
-        self._predicted_this_frame = False  # reset for next frame
+        self._predicted_this_frame = False
         return float(self.x[0, 0]), float(self.x[1, 0])
-
     def gate_distance(self, cx: float, cy: float) -> float:
-        """Mahalanobis-ish distance between prediction and candidate (px)."""
         if not self.initialized:
             return 0.0
         pred_x = float(self.x[0, 0])
         pred_y = float(self.x[1, 0])
         return math.hypot(cx - pred_x, cy - pred_y)
-
     @property
     def position(self) -> Tuple[float, float]:
         return float(self.x[0, 0]), float(self.x[1, 0])
-
     @property
     def velocity(self) -> Tuple[float, float]:
         return float(self.x[2, 0]), float(self.x[3, 0])
-
     @property
     def stale_frames(self) -> int:
         return self._stale_frames
 
-# ── v7.0: Ball Color Model ────────────────────────────────────────────────────
+# ── Ball Color Model (unchanged) ─────────────────────────────────────────────
 class BallColorModel:
-    """
-    HSV histogram appearance model for the ball.
-    Built incrementally from the first BALL_COLOR_MODEL_BUILD_FRAMES YOLO
-    detections; afterwards used to gate subsequent candidates.
-    """
     def __init__(self, n_build: int = BALL_COLOR_MODEL_BUILD_FRAMES) -> None:
         self._n_build  = n_build
         self._samples: List[np.ndarray] = []
-        self._model:   Optional[np.ndarray] = None  # normalised HSV histogram
-        self._bins     = [8, 8,  4]   # H, S, V bins
-
-    # ------------------------------------------------------------------
+        self._model:   Optional[np.ndarray] = None
+        self._bins     = [8, 8,  4]
     def _extract_hist(self, patch: np.ndarray) -> np.ndarray:
         if patch.size == 0:
             return np.zeros(int(np.prod(self._bins)), dtype=np.float32)
@@ -453,11 +414,9 @@ class BallColorModel:
                             [0, 180, 0, 256, 0, 256])
         hist = cv2.normalize(hist, hist).flatten()
         return hist.astype(np.float32)
-
-    def add_sample(self, frame: np.ndarray,
-                   bbox: Tuple[int, int, int, int]) -> None:
+    def add_sample(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> None:
         if self._model is not None:
-            return   # model is frozen once built
+            return
         x1, y1, x2, y2 = bbox
         patch = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
         if patch.size == 0:
@@ -465,59 +424,34 @@ class BallColorModel:
         self._samples.append(self._extract_hist(patch))
         if len(self._samples) >= self._n_build:
             self._model = np.mean(self._samples, axis=0).astype(np.float32)
-
-    def match(self, frame: np.ndarray,
-              bbox: Tuple[int, int, int, int]) -> float:
-        """Returns correlation [0-1]; 1.0 = perfect match."""
-        # v7.1 Fix: Allow early passes if model isn't robust yet to speed up init
+    def match(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> float:
         if self._model is None or len(self._samples) < 3:
-            return 1.0   
-        
+            return 1.0
         x1, y1, x2, y2 = bbox
-        patch = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)] 
+        patch = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
         if patch.size == 0:
             return 0.0
         h = self._extract_hist(patch)
         score = float(cv2.compareHist(self._model, h, cv2.HISTCMP_CORREL))
         return max(0.0, score)
-
     @property
     def is_ready(self) -> bool:
         return self._model is not None
 
-# ── v7.0: Ball Color Detector (HSV contour fallback) ─────────────────────────
+# ── Ball Color Detector (unchanged) ─────────────────────────────────────────
 class BallColorDetector:
-    """
-    Searches a predicted region in HSV colour space for round-ish contours
-    that match the ball's colour model. Used when YOLO and ROI tracker both
-    fail.
-    """
     _BALL_HSV_RANGES = [
-        # orange (basketball)
-        (np.array([5,  100, 100], dtype=np.uint8),
-         np.array([20, 255, 255], dtype=np.uint8)),
-        # white (tennis / volleyball)
-        (np.array([0,  0,   200], dtype=np.uint8),
-         np.array([180, 30, 255], dtype=np.uint8)),
-        # yellow-green (tennis ball)
-        (np.array([25, 100, 100], dtype=np.uint8),
-         np.array([45, 255, 255], dtype=np.uint8)),
-        # dark brown / dark orange
-        (np.array([0,  80, 50],  dtype=np.uint8),
-         np.array([15, 200, 180], dtype=np.uint8)),
+        (np.array([5,  100, 100], dtype=np.uint8), np.array([20, 255, 255], dtype=np.uint8)),
+        (np.array([0,  0,   200], dtype=np.uint8), np.array([180, 30, 255], dtype=np.uint8)),
+        (np.array([25, 100, 100], dtype=np.uint8), np.array([45, 255, 255], dtype=np.uint8)),
+        (np.array([0,  80, 50],  dtype=np.uint8), np.array([15, 200, 180], dtype=np.uint8)),
     ]
-
     def __init__(self, color_model: BallColorModel) -> None:
         self._model = color_model
-
     def detect(self, frame: np.ndarray,
                search_center: Optional[Tuple[float, float]],
                search_radius: int = 120,
                expected_area: float = 400.0) -> Optional[Tuple[int, int, int, int]]:
-        """
-        Returns (x1,y1,x2,y2) in frame coords or None.
-        `expected_area` is the average ball area in px² at det-scale.
-        """
         h, w = frame.shape[:2]
         if search_center is not None:
             scx, scy = int(search_center[0]), int(search_center[1])
@@ -530,24 +464,18 @@ class BallColorDetector:
         else:
             roi = frame
             ox = oy = 0
-
         if roi.size == 0:
             return None
-
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         combined = np.zeros(hsv.shape[:2], dtype=np.uint8)
         for lo, hi in self._BALL_HSV_RANGES:
             combined = cv2.bitwise_or(combined, cv2.inRange(hsv, lo, hi))
-
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, k)
         combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, k)
-
-        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return None
-
         best_bbox = None
         best_score = -1.0
         for cnt in contours:
@@ -558,9 +486,7 @@ class BallColorDetector:
             aspect = bh / max(bw, 1)
             if aspect < BALL_MIN_ASPECT or aspect > BALL_MAX_ASPECT:
                 continue
-            # prefer shapes close to expected size
             size_score = 1.0 - abs(area - expected_area) / max(expected_area, 1.0)
-            # colour model score
             abs_x1 = ox + x; abs_y1 = oy + y
             abs_x2 = abs_x1 + bw; abs_y2 = abs_y1 + bh
             color_score = self._model.match(frame, (abs_x1, abs_y1, abs_x2, abs_y2))
@@ -568,12 +494,11 @@ class BallColorDetector:
             if score > best_score:
                 best_score = score
                 best_bbox = (abs_x1, abs_y1, abs_x2, abs_y2)
-
         if best_bbox is not None and best_score >= BALL_COLOR_MATCH_THRESHOLD:
             return best_bbox
         return None
 
-# ── Ball ROI tracker wrapper (v7.0: velocity-aware pad + age limit) ────────────
+# ── Ball ROI tracker (unchanged) ────────────────────────────────────────────
 class BallROITracker:
     def __init__(self, tracker_type: str = BALL_TRACKER_TYPE,
                  max_age: int = BALL_ROI_MAX_AGE_FRAMES) -> None:
@@ -585,20 +510,17 @@ class BallROITracker:
         self._max_age = max_age
         self._last_velocity: Tuple[float, float] = (0.0, 0.0)
         self._last_conf: float = 0.0
-
     def _make_tracker(self) -> Any:
         if self._type == "CSRT":
             return cv2.TrackerCSRT_create()
         if self._type == "KCF":
             return cv2.TrackerKCF_create()
         return cv2.TrackerCSRT_create()
-
     def init(self, det_frame: np.ndarray,
              bbox_det: Tuple[int, int, int, int],
              velocity: Tuple[float, float] = (0.0, 0.0),
              confidence: float = 1.0) -> None:
         x1, y1, x2, y2 = bbox_det
-        # Use actual ball bbox for tracker init — padding caused drift
         bw = max(x2 - x1, 1); bh = max(y2 - y1, 1)
         self._tracker = self._make_tracker()
         self._tracker.init(det_frame, (x1, y1, bw, bh))
@@ -607,7 +529,6 @@ class BallROITracker:
         self._age           = 0
         self._last_velocity = velocity
         self._last_conf     = confidence
-
     def update(self, det_frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
         if self._tracker is None or self._lost:
             return None
@@ -619,33 +540,27 @@ class BallROITracker:
             self._lost = True
             return None
         self._age += 1
-        # decay confidence
         self._last_conf *= BALL_ROI_CONF_DECAY
         self._bbox_det = (int(x), int(y), int(x + bw), int(y + bh))
         return self._bbox_det
-
     def reset(self) -> None:
         self._tracker  = None
         self._bbox_det = None
         self._lost     = True
         self._age      = 0
         self._last_conf = 0.0
-
     @property
     def is_active(self) -> bool:
         return not self._lost and self._tracker is not None and self._age < self._max_age
-
     @property
     def age(self) -> int:
         return self._age
-
     @property
     def confidence(self) -> float:
         return self._last_conf
 
-# ── Resource Monitor ──────────────────────────────────────────────────────────
+# ── Resource Monitor (unchanged) ────────────────────────────────────────────
 class ResourceMonitor:
-    """Recursively includes child processes so FFmpeg + model threads count."""
     def __init__(self):
         self.cpu_samples: List[float] = []
         self.ram_samples: List[float] = []
@@ -653,7 +568,6 @@ class ResourceMonitor:
         self._active = False
         self._thread: Optional[threading.Thread] = None
         self._known_children: Set[int] = set()
-
     def _refresh_children(self) -> List[Any]:
         if self._process is None:
             return []
@@ -670,7 +584,6 @@ class ResourceMonitor:
         except Exception:
             pass
         return children
-
     def _sample_loop(self):
         if self._process:
             self._process.cpu_percent(interval=None)
@@ -695,21 +608,18 @@ class ResourceMonitor:
             except Exception:
                 pass
             time.sleep(0.5)
-
     def start(self):
         if not self._active:
             self._active = True
             self._known_children.clear()
             self._thread = threading.Thread(target=self._sample_loop, daemon=True)
             self._thread.start()
-
     def stop(self):
         if self._active:
             self._active = False
             if self._thread:
                 self._thread.join(timeout=2.0)
             self._thread = None
-
     def get_stats(self) -> Dict[str, float]:
         if not self.cpu_samples:
             return {"cpu_avg_pct": 0.0, "cpu_max_pct": 0.0, "ram_avg_mb": 0.0, "ram_max_mb": 0.0}
@@ -720,21 +630,19 @@ class ResourceMonitor:
             "ram_max_mb":  round(max(self.ram_samples), 1),
         }
 
-# ── Feature guards ────────────────────────────────────────────────────────────
+# ── Feature guards (unchanged) ──────────────────────────────────────────────
 def whisper_available() -> bool:
     try:
         import whisper
         return True
     except ImportError:
         return False
-
 def translation_available() -> bool:
     try:
         import deep_translator
         return True
     except ImportError:
         return False
-
 def yolo_available() -> bool:
     if not _YOLO_AVAILABLE:
         return False
@@ -747,9 +655,8 @@ def yolo_available() -> bool:
                 os.path.exists("yolov8s.pt") or
                 os.path.exists("yolo11n.pt"))
 
-# ── Visual Effects ────────────────────────────────────────────────────────────
+# ── Visual Effects (unchanged) ──────────────────────────────────────────────
 _vignette_cache: Dict[Tuple, np.ndarray] = {}
-
 def _build_vignette(w: int, h: int, strength: float = VIGNETTE_STRENGTH,
                     falloff: float = VIGNETTE_FALLOFF) -> np.ndarray:
     key = (w, h, round(strength, 3), round(falloff, 3))
@@ -762,22 +669,18 @@ def _build_vignette(w: int, h: int, strength: float = VIGNETTE_STRENGTH,
         mask   = np.clip(1.0 - strength * (dist**falloff), 0.0, 1.0)[:, :, np.newaxis]
         _vignette_cache[key] = mask
     return _vignette_cache[key]
-
 def apply_vignette(frame: np.ndarray, strength: float = VIGNETTE_STRENGTH) -> np.ndarray:
     if strength <= 0:
         return frame
     h, w = frame.shape[:2]
     return (frame.astype(np.float32) * _build_vignette(w, h, strength)).clip(0, 255).astype(np.uint8)
-
 def apply_sharpen(frame: np.ndarray, strength: float = 0.6, radius: int = 1) -> np.ndarray:
     if strength <= 0:
         return frame
     ksize   = radius * 2 + 1
     blurred = cv2.GaussianBlur(frame, (ksize, ksize), 0)
     return cv2.addWeighted(frame, 1 + strength, blurred, -strength, 0)
-
 _lut_cache: Dict[str, np.ndarray] = {}
-
 def _build_lut(grade: str) -> np.ndarray:
     if grade in _lut_cache:
         return _lut_cache[grade]
@@ -804,25 +707,21 @@ def _build_lut(grade: str) -> np.ndarray:
     lut = np.stack([b, g, r], axis=1).astype(np.uint8).reshape(256, 1, 3)
     _lut_cache[grade] = lut
     return lut
-
 def apply_color_grade(frame: np.ndarray, grade: str = "none") -> np.ndarray:
     if not grade or grade == "none":
         return frame
     return cv2.LUT(frame, _build_lut(grade))
 
-# ── v7.0: Overlay rendering ───────────────────────────────────────────────────
+# ── Overlay rendering (unchanged) ───────────────────────────────────────────
 def _draw_tracking_overlays(
     frame: np.ndarray,
     ball_record: Optional[BallFrameRecord],
     overlay_cfg: Optional[OverlayConfig] = None,
     ball_trail: Optional[List[Tuple[int, int]]] = None,
 ) -> np.ndarray:
-    """Draw ball box and optional trail. Person boxes are NOT rendered."""
     cfg = overlay_cfg or OverlayConfig()
     out = frame.copy()
     h, w = out.shape[:2]
-
-    # ── ball trail ────────────────────────────────────────────────────
     if cfg.show_ball_trail and ball_trail and len(ball_trail) >= 2:
         n_trail = len(ball_trail)
         for i in range(1, n_trail):
@@ -832,8 +731,6 @@ def _draw_tracking_overlays(
             radius = max(2, 4 - (n_trail - i) // 4)
             cv2.circle(out, curr_pt, radius,
                        (0, trail_alpha, 255 - trail_alpha), -1, cv2.LINE_AA)
-
-    # ── ball box ──────────────────────────────────────────────────────
     if (cfg.show_ball_box and ball_record is not None
             and ball_record.bbox is not None
             and ball_record.confidence >= cfg.min_ball_confidence):
@@ -852,7 +749,6 @@ def _draw_tracking_overlays(
                 color = (80, 80, 220); alpha = 0.55
             else:
                 color = (80, 140, 180); alpha = 0.50
-
             style = cfg.ball_box_style
             if style == "rect":
                 layer = out.copy() if alpha < 1.0 else out
@@ -882,8 +778,6 @@ def _draw_tracking_overlays(
                                 color, -1, cv2.LINE_AA)
                     if alpha < 1.0:
                         cv2.addWeighted(layer, alpha, out, 1.0 - alpha, 0, out)
-
-            # confidence label
             if cfg.show_confidence_label and ball_record.confidence > 0:
                 label = f"{ball_record.source[0].upper()}{ball_record.confidence:.2f}"
                 cv2.putText(out, label, (bx1c, max(0, by1c - 4)),
@@ -908,23 +802,20 @@ class DissolveBuffer:
         self.n    = n
         self._buf: Optional[np.ndarray] = None
         self._rem = 0
-
     def on_cut(self, last_frame: np.ndarray) -> None:
         self._buf = last_frame.copy()
         self._rem = self.n
-
     def blend(self, new_frame: np.ndarray) -> np.ndarray:
         if self._rem <= 0 or self._buf is None:
             return new_frame
         alpha = self._rem / self.n
         self._rem -= 1
         return cv2.addWeighted(self._buf, alpha, new_frame, 1.0 - alpha, 0)
-
     @property
     def active(self) -> bool:
         return self._rem > 0
 
-# ── FFmpeg Utilities ──────────────────────────────────────────────────────────
+# ── FFmpeg Utilities (unchanged) ────────────────────────────────────────────
 def _build_ffmpeg_vf(color_grade: str = "none", ffmpeg_sharpen: bool = False) -> List[str]:
     filters: List[str] = []
     eq_map = {
@@ -953,7 +844,6 @@ class FFmpegVideoReader:
         self._proc: Optional[subprocess.Popen] = None
         self._frame_bytes = self.out_w * self.out_h * 3
         self._leftover    = b""
-
     def _build_cmd(self, extra: List[str]) -> List[str]:
         cmd = ["ffmpeg"]
         if self.seek_sec > 0:
@@ -965,7 +855,6 @@ class FFmpegVideoReader:
             cmd += ["-vframes", str(self.n_frames)]
         cmd += ["pipe:1"]
         return cmd
-
     def _open(self) -> None:
         buf_size = max(self._frame_bytes * 16, 1 << 22)
         for extra in [[], ["-hwaccel", "none"]]:
@@ -987,21 +876,17 @@ class FFmpegVideoReader:
             except Exception:
                 pass
         raise ProcessingError(f"FFmpeg could not decode: {self.path}")
-
     def close(self) -> None:
         if self._proc:
             try: self._proc.stdout.close()
             except Exception: pass
             try: self._proc.wait(timeout=5)
-            except Exception: self._proc.kill() 
+            except Exception: self._proc.kill()
             self._proc = None
-
     def __enter__(self) -> "FFmpegVideoReader":
         self._open(); return self
-
     def __exit__(self, *_: Any) -> None:
         self.close()
-
     def __iter__(self):
         if not self._proc:
             self._open()
@@ -1198,10 +1083,9 @@ def calculate_crop_dims(orig_w: int, orig_h: int, tw: int, th: int) -> Tuple[int
         cw = orig_w; ch = int(round(cw / ratio))
     return min(cw, orig_w), min(ch, orig_h)
 
-# ── Model Cache & Face Detection ──────────────────────────────────────────────
+# ── Model Cache & Face Detection (unchanged) ─────────────────────────────────
 _model_cache: Dict[str, Any] = {}
 _yunet_detector: Optional[Any] = None
-
 def _get_model(weights: str = "yolov8n.pt") -> Optional[Any]:
     if not _YOLO_AVAILABLE:
         return None
@@ -1217,7 +1101,6 @@ def _get_model(weights: str = "yolov8n.pt") -> Optional[Any]:
         print("YOLO unavailable", file=sys.stderr)
         return None
     return _model_cache[weights]
-
 def _get_yunet() -> Optional[Any]:
     global _yunet_detector
     if _yunet_detector is not None:
@@ -1231,7 +1114,6 @@ def _get_yunet() -> Optional[Any]:
             except Exception:
                 pass
     return None
-
 def detect_faces(frame: np.ndarray,
                  confidence_thresh: float = 0.6) -> List[Tuple[int, int, int, int]]:
     h, w = frame.shape[:2]
@@ -1268,7 +1150,7 @@ def detect_faces(frame: np.ndarray,
             return faces
     return []
 
-# ── Multi-Object Sports Tracker ───────────────────────────────────────────────
+# ── Multi-Object Sports Tracker (unchanged) ─────────────────────────────────
 class MultiObjectSportsTracker:
     def __init__(self, fps: float, frame_w: int, frame_h: int) -> None:
         self.fps     = fps
@@ -1280,7 +1162,6 @@ class MultiObjectSportsTracker:
         self.gravity_px = GRAVITY_PIXELS_PER_SEC2_BASE * (frame_h / 1080.0)
         self.track_history: Dict[int, deque] = {}
         self.appearance_gallery: Dict[int, np.ndarray] = {}
-
     def _compute_iou(self, a: Tuple, b: Tuple) -> float:
         x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
         x2 = min(a[2], b[2]); y2 = min(a[3], b[3])
@@ -1289,7 +1170,6 @@ class MultiObjectSportsTracker:
         area_b = (b[2]-b[0]) * (b[3]-b[1])
         union  = area_a + area_b - inter
         return inter / union if union > 0 else 0.0
-
     def _compute_appearance_sim(self, track_id: int, det_frame: np.ndarray,
                                 det_box: Tuple) -> float:
         if track_id not in self.appearance_gallery:
@@ -1304,7 +1184,6 @@ class MultiObjectSportsTracker:
         hist = cv2.normalize(hist, hist).flatten()
         return float(cv2.compareHist(self.appearance_gallery[track_id].astype(np.float32),
                                      hist.astype(np.float32), cv2.HISTCMP_CORREL))
-
     def _update_appearance(self, track_id: int, det_frame: np.ndarray, det_box: Tuple) -> None:
         x1, y1, x2, y2 = det_box
         x1, y1 = max(0, x1), max(0, y1)
@@ -1318,7 +1197,6 @@ class MultiObjectSportsTracker:
             self.appearance_gallery[track_id] = 0.7 * self.appearance_gallery[track_id] + 0.3 * hist
         else:
             self.appearance_gallery[track_id] = hist
-
     def _hungarian_match(self, tracks: List[Track], detections: List[Tuple],
                          det_frame: np.ndarray) -> Tuple[Dict[int, int], Set[int], Set[int]]:
         if not tracks or not detections:
@@ -1353,7 +1231,6 @@ class MultiObjectSportsTracker:
             if cost[i, j] < 0.7:
                 matched[i] = j; unmatched_t.discard(i); unmatched_d.discard(j)
         return matched, unmatched_t, unmatched_d
-
     def update(self, persons: List[Tuple[int, int, int, int]],
                ball_box: Optional[Tuple[int, int, int, int]],
                det_frame: np.ndarray,
@@ -1395,7 +1272,6 @@ class MultiObjectSportsTracker:
         self._update_ball(ball_box)
         self.tracks = {k: v for k, v in self.tracks.items()
                        if v.status != TrackingStatus.LOST}
-
     def _update_ball(self, ball_box: Optional[Tuple[int, int, int, int]]) -> None:
         if ball_box is not None:
             bx = (ball_box[0]+ball_box[2])/2; by = (ball_box[1]+ball_box[3])/2
@@ -1419,8 +1295,7 @@ class MultiObjectSportsTracker:
                 ncx = self.ball_state.center[0] + self.ball_state.velocity[0]
                 ncy = self.ball_state.center[1] + nvy*dt
                 self.ball_state.center = (ncx, ncy)
-                self.ball_state.velocity = (self.ball_state.velocity[0], nvy) 
-
+                self.ball_state.velocity = (self.ball_state.velocity[0], nvy)
     def get_primary_track(self, prev_ball_carrier: Optional[int] = None) -> Optional[Track]:
         if not self.tracks:
             return None
@@ -1440,7 +1315,7 @@ class MultiObjectSportsTracker:
             else:
                 self.ball_state.is_possessed = False
                 self.ball_state.possessor_track_id = None
-                return None 
+                return None
         active = [t for t in self.tracks.values() if t.status == TrackingStatus.ACTIVE]
         if not active:
             return None
@@ -1454,7 +1329,6 @@ class MultiObjectSportsTracker:
             if s > best_score:
                 best_score, best = s, t
         return best
-
     def predict_ball_trajectory(self, n_frames: int = 10) -> List[Tuple[float, float]]:
         if self.ball_state.center is None or not self.ball_state.is_airborne:
             return []
@@ -1465,7 +1339,7 @@ class MultiObjectSportsTracker:
             traj.append((cx, cy))
         return traj
 
-# ── Adaptive Velocity-Aware Smoother (AVS) ────────────────────────────────────
+# ── Adaptive Velocity-Aware Smoother (AVS) (unchanged) ──────────────────────
 class AdaptiveVelocityAwareSmoother:
     def __init__(self, fps: float, base_window_sec: float = AVS_BASE_WINDOW_SEC) -> None:
         self.fps         = fps
@@ -1482,7 +1356,6 @@ class AdaptiveVelocityAwareSmoother:
         self.prev_velocity: Tuple[float, float] = (0.0, 0.0)
         self._raw_diffs:    List[float] = []
         self._smooth_diffs: List[float] = []
-
     def _push(self, cx: float, cy: float, conf: float) -> None:
         self._cx[self._head]   = cx
         self._cy[self._head]   = cy
@@ -1490,13 +1363,11 @@ class AdaptiveVelocityAwareSmoother:
         self._head  = (self._head + 1) % self._cap
         if self._count < self._cap:
             self._count += 1
-
     def _window_arr(self, w: int) -> Tuple[np.ndarray, np.ndarray]:
         n = min(w, self._count)
         idx = [(self._head - 1 - i) % self._cap for i in range(n)]
         idx.reverse()
         return self._cx[idx], self._cy[idx]
-
     def _compute_adaptive_window(self, velocity: float, accel: float,
                                  confidence: float, phase: PlayPhase) -> int:
         w = int(self.fps * self.base_window)
@@ -1514,7 +1385,6 @@ class AdaptiveVelocityAwareSmoother:
             w = int(w * 1.5)
         w = max(5, min(w, int(self.fps * AVS_MAX_WINDOW_SEC)))
         return w | 1
-
     def smooth(self, cx: float, cy: float, confidence: float = 1.0,
                phase: PlayPhase = PlayPhase.HALF_COURT) -> Tuple[float, float]:
         if self.prev_smooth_cx is not None:
@@ -1522,13 +1392,11 @@ class AdaptiveVelocityAwareSmoother:
                                               cy - self.prev_smooth_cy))
         self._push(cx, cy, confidence)
         n = self._count
-
         if n < 5:
             if self.prev_smooth_cx is None:
                 self.prev_smooth_cx = cx
                 self.prev_smooth_cy = cy
             return cx, cy
-
         arr_cx, arr_cy = self._window_arr(min(n, int(self.fps * AVS_MAX_WINDOW_SEC)))
         nn = len(arr_cx)
         if nn >= 3:
@@ -1538,10 +1406,8 @@ class AdaptiveVelocityAwareSmoother:
             accel    = abs(v_curr - v_prev)
         else:
             velocity = accel = 0.0
-
         w = self._compute_adaptive_window(velocity, accel, confidence, phase)
         w = min(w, nn); w = max(w, 5); w = w | 1
-
         try:
             polyorder = min(AVS_POLYORDER, w - 1)
             if polyorder < 2: polyorder = 2
@@ -1559,7 +1425,6 @@ class AdaptiveVelocityAwareSmoother:
             alpha = 0.15
             smooth_cx = alpha*cx + (1-alpha)*(self.prev_smooth_cx or cx)
             smooth_cy = alpha*cy + (1-alpha)*(self.prev_smooth_cy or cy)
-
         if self.prev_smooth_cx is not None:
             dvx = smooth_cx - self.prev_smooth_cx
             dvy = smooth_cy - self.prev_smooth_cy
@@ -1568,7 +1433,6 @@ class AdaptiveVelocityAwareSmoother:
             if cvm > pvm * 2.5 and pvm > 5.0:
                 smooth_cx = self.prev_smooth_cx + dvx * 0.5
                 smooth_cy = self.prev_smooth_cy + dvy * 0.5
-
         if self.prev_smooth_cx is not None:
             self._smooth_diffs.append(math.hypot(smooth_cx - self.prev_smooth_cx,
                                                  smooth_cy - self.prev_smooth_cy))
@@ -1576,7 +1440,6 @@ class AdaptiveVelocityAwareSmoother:
         self.prev_smooth_cy = smooth_cy
         self.prev_velocity  = (smooth_cx - cx, smooth_cy - cy)
         return float(smooth_cx), float(smooth_cy)
-
     def get_metrics(self) -> Dict[str, float]:
         raw_j = float(np.mean(self._raw_diffs))    if self._raw_diffs    else 0.0
         smo_j = float(np.mean(self._smooth_diffs)) if self._smooth_diffs else 0.0
@@ -1585,7 +1448,7 @@ class AdaptiveVelocityAwareSmoother:
         return {"jitter_raw": round(raw_j, 2), "jitter_smooth": round(smo_j, 2),
                 "smoothness_pct": round(pct, 1)}
 
-# ── Intelligent Crop Strategy (ICS) ──────────────────────────────────────────
+# ── Intelligent Crop Strategy (ICS) with larger ball margin ──────────────────
 class IntelligentCropStrategy:
     def __init__(self, orig_w: int, orig_h: int, crop_w: int, crop_h: int, fps: float) -> None:
         self.orig_w = orig_w; self.orig_h = orig_h
@@ -1598,7 +1461,6 @@ class IntelligentCropStrategy:
         self._cached_vy: float = 0.0
         self._prev_cx: Optional[float] = None
         self._prev_cy: Optional[float] = None
-
     def compute_crop(self, cx: float, cy: float,
                      phase: PlayPhase = PlayPhase.HALF_COURT,
                      ball_pos: Optional[Tuple[float, float]] = None) -> Tuple[int, int, int, int]:
@@ -1633,7 +1495,9 @@ class IntelligentCropStrategy:
         top  = max(0, min(top,  max(0, self.orig_h - self.crop_h)))
         right, bottom = left+self.crop_w, top+self.crop_h
         if ball_pos is not None:
-            bx, by = ball_pos; m = self.crop_w * 0.15
+            bx, by = ball_pos
+            # FIX: Increased margin from 0.15 to 0.35 to keep ball inside crop
+            m = self.crop_w * 0.35
             if bx < left+m:
                 left  = max(0, left-int(left+m-bx)); right = left+self.crop_w
             elif bx > right-m:
@@ -1644,7 +1508,7 @@ class IntelligentCropStrategy:
                 top   = min(max(0,self.orig_h-self.crop_h), top+int(by-(bottom-m))); bottom=top+self.crop_h
         return left, top, right, bottom
 
-# ── Game State Engine ─────────────────────────────────────────────────────────
+# ── Game State Engine (unchanged) ───────────────────────────────────────────
 class GameStateEngine:
     def __init__(self, fps: float, frame_w: int, frame_h: int) -> None:
         self.fps = fps; self.frame_w = frame_w; self.frame_h = frame_h
@@ -1653,7 +1517,6 @@ class GameStateEngine:
         self.freeze_frame_count = 0
         self.motion_history: deque = deque(maxlen=int(fps*2))
         self.formation_history: deque = deque(maxlen=int(fps*1))
-
     def update(self, persons: List[Tuple], gray_frame: np.ndarray) -> GameState:
         if self.prev_gray is not None:
             diff = float(cv2.absdiff(self.prev_gray, gray_frame).mean())
@@ -1682,13 +1545,12 @@ class GameStateEngine:
             if near_line >= 1 and spread > 0.2 and len(persons) <= 5:
                 self.current_state = GameState.FREE_THROW; return self.current_state
         self.current_state = GameState.LIVE_PLAY; return self.current_state
-
     def get_zoom_factor(self) -> float:
         if self.current_state == GameState.FREE_THROW: return 1.1
         if self.current_state in (GameState.TIMEOUT, GameState.REPLAY): return 1.0
         return 1.15
 
-# ── Sports Play Phase Detector ────────────────────────────────────────────────
+# ── Sports Play Phase Detector (unchanged) ──────────────────────────────────
 class SportsPlayPhaseDetector:
     def __init__(self, fps: float) -> None:
         self.fps = fps
@@ -1697,7 +1559,6 @@ class SportsPlayPhaseDetector:
         self.player_spread_hist:  deque = deque(maxlen=int(fps*0.5))
         self.phase_history:       deque = deque(maxlen=5)
         self.transition_counter = 0
-
     def detect_phase(self, persons: List[Tuple], ball_box: Optional[Tuple],
                      frame_w: int, ball_state: Optional[BallState] = None) -> PlayPhase:
         if not persons:
@@ -1734,7 +1595,7 @@ class SportsPlayPhaseDetector:
         self.phase_history.append(phase)
         return phase
 
-# ── Legacy Kalman Tracker ─────────────────────────────────────────────────────
+# ── Legacy Kalman Tracker (unchanged) ───────────────────────────────────────
 class SportsKalmanTracker:
     def __init__(self, dt: float = 1.0, fps: float = 30.0) -> None:
         self.dt = dt; self.fps = fps
@@ -1752,12 +1613,10 @@ class SportsKalmanTracker:
         self.x = np.zeros((6,1), dtype=np.float64)
         self.initialized = False; self._stale_count = 0
         self._last_sensor = "none"; self._prev_accel_mag = 0.0
-
     def init(self, cx: float, cy: float) -> None:
         self.x = np.array([[cx],[cy],[0.],[0.],[0.],[0.]], dtype=np.float64)
         self.P = np.eye(6, dtype=np.float64) * KALMAN_INITIAL_ERROR
         self.initialized = True; self._stale_count = 0; self._last_sensor = "init"
-
     def predict(self, steps: int = 1) -> Tuple[float, float]:
         if not self.initialized: return float(self.x[0,0]), float(self.x[1,0])
         if steps == 0: return float(self.x[0,0]), float(self.x[1,0])
@@ -1765,7 +1624,6 @@ class SportsKalmanTracker:
         px = float(self.x[0,0])+float(self.x[2,0])*dt_s+0.5*float(self.x[4,0])*dt_s**2
         py = float(self.x[1,0])+float(self.x[3,0])*dt_s+0.5*float(self.x[5,0])*dt_s**2
         return px, py
-
     def predict_adaptive(self, play_phase: str, ball_is_airborne: bool = False,
                          ball_vel: Optional[Tuple] = None) -> Tuple[float, float]:
         if not self.initialized: return 0.0, 0.0
@@ -1773,7 +1631,6 @@ class SportsKalmanTracker:
                                 else 0.1 if play_phase == "rebound"
                                 else HALF_COURT_PREDICT_SEC))
         return self.predict(steps=max(1, steps))
-
     def _predict_step(self) -> None:
         if not self.initialized: return
         am = math.sqrt(float(self.x[4,0])**2+float(self.x[5,0])**2)
@@ -1783,7 +1640,6 @@ class SportsKalmanTracker:
         for i in (2, 3):
             if abs(float(self.x[i,0])) > 200:
                 self.x[i,0] = float(np.sign(self.x[i,0]))*200
-
     def update(self, cx: float, cy: float, sensor: str = "yolo") -> Tuple[float, float]:
         if not self.initialized: self.init(cx, cy); return cx, cy
         R = self.R_optical if sensor=="optical_flow" else (
@@ -1800,22 +1656,17 @@ class SportsKalmanTracker:
         self.P = (np.eye(6, dtype=np.float64) - K @ self.H) @ self.P
         self._stale_count = 0; self._last_sensor = sensor
         return float(self.x[0,0]), float(self.x[1,0])
-
     def increment_stale(self) -> None: self._predict_step()
-
     @property
     def is_stale(self) -> bool: return self._stale_count > 10
-
     @property
     def velocity(self) -> Tuple[float, float]: return float(self.x[2,0]), float(self.x[3,0])
-
     @property
     def speed(self) -> float: return math.hypot(*self.velocity)
-
     @property
     def last_sensor(self) -> str: return self._last_sensor
 
-# ── Court / field detection ───────────────────────────────────────────────────
+# ── Court / field detection (unchanged) ─────────────────────────────────────
 def detect_field_of_play(frame: np.ndarray,
                          sport_hint: str = "auto") -> Optional[np.ndarray]:
     hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -1844,14 +1695,13 @@ def detect_field_of_play(frame: np.ndarray,
         mask = np.zeros_like(mask)
         cv2.drawContours(mask, [largest], -1, 255, -1)
         return mask if cv2.countNonZero(mask) > h*w*0.10 else None
-
 def get_court_center_of_mass(field_mask: np.ndarray) -> Optional[Tuple[float, float]]:
     if field_mask is None: return None
     m = cv2.moments(field_mask)
     if m["m00"] == 0: return None
     return m["m10"]/m["m00"], m["m01"]/m["m00"]
 
-# ── Optical flow & Saliency ───────────────────────────────────────────────────
+# ── Optical flow & Saliency (unchanged) ─────────────────────────────────────
 def sports_optical_flow_center(prev: np.ndarray, curr: np.ndarray, w: int, h: int,
                                prev_center: Optional[Tuple] = None,
                                field_mask: Optional[np.ndarray] = None) -> Optional[Tuple[int, int]]:
@@ -1895,7 +1745,7 @@ def temporal_saliency_center(frame: np.ndarray,
     ys, xs = np.mgrid[0:h, 0:w]
     return int((xs*sal).sum()/t), int((ys*sal).sum()/t), sal
 
-# ── Scene change detection ────────────────────────────────────────────────────
+# ── Scene change detection (unchanged, thresholds already updated) ──────────
 def _ensure_bgr(img: Optional[np.ndarray]) -> Optional[np.ndarray]:
     if img is None: return None
     if img.ndim == 2 or (img.ndim == 3 and img.shape[2] == 1):
@@ -1933,13 +1783,12 @@ def is_scene_change(prev: Optional[np.ndarray], curr: np.ndarray,
     if is_cut: last_cut_frame = frame_count
     return is_cut, ch, last_cut_frame
 
-# ── Sports Event Detector ─────────────────────────────────────────────────────
+# ── Sports Event Detector (unchanged) ───────────────────────────────────────
 class SportsEventDetector:
     def __init__(self, fps: float = 30.0) -> None:
         self.fps = fps; self.recent_ball_heights: List[float] = []
         self.event_active = False; self.event_end_frame = 0
         self._frame_count = 0; self._event_flags: Dict[int, bool] = {}
-
     def update(self, ball_box: Optional[Tuple], primary_person: Optional[Tuple],
                record_frame: Optional[int] = None) -> bool:
         self._frame_count += 1; active = False
@@ -1958,11 +1807,10 @@ class SportsEventDetector:
         self.event_active = active
         if record_frame is not None: self._event_flags[record_frame] = active
         return active
-
     def event_active_for(self, fi: int) -> bool:
         return self._event_flags.get(fi, False)
 
-# ── Subject detection ─────────────────────────────────────────────────────────
+# ── Subject detection (unchanged) ───────────────────────────────────────────
 DetectionResult = namedtuple("DetectionResult",
                              ["cx", "cy", "ux1", "uy1", "ux2", "uy2", "count"])
 
@@ -2063,7 +1911,7 @@ def detect_persons_all(frame: np.ndarray, model: Any,
          if int(box.cls[0]) == PERSON_CLASS_ID],
         key=lambda b: b[0])
 
-# ── v7.0: Ball detection validation ──────────────────────────────────────────
+# ── Ball detection validation (unchanged) ───────────────────────────────────
 def _validate_ball_detection(
     bbox: Tuple[int, int, int, int],
     det_frame: np.ndarray,
@@ -2071,13 +1919,6 @@ def _validate_ball_detection(
     color_model: BallColorModel,
     det_scale: float = 1.0,
 ) -> bool:
-    """
-    Returns True if bbox passes all four gates:
-    1. Size gate   — area in [BALL_MIN_AREA_PX2, BALL_MAX_AREA_PX2]
-    2. Aspect gate — aspect ratio in [BALL_MIN_ASPECT, BALL_MAX_ASPECT]
-    3. Kalman gate — Euclidean distance to Kalman prediction ≤ BALL_MAX_GATE_PX
-    4. Color model — colour correlation ≥ BALL_COLOR_MATCH_THRESHOLD (once built)
-    """
     x1, y1, x2, y2 = bbox
     bw = max(x2 - x1, 1)
     bh = max(y2 - y1, 1)
@@ -2099,7 +1940,7 @@ def _validate_ball_detection(
             return False
     return True
 
-# ── Framing helpers ───────────────────────────────────────────────────────────
+# ── Framing helpers (unchanged) ─────────────────────────────────────────────
 def _apply_lower_third_guard(cy: int, crop_h: int, subject_cy_src: int, orig_h: int) -> int:
     hh    = crop_h // 2
     max_cy = subject_cy_src - int((1.0-LOWER_THIRD_GUARD)*crop_h) + hh
@@ -2130,7 +1971,7 @@ def talking_head_center(faces: List[Tuple], orig_w: int, orig_h: int,
     cy = _apply_lower_third_guard(cy, crop_h, fcy, orig_h)
     return cx, max(hh, min(cy, orig_h-hh))
 
-# ── Panel detection & rendering ───────────────────────────────────────────────
+# ── Panel detection & rendering (unchanged) ─────────────────────────────────
 def _detect_panel_mode(input_path: str, model: Any, fps: float, total_frames: int,
                        orig_w: int, orig_h: int, confidence: float = 0.45,
                        n_probe: int = PANEL_PROBE_COUNT,
@@ -2195,13 +2036,11 @@ class PanelSlotSmoother:
         self.alpha = alpha; self.max_jump_frac = max_jump_frac
         self._slots: List[Optional[Tuple]] = [None, None]
         self._slot_cx: List[Optional[float]] = [None, None]
-
     def _ema_box(self, prev: Optional[Tuple], new_box: Tuple, axis_size: float) -> Tuple:
         if prev is None: return tuple(float(v) for v in new_box)
         a = self.alpha; mj = axis_size*self.max_jump_frac
         s = tuple(prev[i]*(1-a)+new_box[i]*a for i in range(4))
         return tuple(float(np.clip(s[i], prev[i]-mj, prev[i]+mj)) for i in range(4))
-
     def _assign_slots(self, groups: List[List]) -> List[List]:
         if not any(groups): return [[],[]]
         gcx = [float(np.mean([(p[0]+p[2])//2 for p in g])) if g else None for g in groups]
@@ -2220,7 +2059,6 @@ class PanelSlotSmoother:
                 if d < best_d: best_d, best_g = d, gi
             if best_g >= 0: result[si] = groups[best_g]; used.add(best_g)
         return result
-
     def update(self, group_a: List, group_b: List, strip_w: float) -> Tuple[List, List]:
         assigned = self._assign_slots([group_a, group_b])
         result: List[List] = [[],[]]
@@ -2296,7 +2134,7 @@ def _render_panel_frame(frame: np.ndarray, persons: List[Tuple], out_w: int, out
         canvas[dy1:dy2, :] = PANEL_DIVIDER_COLOR
     return canvas, [list(group_a), list(group_b)]
 
-# ── Legacy optical flow / saliency ────────────────────────────────────────────
+# ── Legacy optical flow / saliency (unchanged) ──────────────────────────────
 def optical_flow_center(prev: np.ndarray, curr: np.ndarray,
                         w: int, h: int) -> Optional[Tuple[int, int]]:
     if prev is None or curr is None: return None
@@ -2327,7 +2165,7 @@ def saliency_center(frame: np.ndarray) -> Tuple[int, int]:
     ys, xs = np.mgrid[0:h, 0:w]
     return int((xs*sal).sum()/t), int((ys*sal).sum()/t)
 
-# ── Camera-path smoothing ─────────────────────────────────────────────────────
+# ── Camera-path smoothing (unchanged, but constants updated) ────────────────
 def _vel_to_window(speed: float) -> int:
     t = VELOCITY_SMOOTH_TABLE
     if speed <= t[0][0]:  return t[0][1]
@@ -2376,8 +2214,10 @@ def _apply_sports_post_smooth(dense_cx: np.ndarray, dense_cy: np.ndarray,
         vy = np.diff(damp_cy, prepend=damp_cy[0])
         prev_vx = np.roll(vx, 1); prev_vx[0] = vx[0]
         prev_vy = np.roll(vy, 1); prev_vy[0] = vy[0]
-        # v7.1 Tuning: Relaxed damping to prevent sticking
-        spike_thresh = 1.8; min_vel = 3.0; damp = 0.85 
+        # FIX: Relaxed spike detection and damping
+        spike_thresh = 2.5   # was 1.8
+        min_vel = 5.0        # was 3.0
+        damp = 0.9           # was 0.85
         mask_x = (np.abs(vx) > np.abs(prev_vx)*spike_thresh) & (np.abs(prev_vx) > min_vel)
         mask_y = (np.abs(vy) > np.abs(prev_vy)*spike_thresh) & (np.abs(prev_vy) > min_vel)
         damp_cx[mask_x] = (np.roll(damp_cx, 1)+prev_vx*damp)[mask_x]
@@ -2402,7 +2242,7 @@ def _apply_sports_post_smooth(dense_cx: np.ndarray, dense_cy: np.ndarray,
                 seg_cy=np.convolve(np.pad(damp_cy[s:e],h2,"edge"),k,"valid")[:sl]
         except Exception:
             seg_cx = damp_cx[s:e]; seg_cy = damp_cy[s:e]
-        # v7.1 Tuning: Increased alpha for less lag
+        # FIX: Increased alpha for less lag (already updated constant)
         seg_cx, seg_cy = _bidir_ema(seg_cx, seg_cy, alpha=SPORTS_POST_SMOOTH_EMA_ALPHA)
         out_cx[s:e] = seg_cx; out_cy[s:e] = seg_cy
     return out_cx, out_cy
@@ -2480,7 +2320,7 @@ def _compute_final_smoothness(raw_centers: List[Tuple], smoothed_centers: List[T
         "smoothness_pct": round(pct, 1),
     }
 
-# ── Whisper / translate ───────────────────────────────────────────────────────
+# ── Whisper / translate (unchanged) ─────────────────────────────────────────
 def _seconds_to_srt_time(s: float) -> str:
     h=int(s//3600); m=int((s%3600)//60); sc=int(s%60); ms=int((s-int(s))*1000)
     return f"{h:02d}:{m:02d}:{sc:02d},{ms:03d}"
@@ -2550,7 +2390,7 @@ def translate_srt(srt_path: str, target_language: str, source_language: str = "a
     except Exception as e:
         print(f"Translation failed: {e}",file=sys.stderr); return False
 
-# ── Clip detection ────────────────────────────────────────────────────────────
+# ── Clip detection (unchanged) ──────────────────────────────────────────────
 def _frame_saliency_score(frame: np.ndarray, prev_frame: Optional[np.ndarray]) -> float:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     lap  = min(float(cv2.Laplacian(gray,cv2.CV_64F).var())/3000.0, 1.0)
@@ -2654,7 +2494,7 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
                                       title=f"Clip {ci+1} ({ms}:{secs:02d} - {me}:{sece:02d})"))
     _p(1.0,f"Found {len(segments)} clips"); return segments
 
-# ── Analytics ─────────────────────────────────────────────────────────────────
+# ── Analytics (unchanged) ───────────────────────────────────────────────────
 def _build_analytics(input_path: str, output_path: str, orig_w: int, orig_h: int,
                      out_w: int, out_h: int, smooth_metrics: Optional[Dict]=None,
                      panel_mode: bool=False, kalman_predictions: int=0,
@@ -2695,7 +2535,7 @@ def _build_analytics(input_path: str, output_path: str, orig_w: int, orig_h: int
         a.update(resource_stats)
     return a
 
-# ── Core rendering engine ─────────────────────────────────────────────────────
+# ── Core rendering engine (unchanged) ───────────────────────────────────────
 def _render_video(input_path: str, output_path: str,
                   out_w: int, out_h: int, crop_w: int, crop_h: int,
                   orig_w: int, orig_h: int, fps: float, total_frames: int,
@@ -2720,13 +2560,11 @@ def _render_video(input_path: str, output_path: str,
                   overlay_config: Optional[OverlayConfig] = None,
                   ) -> Dict[str,Any]:
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
-    # Resolve overlay config — backward compat: draw_tracking_boxes=True → default OverlayConfig
     eff_overlay: Optional[OverlayConfig] = None
     if overlay_config is not None:
         eff_overlay = overlay_config
     elif draw_tracking_boxes:
         eff_overlay = OverlayConfig()
-
     eff_fps=output_fps or fps; srt_path=None
     if burn_subtitles and whisper_available():
         fd,srt_path=tempfile.mkstemp(suffix=".srt"); os.close(fd)
@@ -2745,21 +2583,16 @@ def _render_video(input_path: str, output_path: str,
     enc=_open_ffmpeg_encoder(output_path,out_w,out_h,eff_fps,audio_source=input_path,
                              crf=crf,preset=encoder_preset,audio_bitrate=audio_bitrate,
                              subtitle_path=srt_path,subtitle_style=subtitle_style,extra_vf=extra_vf)
-
     dissolve=DissolveBuffer(DISSOLVE_FRAMES)
     slot_smoother=PanelSlotSmoother() if use_panel_mode else None
     prev_slots=None; orientation=(panel_config.split_orientation if panel_config else "horizontal")
     scene_cut_set=set(scene_cuts or [])
-
-    # ball trail buffer (output-space centres)
     ball_trail_buf: deque = deque(maxlen=(eff_overlay.trail_length if eff_overlay else 20))
-
     fi=0
     try:
         with FFmpegVideoReader(input_path,orig_w,orig_h) as reader:
             for frame in reader:
                 if fi >= total_frames: break
-
                 if use_panel_mode:
                     persons=(panel_persons_map or {}).get(fi,[])
                     if not persons:
@@ -2780,12 +2613,9 @@ def _render_video(input_path: str, output_path: str,
                     if crop.shape[0]==0 or crop.shape[1]==0:
                         crop=(frame[:crop_h,:crop_w] if orig_h>=crop_h and orig_w>=crop_w else frame)
                     out_frame=cv2.resize(crop,(out_w,out_h),interpolation=cv2.INTER_LANCZOS4)
-
                     if eff_overlay is not None:
                         sx = out_w / crop_w
                         sy = out_h / crop_h
-
-                        # ball record — translate bbox from orig → crop → output coords
                         ball_rec_out: Optional[BallFrameRecord] = None
                         if ball_records and fi in ball_records:
                             br = ball_records[fi]
@@ -2802,11 +2632,9 @@ def _render_video(input_path: str, output_path: str,
                                         confidence=br.confidence,
                                         source=br.source,
                                     )
-                                    # update trail
                                     trail_cx = (out_bx1+out_bx2)//2
                                     trail_cy = (out_by1+out_by2)//2
                                     ball_trail_buf.append((trail_cx, trail_cy))
-
                         if ball_rec_out is not None:
                             out_frame = _draw_tracking_overlays(
                                 out_frame,
@@ -2814,11 +2642,9 @@ def _render_video(input_path: str, output_path: str,
                                 overlay_cfg=eff_overlay,
                                 ball_trail=list(ball_trail_buf),
                             )
-
                 if vignette_strength >0: out_frame=apply_vignette(out_frame,vignette_strength)
                 if sharpen_strength >0 and not ffmpeg_sharpen:
                     out_frame=apply_sharpen(out_frame,sharpen_strength)
-
                 if fi in scene_cut_set:
                     dissolve.on_cut(out_frame)
                     ball_trail_buf.clear()
@@ -2834,7 +2660,7 @@ def _render_video(input_path: str, output_path: str,
         return {"subtitle_path":srt_path}
     return {}
 
-# ── First-pass tracking ───────────────────────────────────────────────────────
+# ── First-pass tracking (unchanged) ─────────────────────────────────────────
 def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_h: int,
                    fps: float, total_frames: int, tracking_mode: str, model: Any,
                    confidence: float, smooth_window: int, adaptive_smoothing: bool,
@@ -2914,7 +2740,7 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
             centers.append(centers[-1] if centers else (orig_w//2,orig_h//2)); speeds.append(0.0)
     return centers,speeds,scene_cuts,persons_map,kalman_pred_count
 
-# ── v7.0: Optimized sports tracking pass with Kalman, colour model, and 4-gate validation ──
+# ── Optimized sports tracking pass with ball prioritisation ─────────────────
 def _sports_tracking_pass_optimized(
     input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_h: int,
     fps: float, total_frames: int, model: Any, confidence: float,
@@ -2945,7 +2771,6 @@ def _sports_tracking_pass_optimized(
     det_cache    = DetectionCache()
     ball_tracker = BallROITracker(BALL_TRACKER_TYPE, max_age=BALL_ROI_MAX_AGE_FRAMES)
 
-    # v7.0: Kalman filter and colour model for ball
     ball_kalman       = BallKalmanFilter(fps, det_h)
     ball_color_model = BallColorModel(n_build=BALL_COLOR_MODEL_BUILD_FRAMES)
     ball_color_det   = BallColorDetector(ball_color_model)
@@ -2963,10 +2788,7 @@ def _sports_tracking_pass_optimized(
     tracker_lost_ball: bool = False
     yolo_skip = SPORTS_YOLO_SKIP_BASE
     frames_since_yolo = 0
-
-    # rolling ball size history for prediction bbox fallback
     ball_size_history: deque = deque(maxlen=10)
-    # expected area (px²) at det-scale for colour detector
     expected_ball_area: float = 400.0
 
     fi = 0
@@ -2985,15 +2807,17 @@ def _sports_tracking_pass_optimized(
                     mot_tracker.__init__(fps, orig_w, orig_h)
                     avs_smoother.__init__(fps)
                     ball_tracker.reset()
-                    ball_kalman.__init__(fps, det_h)
+                    # FIX: Do NOT reinitialize ball Kalman or colour model on scene cut
+                    # ball_kalman.__init__(fps, det_h)   # commented out
+                    # ball_color_model = BallColorModel(...) # keep existing
                     det_cache = DetectionCache()
                     prev_cx = prev_cy = None
                     frames_since_yolo = yolo_skip
                     tracker_lost_ball = False
-                    ball_found_ever = False
+                    # FIX: Keep ball_found_ever (don't reset)
+                    # ball_found_ever = False   # removed
                     ball_size_history.clear()
 
-                # Reset per-frame predict guard; predict() is called lazily inside update()
                 ball_kalman.new_frame()
 
                 # v7.1 Fix: Force YOLO if confidence drops or tracker lost, not just frame count
@@ -3006,12 +2830,10 @@ def _sports_tracking_pass_optimized(
                     or is_cut
                     or (ball_found_ever and det_cache.ball_confidence < min_ball_confidence * 0.8)
                 )
-                
                 if run_yolo:
                     frames_since_yolo = 0
                 else:
                     frames_since_yolo += 1
-                    
                 tracker_lost_ball = False
 
                 this_ball_rec = BallFrameRecord(bbox=None, confidence=0.0, source="none")
@@ -3031,9 +2853,12 @@ def _sports_tracking_pass_optimized(
                         ball_box_orig: Optional[Tuple[int,int,int,int]] = None
                         ball_conf_yolo = 0.0
                         if balls_raw and use_ball_tracking:
-                            # Apply all 4 validation gates to each candidate
+                            # FIX: lower confidence threshold for first 10 frames
+                            effective_min_conf = min_ball_confidence
+                            if fi < 10:
+                                effective_min_conf = 0.20
                             for bb in balls_raw:
-                                if bb[6] < min_ball_confidence:
+                                if bb[6] < effective_min_conf:
                                     continue
                                 cand_bbox_det = (bb[0], bb[1], bb[2], bb[3])
                                 if not _validate_ball_detection(
@@ -3042,7 +2867,6 @@ def _sports_tracking_pass_optimized(
                                     det_scale=det_scale,
                                 ):
                                     continue
-                                # accepted
                                 ball_conf_yolo = bb[6]
                                 ball_box_orig = (
                                     int(bb[0]/det_scale), int(bb[1]/det_scale),
@@ -3054,20 +2878,17 @@ def _sports_tracking_pass_optimized(
                                 if ball_size_history:
                                     expected_ball_area = float(
                                         np.mean([s[0]*s[1] for s in ball_size_history]))
-                                # update Kalman
                                 bcx_det = (bb[0]+bb[2])/2.0; bcy_det = (bb[1]+bb[3])/2.0
                                 if not ball_kalman.initialized:
                                     ball_kalman.init(bcx_det, bcy_det)
                                 else:
                                     ball_kalman.update(bcx_det, bcy_det)
-                                # feed colour model
                                 ball_color_model.add_sample(det_frame, cand_bbox_det)
-                                # init ROI tracker on the actual ball bbox
                                 vkx, vky = ball_kalman.velocity
                                 ball_tracker.init(det_frame, cand_bbox_det,
                                                   velocity=(vkx, vky),
                                                   confidence=ball_conf_yolo)
-                                break   # use best-conf passing candidate
+                                break
 
                         this_ball_rec = BallFrameRecord(
                             bbox=ball_box_orig,
@@ -3096,11 +2917,9 @@ def _sports_tracking_pass_optimized(
                 else:
                     # ── Skipped-frame ball tracking (ROI → colour → Kalman) ──
                     resolved = False
-
                     if use_ball_tracking and ball_tracker.is_active:
                         tracked_bb_det = ball_tracker.update(det_frame)
                         if tracked_bb_det is not None:
-                            # Validate with Kalman gate + size gate
                             roi_cx = (tracked_bb_det[0]+tracked_bb_det[2])/2.0
                             roi_cy = (tracked_bb_det[1]+tracked_bb_det[3])/2.0
                             roi_area = ((tracked_bb_det[2]-tracked_bb_det[0]) *
@@ -3112,7 +2931,6 @@ def _sports_tracking_pass_optimized(
                                 and roi_area <= BALL_MAX_AREA_PX2
                             )
                             if gate_ok:
-                                # Kalman update on ROI centre
                                 ball_kalman.update(roi_cx, roi_cy)
                                 tracked_ball_orig = (
                                     int(tracked_bb_det[0]/det_scale),
@@ -3135,7 +2953,6 @@ def _sports_tracking_pass_optimized(
                             det_cache.ball_box = None
 
                     if not resolved and use_ball_tracking and ball_found_ever:
-                        # colour detector fallback
                         pred_center = ball_kalman.position if ball_kalman.initialized else None
                         color_bbox = ball_color_det.detect(
                             det_frame, pred_center,
@@ -3156,7 +2973,6 @@ def _sports_tracking_pass_optimized(
                             resolved = True
 
                     if not resolved:
-                        # Kalman prediction as last resort
                         if ball_kalman.initialized and ball_found_ever:
                             kpx, kpy = ball_kalman.position
                             if ball_size_history:
@@ -3196,6 +3012,47 @@ def _sports_tracking_pass_optimized(
                 ball_center = mot_tracker.ball_state.center
                 primary_track = mot_tracker.get_primary_track(prev_ball_carrier)
 
+                # FIX: Ball-aware weighted centre if ball confidence is high and far from current crop
+                ball_confidence = this_ball_rec.confidence
+                if use_ball_tracking and ball_center is not None and ball_confidence >= 0.4:
+                    # Get current crop centre (previous centre or predicted)
+                    current_cx = prev_cx if prev_cx is not None else (orig_w/2)
+                    current_cy = prev_cy if prev_cy is not None else (orig_h/2)
+                    dist_to_ball = math.hypot(ball_center[0] - current_cx, ball_center[1] - current_cy)
+                    if dist_to_ball > crop_w * 0.2:   # ball more than 20% of crop width away
+                        # Weight: 70% ball, 30% player (if player exists)
+                        weight_ball = 0.7
+                        weight_player = 0.3
+                        if primary_track is not None:
+                            raw_cx = ball_center[0] * weight_ball + primary_track.center[0] * weight_player
+                            raw_cy = ball_center[1] * weight_ball + primary_track.center[1] * weight_player
+                        else:
+                            raw_cx = ball_center[0]
+                            raw_cy = ball_center[1]
+                        # Use this raw centre for smoothing
+                        smooth_cx, smooth_cy = avs_smoother.smooth(raw_cx, raw_cy, 0.8, current_phase)
+                        # Skip the usual logic for this frame
+                        ball_pos_orig = (float(ball_center[0]), float(ball_center[1]))
+                        left, top, right, bottom = ics.compute_crop(
+                            smooth_cx, smooth_cy, current_phase, ball_pos_orig)
+                        cx_out = (left+right)//2;  cy_out = (top+bottom)//2
+                        cx_out = max(hw, min(cx_out, orig_w-hw))
+                        cy_out = max(hh, min(cy_out, orig_h-hh))
+                        cy_out = _apply_lower_third_guard(cy_out, crop_h, cy_out, orig_h)
+                        speed = math.hypot(cx_out-(prev_cx or cx_out), cy_out-(prev_cy or cy_out))
+                        raw_centers.append((cx_out, cy_out)); speeds.append(speed)
+                        prev_cx = float(cx_out); prev_cy = float(cy_out)
+                        prev_gray = gray; prev_frame = det_frame
+                        if fi % max(1, total_frames//50) == 0:
+                            ball_src = this_ball_rec.source
+                            focus = "ball-priority"
+                            _p(fi/total_frames,
+                               f"Sports tracking {fi}/{total_frames} "
+                               f"(skip={yolo_skip}, phase={current_phase.name}, "
+                               f"ball={ball_src}, focus={focus})...")
+                        continue   # skip the rest of the standard centre selection
+
+                # Fallback to standard centre selection
                 if primary_track is not None:
                     raw_cx = float(primary_track.center[0])
                     raw_cy = float(primary_track.center[1])
@@ -3268,7 +3125,7 @@ def _sports_tracking_pass_optimized(
             if missing_fi not in person_boxes_map:
                 person_boxes_map[missing_fi] = []
 
-    # Synchronize — pad everything to the exact same length
+    # Synchronize
     actual_frames = len(raw_centers)
     if actual_frames < total_frames:
         last_center = raw_centers[-1] if raw_centers else (orig_w//2, orig_h//2)
@@ -3287,7 +3144,7 @@ def _sports_tracking_pass_optimized(
 
     return raw_centers, speeds, scene_cuts, ball_records, person_boxes_map
 
-# ── process_video — main public API ───────────────────────────────────────────
+# ── process_video (unchanged) ───────────────────────────────────────────────
 def process_video(input_path: str, output_path: str,
                   target_preset_label: str = "720p   (720x1280  - HD)",
                   tracking_mode: str = "subject", talking_head_bias: float = 0.30,
@@ -3307,7 +3164,6 @@ def process_video(input_path: str, output_path: str,
                   progress_callback=None) -> Dict[str, Any]:
     res_mon = ResourceMonitor()
     res_mon.start()
-
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
     _check_ffmpeg()
     info=get_video_info(input_path)
@@ -3359,7 +3215,6 @@ def process_video(input_path: str, output_path: str,
                               draw_tracking_boxes=False,
                               overlay_config=None,
                               progress_callback=lambda v,m:_p(0.55+v*0.43,m))
-
     res_mon.stop()
     resource_stats = res_mon.get_stats()
     _p(1.0, "Done!")
@@ -3372,7 +3227,7 @@ def process_video(input_path: str, output_path: str,
     if render_meta.get("subtitle_path"): result["subtitle_path"]=render_meta["subtitle_path"]
     return result
 
-# ── process_sports_video — optimized sports pipeline ─────────────────────────
+# ── process_sports_video (unchanged) ────────────────────────────────────────
 def process_sports_video(input_path: str, output_path: str,
                          sport_type: str = "auto",
                          target_preset_label: str = "720p   (720x1280  - HD)",
@@ -3396,7 +3251,6 @@ def process_sports_video(input_path: str, output_path: str,
                          progress_callback=None) -> Dict[str, Any]:
     res_mon = ResourceMonitor()
     res_mon.start()
-
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
     _check_ffmpeg()
     info=get_video_info(input_path)
@@ -3413,7 +3267,7 @@ def process_sports_video(input_path: str, output_path: str,
     avs_smoother   = AdaptiveVelocityAwareSmoother(fps)
     ics            = IntelligentCropStrategy(orig_w,orig_h,crop_w,crop_h,fps)
     phase_detector = SportsPlayPhaseDetector(fps)
-    _p(0.05, "Sports tracking (v7.1 — Kalman + colour model + 4-gate validation)...")
+    _p(0.05, "Sports tracking (v7.2 — ball-prioritising, reduced jitter)...")
     raw_centers, speeds, scene_cuts, ball_records, person_boxes_map = \
         _sports_tracking_pass_optimized(
             input_path=input_path, orig_w=orig_w, orig_h=orig_h,
@@ -3426,20 +3280,13 @@ def process_sports_video(input_path: str, output_path: str,
             min_ball_confidence=min_ball_confidence,
             progress_callback=lambda v,m:_p(0.05+v*0.45,m),
         )
-
-    # Sync frame count to what was actually tracked
     total_frames = len(raw_centers)
-
     _p(0.50, "Sports post-smoothing...")
     dense_cx=np.array([c[0] for c in raw_centers],dtype=float)
     dense_cy=np.array([c[1] for c in raw_centers],dtype=float)
     dense_cx,dense_cy=_apply_sports_post_smooth(dense_cx,dense_cy,fps,scene_cuts,total_frames)
     smoothed=[(int(x),int(y)) for x,y in zip(dense_cx,dense_cy)]
-
-    # Compute smoothness on final rendered path
     final_smooth_metrics = _compute_final_smoothness(raw_centers, smoothed)
-
-    # Resolve overlay: explicit OverlayConfig > draw_tracking_boxes bool > None
     eff_overlay: Optional[OverlayConfig]
     if overlay_config is not None:
         eff_overlay = overlay_config
@@ -3447,7 +3294,6 @@ def process_sports_video(input_path: str, output_path: str,
         eff_overlay = OverlayConfig()
     else:
         eff_overlay = None
-
     _p(0.55, "Rendering sports video...")
     render_meta=_render_video(
         input_path=input_path, output_path=output_path,
@@ -3466,11 +3312,10 @@ def process_sports_video(input_path: str, output_path: str,
         use_panel_mode=False,
         ball_records=ball_records,
         person_boxes_map=person_boxes_map,
-        draw_tracking_boxes=False,    # handled via overlay_config below
+        draw_tracking_boxes=False,
         overlay_config=eff_overlay,
         progress_callback=lambda v,m:_p(0.55+v*0.43,m),
     )
-
     res_mon.stop()
     resource_stats = res_mon.get_stats()
     _p(1.0, "Done!")
@@ -3481,7 +3326,7 @@ def process_sports_video(input_path: str, output_path: str,
     if render_meta.get("subtitle_path"): result["subtitle_path"]=render_meta["subtitle_path"]
     return result
 
-# ── process_clips_batch ───────────────────────────────────────────────────────
+# ── process_clips_batch (unchanged) ─────────────────────────────────────────
 def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegment],
                         target_preset_label: str = "720p   (720x1280  - HD)",
                         tracking_mode: str = "subject", talking_head_bias: float = 0.30,
