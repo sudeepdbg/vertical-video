@@ -2325,7 +2325,7 @@ def saliency_center(frame: np.ndarray) -> Tuple[int, int]:
     t = sal.sum()
     if t < 1e-6: return w//2, h//2
     ys, xs = np.mgrid[0:h, 0:w]
-    return int((xs*sal).sum()/t), int((ys*sal).sum()/t), sal
+    return int((xs*sal).sum()/t), int((ys*sal).sum()/t)
 
 # ── Camera-path smoothing ─────────────────────────────────────────────────────
 def _vel_to_window(speed: float) -> int:
