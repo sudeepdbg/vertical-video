@@ -1,6 +1,22 @@
 """
 app.py — Reframe · AI Vertical Video Studio
 Mobile-first · Light theme · Single Clip + Auto-Clip modes
+
+NOTE: ResourceMonitor v2.0 Fix
+------------------------------
+The corrected ResourceMonitor has been extracted to resource_monitor.py.
+It replaces the old version in verticalize.py with these fixes:
+  • Uses cpu_times() instead of cpu_percent() — eliminates double-counting
+  • Normalizes to 0-100% of total system capacity (÷ cpu_count)
+  • Clamps to [0, 100] — never shows impossible values like 621.5%
+  • Tracks wall time with time.monotonic() — immune to NTP skew
+
+To apply: in verticalize.py, replace the old ResourceMonitor class with
+the one from resource_monitor.py (or import from it).
+"""
+"""
+app.py — Reframe · AI Vertical Video Studio
+Mobile-first · Light theme · Single Clip + Auto-Clip modes
 """
 import streamlit as st
 import tempfile
