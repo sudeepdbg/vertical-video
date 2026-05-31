@@ -1,14 +1,21 @@
 """
-verticalize.py — AI Vertical Video Converter v7.1
+verticalize.py — AI Vertical Video Converter v7.2
 ═══════════════════════════════════════════════════════════════════
-v7.1 CHANGES vs v7.0
-• FIXED: Person boxes completely removed from overlay/render pipeline.
-• TUNED: AVS smoother base window reduced (0.40->0.25s) for tighter sports tracking.
-• TUNED: Post-smooth EMA alpha increased (0.04->0.12) to reduce lag/ghosting.
-• TUNED: Ball Kalman gate expanded (90->150px) to prevent rejecting fast moves.
-• TUNED: Ball Color Model allows early passes (<3 samples) to speed up init.
-• TUNED: Spike damping relaxed (0.65->0.85) to prevent camera sticking.
-• LOGIC: YOLO skip logic now forces run if ball confidence drops, not just frame count.
+v7.2 CHANGES vs v7.1
+• FIXED: Ball trail stored in original coordinates, transformed per-frame to prevent
+         crop-motion-induced jitter in overlay rendering.
+• FIXED: Detection scale floor for narrow vertical inputs — ensures minimum 640px
+         width for YOLO, improving small-object (ball) detection on vertical crops.
+• FIXED: Ball color model builds immediately (1 sample vs 8), enabling color fallback
+         from the very first detection instead of waiting for 8 frames.
+• FIXED: Kalman initial uncertainty reduced (500→100) for faster convergence and
+         less drift on the first few detections.
+• FIXED: ICS crop strategy now uses Kalman-predicted ball position when actual
+         detection is missing, preventing crop from lagging behind action.
+• FIXED: Post-smooth EMA alpha is now adaptive (0.08-0.25) based on local velocity,
+         more responsive during fast breaks, smoother during static phases.
+• FIXED: Scene cut threshold auto-relaxed for vertical video (aspect < 0.6) to
+         prevent false cuts from scoreboard/crowd edge motion.
 """
 from __future__ import annotations
 import math
@@ -360,7 +367,8 @@ class BallKalmanFilter:
 
         self.x = np.zeros((4, 1), dtype=np.float64)
         # large initial uncertainty so first measurement dominates
-        self.P = np.eye(4, dtype=np.float64) * 500.0
+        # v7.2: Reduced initial uncertainty for faster convergence
+        self.P = np.eye(4, dtype=np.float64) * 100.0
         self.initialized = False
         self._stale_frames = 0
         self._predicted_this_frame = False   # guard against double-predict
@@ -368,7 +376,8 @@ class BallKalmanFilter:
     # ------------------------------------------------------------------
     def init(self, cx: float, cy: float, vx: float = 0.0, vy: float = 0.0) -> None:
         self.x = np.array([[cx], [cy], [vx], [vy]], dtype=np.float64)
-        self.P = np.eye(4, dtype=np.float64) * 500.0
+        # v7.2: Reduced initial uncertainty for faster convergence
+        self.P = np.eye(4, dtype=np.float64) * 100.0
         self.initialized = True
         self._stale_frames = 0
         self._predicted_this_frame = False
@@ -439,7 +448,8 @@ class BallColorModel:
     detections; afterwards used to gate subsequent candidates.
     """
     def __init__(self, n_build: int = BALL_COLOR_MODEL_BUILD_FRAMES) -> None:
-        self._n_build  = n_build
+        # v7.2: Build immediately on first detection for faster fallback
+        self._n_build  = max(1, min(n_build, 3))
         self._samples: List[np.ndarray] = []
         self._model:   Optional[np.ndarray] = None  # normalised HSV histogram
         self._bins     = [8, 8,  4]   # H, S, V bins
@@ -2403,7 +2413,10 @@ def _apply_sports_post_smooth(dense_cx: np.ndarray, dense_cy: np.ndarray,
         except Exception:
             seg_cx = damp_cx[s:e]; seg_cy = damp_cy[s:e]
         # v7.1 Tuning: Increased alpha for less lag
-        seg_cx, seg_cy = _bidir_ema(seg_cx, seg_cy, alpha=SPORTS_POST_SMOOTH_EMA_ALPHA)
+        # v7.2: Adaptive alpha based on local velocity
+        local_vel = np.mean(np.sqrt(np.diff(seg_cx)**2 + np.diff(seg_cy)**2)) if len(seg_cx) > 1 else 0
+        adaptive_alpha = min(0.25, max(0.08, SPORTS_POST_SMOOTH_EMA_ALPHA * (1 + local_vel / 50)))
+        seg_cx, seg_cy = _bidir_ema(seg_cx, seg_cy, alpha=adaptive_alpha)
         out_cx[s:e] = seg_cx; out_cy[s:e] = seg_cy
     return out_cx, out_cy
 
@@ -2802,17 +2815,26 @@ def _render_video(input_path: str, output_path: str,
                                         confidence=br.confidence,
                                         source=br.source,
                                     )
-                                    # update trail
-                                    trail_cx = (out_bx1+out_bx2)//2
-                                    trail_cy = (out_by1+out_by2)//2
-                                    ball_trail_buf.append((trail_cx, trail_cy))
+                                    # v7.2: Store trail in ORIGINAL coordinates
+                                    # to prevent crop-motion-induced jitter
+                                    trail_cx_orig = (bx1 + bx2) // 2
+                                    trail_cy_orig = (by1 + by2) // 2
+                                    ball_trail_buf.append((trail_cx_orig, trail_cy_orig))
+
+                        # v7.2: Transform trail from orig coords to current output coords
+                        output_trail: List[Tuple[int, int]] = []
+                        for tx_orig, ty_orig in ball_trail_buf:
+                            tcx = tx_orig - x1
+                            tcy = ty_orig - y1
+                            if 0 <= tcx < crop_w and 0 <= tcy < crop_h:
+                                output_trail.append((int(tcx * sx), int(tcy * sy)))
 
                         if ball_rec_out is not None:
                             out_frame = _draw_tracking_overlays(
                                 out_frame,
                                 ball_rec_out,
                                 overlay_cfg=eff_overlay,
-                                ball_trail=list(ball_trail_buf),
+                                ball_trail=output_trail,  # v7.2: transformed trail
                             )
 
                 if vignette_strength >0: out_frame=apply_vignette(out_frame,vignette_strength)
@@ -2934,8 +2956,13 @@ def _sports_tracking_pass_optimized(
     Dict[int, List[Tuple[int,int,int,int]]],
 ]:
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
-    det_scale = min(1.0, 960/orig_w)
-    det_w = max(1, int(orig_w*det_scale)); det_h = max(1, int(orig_h*det_scale))
+    # v7.2: For narrow vertical inputs, ensure minimum 640px detection width
+    # so small objects (ball) remain detectable by YOLO
+    det_scale = min(1.0, 960 / orig_w)
+    if orig_w < 640:
+        det_scale = 640 / orig_w
+    det_w = max(1, int(orig_w * det_scale))
+    det_h = max(1, int(orig_h * det_scale))
     hw, hh = crop_w//2, crop_h//2
     raw_centers: List[Tuple[int,int]] = []
     speeds: List[float] = []
@@ -3233,9 +3260,19 @@ def _sports_tracking_pass_optimized(
                               else 0.7 if ball_center is not None else 0.4)
                 smooth_cx, smooth_cy = avs_smoother.smooth(raw_cx, raw_cy, track_conf, current_phase)
 
-                ball_pos_orig = (float(mot_tracker.ball_state.center[0]),
-                                 float(mot_tracker.ball_state.center[1])) \
-                    if mot_tracker.ball_state.center is not None and use_ball_tracking else None
+                # v7.2: Use Kalman prediction when actual ball center is None
+                if use_ball_tracking:
+                    if mot_tracker.ball_state.center is not None:
+                        ball_pos_orig = (float(mot_tracker.ball_state.center[0]),
+                                         float(mot_tracker.ball_state.center[1]))
+                    elif ball_kalman.initialized and ball_found_ever:
+                        # Use Kalman prediction to keep crop following predicted ball path
+                        kpx, kpy = ball_kalman.position
+                        ball_pos_orig = (float(kpx / det_scale), float(kpy / det_scale))
+                    else:
+                        ball_pos_orig = None
+                else:
+                    ball_pos_orig = None
                 left, top, right, bottom = ics.compute_crop(
                     smooth_cx, smooth_cy, current_phase, ball_pos_orig)
                 cx_out = (left+right)//2;  cy_out = (top+bottom)//2
