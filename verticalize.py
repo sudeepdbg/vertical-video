@@ -663,6 +663,8 @@ class ResourceMonitor:
         self._active = False
         self._thread: Optional[threading.Thread] = None
         self._known_children: Set[int] = set()
+        self._start_time: float = 0.0
+        self._stop_time: float = 0.0
 
     def _refresh_children(self) -> List[Any]:
         if self._process is None:
@@ -709,6 +711,7 @@ class ResourceMonitor:
     def start(self):
         if not self._active:
             self._active = True
+            self._start_time = time.time()
             self._known_children.clear()
             self._thread = threading.Thread(target=self._sample_loop, daemon=True)
             self._thread.start()
@@ -716,18 +719,22 @@ class ResourceMonitor:
     def stop(self):
         if self._active:
             self._active = False
+            self._stop_time = time.time()
             if self._thread:
                 self._thread.join(timeout=2.0)
             self._thread = None
 
     def get_stats(self) -> Dict[str, float]:
+        elapsed = round(self._stop_time - self._start_time, 1) if self._stop_time > self._start_time else 0.0
         if not self.cpu_samples:
-            return {"cpu_avg_pct": 0.0, "cpu_max_pct": 0.0, "ram_avg_mb": 0.0, "ram_max_mb": 0.0}
+            return {"cpu_avg_pct": 0.0, "cpu_max_pct": 0.0, "ram_avg_mb": 0.0, "ram_max_mb": 0.0,
+                    "processing_time_sec": elapsed}
         return {
-            "cpu_avg_pct": round(sum(self.cpu_samples) / len(self.cpu_samples), 1),
-            "cpu_max_pct": round(max(self.cpu_samples), 1),
-            "ram_avg_mb":  round(sum(self.ram_samples) / len(self.ram_samples), 1),
-            "ram_max_mb":  round(max(self.ram_samples), 1),
+            "cpu_avg_pct":          round(sum(self.cpu_samples) / len(self.cpu_samples), 1),
+            "cpu_max_pct":          round(max(self.cpu_samples), 1),
+            "ram_avg_mb":           round(sum(self.ram_samples) / len(self.ram_samples), 1),
+            "ram_max_mb":           round(max(self.ram_samples), 1),
+            "processing_time_sec":  elapsed,
         }
 
 # ── Feature guards ────────────────────────────────────────────────────────────
