@@ -706,9 +706,9 @@ if app_mode == "autoClip" and tab_analytics is not None:
                     smooth_color_var = "var(--grn)" if smoothness_pct > 80 else ("var(--amb)" if smoothness_pct > 50 else "var(--acc)")
 
                     # CPU / RAM / time fields from ResourceMonitor (per-clip)
-                    b_cpu_pct   = a.get('cpu_percent', 0)
-                    b_ram_mb    = a.get('ram_mb', 0)
-                    b_ram_peak  = a.get('ram_peak_mb', b_ram_mb)
+                    b_cpu_pct   = a.get('cpu_avg_pct', 0)
+                    b_ram_mb    = a.get('ram_avg_mb', 0)
+                    b_ram_peak  = a.get('ram_max_mb', b_ram_mb)
                     b_proc_secs = a.get('processing_time_sec', 0)
                     b_cpu_color = "var(--acc)" if b_cpu_pct > 80 else ("var(--amb)" if b_cpu_pct > 50 else "var(--grn)")
                     b_ram_color = "var(--acc)" if b_ram_peak > 4000 else ("var(--amb)" if b_ram_peak > 2000 else "var(--ink)")
@@ -910,9 +910,9 @@ with col_out:
                 smooth_color_var = "var(--grn)" if smoothness_pct > 80 else ("var(--amb)" if smoothness_pct > 50 else "var(--acc)")
 
                 # CPU / RAM / time fields from ResourceMonitor
-                cpu_pct   = a.get('cpu_percent', 0)
-                ram_mb    = a.get('ram_mb', 0)
-                ram_peak  = a.get('ram_peak_mb', ram_mb)
+                cpu_pct   = a.get('cpu_avg_pct', 0)
+                ram_mb    = a.get('ram_avg_mb', 0)
+                ram_peak  = a.get('ram_max_mb', ram_mb)
                 proc_secs = a.get('processing_time_sec', 0)
                 cpu_color = "var(--acc)" if cpu_pct > 80 else ("var(--amb)" if cpu_pct > 50 else "var(--grn)")
                 ram_color = "var(--acc)" if ram_peak > 4000 else ("var(--amb)" if ram_peak > 2000 else "var(--ink)")
