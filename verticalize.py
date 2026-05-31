@@ -585,6 +585,10 @@ class BallColorDetector:
 
 # ── Ball ROI tracker wrapper (v7.0: velocity-aware pad + age limit) ────────────
 class BallROITracker:
+    """
+    Ball ROI tracker with fallback when OpenCV tracking module is unavailable
+    (e.g. opencv-python-headless build).
+    """
     def __init__(self, tracker_type: str = BALL_TRACKER_TYPE,
                  max_age: int = BALL_ROI_MAX_AGE_FRAMES) -> None:
         self._type    = tracker_type
@@ -595,23 +599,35 @@ class BallROITracker:
         self._max_age = max_age
         self._last_velocity: Tuple[float, float] = (0.0, 0.0)
         self._last_conf: float = 0.0
+        # Detect if OpenCV trackers are available
+        self._has_cv_tracker = hasattr(cv2, 'TrackerCSRT_create')
 
-    def _make_tracker(self) -> Any:
-        if self._type == "CSRT":
+    def _make_tracker(self) -> Optional[Any]:
+        if not self._has_cv_tracker:
+            return None
+        try:
+            if self._type == "CSRT":
+                return cv2.TrackerCSRT_create()
+            if self._type == "KCF":
+                return cv2.TrackerKCF_create()
             return cv2.TrackerCSRT_create()
-        if self._type == "KCF":
-            return cv2.TrackerKCF_create()
-        return cv2.TrackerCSRT_create()
+        except Exception:
+            self._has_cv_tracker = False
+            return None
 
     def init(self, det_frame: np.ndarray,
              bbox_det: Tuple[int, int, int, int],
              velocity: Tuple[float, float] = (0.0, 0.0),
              confidence: float = 1.0) -> None:
         x1, y1, x2, y2 = bbox_det
-        # Use actual ball bbox for tracker init — padding caused drift
         bw = max(x2 - x1, 1); bh = max(y2 - y1, 1)
         self._tracker = self._make_tracker()
-        self._tracker.init(det_frame, (x1, y1, bw, bh))
+        if self._tracker is not None:
+            try:
+                self._tracker.init(det_frame, (x1, y1, bw, bh))
+            except Exception:
+                self._tracker = None
+                self._has_cv_tracker = False
         self._bbox_det      = bbox_det
         self._lost          = False
         self._age           = 0
@@ -619,20 +635,43 @@ class BallROITracker:
         self._last_conf     = confidence
 
     def update(self, det_frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
-        if self._tracker is None or self._lost:
+        if self._lost:
             return None
         if self._age >= self._max_age:
             self._lost = True
             return None
-        ok, (x, y, bw, bh) = self._tracker.update(det_frame)
-        if not ok or bw < 2 or bh < 2:
-            self._lost = True
-            return None
-        self._age += 1
-        # decay confidence
-        self._last_conf *= BALL_ROI_CONF_DECAY
-        self._bbox_det = (int(x), int(y), int(x + bw), int(y + bh))
-        return self._bbox_det
+
+        if self._tracker is not None:
+            try:
+                ok, (x, y, bw, bh) = self._tracker.update(det_frame)
+                if not ok or bw < 2 or bh < 2:
+                    self._lost = True
+                    return None
+                self._age += 1
+                self._last_conf *= BALL_ROI_CONF_DECAY
+                self._bbox_det = (int(x), int(y), int(x + bw), int(y + bh))
+                return self._bbox_det
+            except Exception:
+                self._tracker = None
+                self._has_cv_tracker = False
+
+        # Fallback: shift bbox by last known velocity
+        if self._bbox_det is not None:
+            vx, vy = self._last_velocity
+            x1, y1, x2, y2 = self._bbox_det
+            nx1 = int(x1 + vx); ny1 = int(y1 + vy)
+            nx2 = int(x2 + vx); ny2 = int(y2 + vy)
+            h, w = det_frame.shape[:2]
+            if nx1 < 0 or ny1 < 0 or nx2 > w or ny2 > h:
+                self._lost = True
+                return None
+            self._bbox_det = (nx1, ny1, nx2, ny2)
+            self._age += 1
+            self._last_conf *= BALL_ROI_CONF_DECAY
+            return self._bbox_det
+
+        self._lost = True
+        return None
 
     def reset(self) -> None:
         self._tracker  = None
@@ -643,7 +682,7 @@ class BallROITracker:
 
     @property
     def is_active(self) -> bool:
-        return not self._lost and self._tracker is not None and self._age < self._max_age
+        return not self._lost and self._age < self._max_age
 
     @property
     def age(self) -> int:
@@ -653,7 +692,6 @@ class BallROITracker:
     def confidence(self) -> float:
         return self._last_conf
 
-# ── Resource Monitor ──────────────────────────────────────────────────────────
 class ResourceMonitor:
     """
     CPU/RAM tracker using cpu_times() instead of cpu_percent().
