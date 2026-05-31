@@ -655,89 +655,137 @@ class BallROITracker:
 
 # ── Resource Monitor ──────────────────────────────────────────────────────────
 class ResourceMonitor:
-    """Recursively includes child processes so FFmpeg + model threads count."""
-    def __init__(self):
-        self.cpu_samples: List[float] = []
-        self.ram_samples: List[float] = []
-        self._process = psutil.Process(os.getpid()) if _PSUTIL_AVAILABLE else None
-        self._active = False
+    """
+    CPU/RAM tracker using cpu_times() instead of cpu_percent().
+
+    Fixes vs old version:
+      • cpu_times() eliminates double-counting of child threads
+      • Normalizes to 0-100% of total system capacity (÷ cpu_count)
+      • Clamps to [0, 100] — never emits impossible values like 621.5%
+      • time.monotonic() for wall time — immune to NTP skew
+    """
+
+    def __init__(self, interval_sec: float = 0.5) -> None:
+        self.interval_sec = interval_sec
+        self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._known_children: Set[int] = set()
-        self._start_time: float = 0.0
-        self._stop_time: float = 0.0
+        self._lock = threading.Lock()
+        self._samples: List[Tuple[float, float, float]] = []  # (wall, cpu_sec, ram_mb)
+        self._cpu_cores = max(1, psutil.cpu_count()) if _PSUTIL_AVAILABLE else 1
+        self._parent_proc = psutil.Process() if _PSUTIL_AVAILABLE else None
+        self._active = False
 
-    def _refresh_children(self) -> List[Any]:
-        if self._process is None:
-            return []
-        children: List[Any] = []
-        try:
-            for child in self._process.children(recursive=True):
-                try:
-                    if child.pid not in self._known_children:
-                        child.cpu_percent(interval=None)
-                        self._known_children.add(child.pid)
-                    children.append(child)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        return children
+    def start(self) -> None:
+        if self._active:
+            return
+        if not _PSUTIL_AVAILABLE or self._parent_proc is None:
+            return
+        self._stop_event.clear()
+        self._samples = []
+        self._active = True
+        self._thread = threading.Thread(target=self._collect_loop, daemon=True)
+        self._thread.start()
 
-    def _sample_loop(self):
-        if self._process:
-            self._process.cpu_percent(interval=None)
-        while self._active:
-            try:
-                if self._process:
-                    children = self._refresh_children()
-                    cpu = self._process.cpu_percent(interval=None)
-                    for child in children:
-                        try:
-                            cpu += child.cpu_percent(interval=None)
-                        except Exception:
-                            pass
-                    mem = self._process.memory_info().rss
-                    for child in children:
-                        try:
-                            mem += child.memory_info().rss
-                        except Exception:
-                            pass
-                    self.cpu_samples.append(cpu)
-                    self.ram_samples.append(mem / (1024 * 1024))
-            except Exception:
-                pass
-            time.sleep(0.5)
-
-    def start(self):
-        if not self._active:
-            self._active = True
-            self._start_time = time.time()
-            self._known_children.clear()
-            self._thread = threading.Thread(target=self._sample_loop, daemon=True)
-            self._thread.start()
-
-    def stop(self):
+    def stop(self) -> Dict[str, float]:
         if self._active:
             self._active = False
-            self._stop_time = time.time()
+            self._stop_event.set()
             if self._thread:
-                self._thread.join(timeout=2.0)
+                self._thread.join(timeout=self.interval_sec + 0.5)
             self._thread = None
+        return self._build_report()
 
-    def get_stats(self) -> Dict[str, float]:
-        elapsed = round(self._stop_time - self._start_time, 1) if self._stop_time > self._start_time else 0.0
-        if not self.cpu_samples:
-            return {"cpu_avg_pct": 0.0, "cpu_max_pct": 0.0, "ram_avg_mb": 0.0, "ram_max_mb": 0.0,
-                    "processing_time_sec": elapsed}
+    def _collect_loop(self) -> None:
+        while not self._stop_event.is_set():
+            snap = self._sample()
+            with self._lock:
+                self._samples.append(snap)
+            remaining = self.interval_sec
+            while remaining > 0 and not self._stop_event.is_set():
+                chunk = min(0.05, remaining)
+                time.sleep(chunk)
+                remaining -= chunk
+
+    def _sample(self) -> Tuple[float, float, float]:
+        wall = time.monotonic()
+        cpu_sec = 0.0
+        ram_mb = 0.0
+
+        if self._parent_proc is None:
+            return (wall, cpu_sec, ram_mb)
+
+        try:
+            parent = self._parent_proc
+            with parent.oneshot():
+                pt = parent.cpu_times()
+                cpu_sec += pt.user + pt.system
+
+            seen_pids = {parent.pid}
+            for child in parent.children(recursive=True):
+                if child.pid in seen_pids:
+                    continue
+                seen_pids.add(child.pid)
+                try:
+                    with child.oneshot():
+                        ct = child.cpu_times()
+                        cpu_sec += ct.user + ct.system
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+        try:
+            with self._parent_proc.oneshot():
+                ram_mb += self._parent_proc.memory_info().rss / (1024 * 1024)
+            for child in self._parent_proc.children(recursive=True):
+                try:
+                    with child.oneshot():
+                        ram_mb += child.memory_info().rss / (1024 * 1024)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+        return (wall, cpu_sec, ram_mb)
+
+    def _build_report(self) -> Dict[str, float]:
+        with self._lock:
+            samples = list(self._samples)
+
+        n = len(samples)
+        if n < 2 or not _PSUTIL_AVAILABLE:
+            return {
+                "cpu_avg_pct": 0.0, "cpu_max_pct": 0.0,
+                "ram_avg_mb": 0.0, "ram_max_mb": 0.0,
+                "processing_time_sec": 0.0,
+            }
+
+        wall_start = samples[0][0]
+        wall_end   = samples[-1][0]
+        wall_sec   = wall_end - wall_start
+
+        cpu_start = samples[0][1]
+        cpu_end   = samples[-1][1]
+        cpu_delta = cpu_end - cpu_start
+
+        if wall_sec > 0:
+            raw_pct = (cpu_delta / wall_sec / self._cpu_cores) * 100.0
+            cpu_pct = max(0.0, min(100.0, raw_pct))
+        else:
+            cpu_pct = 0.0
+
+        ram_values = [s[2] for s in samples]
+        ram_avg = sum(ram_values) / n
+        ram_max = max(ram_values)
+
         return {
-            "cpu_avg_pct":          round(sum(self.cpu_samples) / len(self.cpu_samples), 1),
-            "cpu_max_pct":          round(max(self.cpu_samples), 1),
-            "ram_avg_mb":           round(sum(self.ram_samples) / len(self.ram_samples), 1),
-            "ram_max_mb":           round(max(self.ram_samples), 1),
-            "processing_time_sec":  elapsed,
+            "cpu_avg_pct":         round(cpu_pct, 1),
+            "cpu_max_pct":         round(cpu_pct, 1),
+            "ram_avg_mb":          round(ram_avg, 1),
+            "ram_max_mb":          round(ram_max, 1),
+            "processing_time_sec": round(wall_sec, 2),
         }
 
-# ── Feature guards ────────────────────────────────────────────────────────────
 def whisper_available() -> bool:
     try:
         import whisper
