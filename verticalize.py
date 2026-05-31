@@ -712,6 +712,7 @@ class ResourceMonitor:
         self._cpu_cores = max(1, psutil.cpu_count()) if _PSUTIL_AVAILABLE else 1
         self._parent_proc = psutil.Process() if _PSUTIL_AVAILABLE else None
         self._active = False
+        self._last_report: Dict[str, float] = {}
 
     def start(self) -> None:
         if self._active:
@@ -720,18 +721,24 @@ class ResourceMonitor:
             return
         self._stop_event.clear()
         self._samples = []
+        self._last_report = {}
         self._active = True
         self._thread = threading.Thread(target=self._collect_loop, daemon=True)
         self._thread.start()
 
-    def stop(self) -> Dict[str, float]:
+    def stop(self) -> None:
+        """Stop monitoring. Call get_stats() afterwards to retrieve results."""
         if self._active:
             self._active = False
             self._stop_event.set()
             if self._thread:
                 self._thread.join(timeout=self.interval_sec + 0.5)
             self._thread = None
-        return self._build_report()
+        self._last_report = self._build_report()
+
+    def get_stats(self) -> Dict[str, float]:
+        """Return the last computed resource report."""
+        return self._last_report
 
     def _collect_loop(self) -> None:
         while not self._stop_event.is_set():
