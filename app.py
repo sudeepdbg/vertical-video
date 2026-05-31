@@ -1,6 +1,22 @@
 """
 app.py — Reframe · AI Vertical Video Studio
 Mobile-first · Light theme · Single Clip + Auto-Clip modes
+
+NOTE: ResourceMonitor v2.0 Fix
+------------------------------
+The corrected ResourceMonitor has been extracted to resource_monitor.py.
+It replaces the old version in verticalize.py with these fixes:
+  • Uses cpu_times() instead of cpu_percent() — eliminates double-counting
+  • Normalizes to 0-100% of total system capacity (÷ cpu_count)
+  • Clamps to [0, 100] — never shows impossible values like 621.5%
+  • Tracks wall time with time.monotonic() — immune to NTP skew
+
+To apply: in verticalize.py, replace the old ResourceMonitor class with
+the one from resource_monitor.py (or import from it).
+"""
+"""
+app.py — Reframe · AI Vertical Video Studio
+Mobile-first · Light theme · Single Clip + Auto-Clip modes
 """
 import streamlit as st
 import tempfile
@@ -10,7 +26,7 @@ from verticalize import (
     process_video, process_sports_video, get_video_info, detect_clips, process_clips_batch,
     RESOLUTION_PRESETS, SUBTITLE_STYLES, TRANSLATION_LANGUAGES,
     resolve_target_size, whisper_available, translation_available,
-    ClipSegment, PanelModeConfig,
+    ClipSegment, PanelModeConfig, OverlayConfig,
 )
 
 st.set_page_config(
@@ -20,7 +36,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ─── CSS ─────────────────────────────────────────────────────────────────────
+# ─── CSS ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=DM+Serif+Display:ital@0;1&display=swap');
@@ -705,6 +721,14 @@ if app_mode == "autoClip" and tab_analytics is not None:
                     # Determine color for smoothness score
                     smooth_color_var = "var(--grn)" if smoothness_pct > 80 else ("var(--amb)" if smoothness_pct > 50 else "var(--acc)")
 
+                    # CPU / RAM / time fields from ResourceMonitor (per-clip)
+                    b_cpu_pct   = a.get('cpu_avg_pct', 0)
+                    b_ram_mb    = a.get('ram_avg_mb', 0)
+                    b_ram_peak  = a.get('ram_max_mb', b_ram_mb)
+                    b_proc_secs = a.get('processing_time_sec', 0)
+                    b_cpu_color = "var(--acc)" if b_cpu_pct > 80 else ("var(--amb)" if b_cpu_pct > 50 else "var(--grn)")
+                    b_ram_color = "var(--acc)" if b_ram_peak > 4000 else ("var(--amb)" if b_ram_peak > 2000 else "var(--ink)")
+
                     st.markdown(f"""
                  <div style="background:var(--surf);border:1px solid var(--bdr);border-radius:var(--rs);
                 padding:10px 12px;margin-bottom:8px;">
@@ -715,7 +739,29 @@ if app_mode == "autoClip" and tab_analytics is not None:
                        <span style="color:var(--grn); font-weight:600;">{a['compression_ratio']:.2f}x</span>
                      </div>
                    </div>
-                   
+
+                   <!-- System Resources Row -->
+                   <div style="margin-top:8px;padding-top:8px;border-top:1px dashed var(--bdr);">
+                     <div style="font-size:9px;font-weight:700;color:var(--ink3);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">
+                       ⚙ Resources
+                     </div>
+                     <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">
+                       <div style="text-align:center;">
+                         <div style="font-size:10px;color:var(--ink2);">Avg CPU</div>
+                         <div style="font-family:'DM Serif Display',serif;font-size:13px;color:{b_cpu_color};font-weight:600;">{b_cpu_pct:.1f}%</div>
+                       </div>
+                       <div style="text-align:center;">
+                         <div style="font-size:10px;color:var(--ink2);">Peak RAM</div>
+                         <div style="font-family:'DM Serif Display',serif;font-size:13px;color:{b_ram_color};">{b_ram_peak:.0f} MB</div>
+                         <div style="font-size:9px;color:var(--ink3);">avg {b_ram_mb:.0f} MB</div>
+                       </div>
+                       <div style="text-align:center;">
+                         <div style="font-size:10px;color:var(--ink2);">Time</div>
+                         <div style="font-family:'DM Serif Display',serif;font-size:13px;color:var(--ink);">{int(b_proc_secs//60)}m {int(b_proc_secs%60):02d}s</div>
+                       </div>
+                     </div>
+                   </div>
+
                    <!-- Smoothness Metrics Row -->
                    <div style="margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--bdr);">
                      <div style="font-size:9px; font-weight:700; color:var(--ink3); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:4px;">
@@ -874,10 +920,18 @@ with col_out:
                 jitter_raw = a.get('jitter_raw', 0)
                 jitter_smooth = a.get('jitter_smooth', 0)
                 smoothness_pct = a.get('smoothness_pct', 0)
-                
+
                 # Determine color for smoothness score
                 smooth_class = "good" if smoothness_pct > 80 else ("amb" if smoothness_pct > 50 else "bad")
                 smooth_color_var = "var(--grn)" if smoothness_pct > 80 else ("var(--amb)" if smoothness_pct > 50 else "var(--acc)")
+
+                # CPU / RAM / time fields from ResourceMonitor
+                cpu_pct   = a.get('cpu_avg_pct', 0)
+                ram_mb    = a.get('ram_avg_mb', 0)
+                ram_peak  = a.get('ram_max_mb', ram_mb)
+                proc_secs = a.get('processing_time_sec', 0)
+                cpu_color = "var(--acc)" if cpu_pct > 80 else ("var(--amb)" if cpu_pct > 50 else "var(--grn)")
+                ram_color = "var(--acc)" if ram_peak > 4000 else ("var(--amb)" if ram_peak > 2000 else "var(--ink)")
 
                 st.markdown(f"""
              <div class="rf-analytics">
@@ -899,8 +953,32 @@ with col_out:
                    <div class="rf-an-sub">{a['input_resolution']} source</div>
                  </div>
                </div>
-               
-               <!-- New Smoothness Metrics Row -->
+
+               <!-- System Resources Row -->
+               <div style="margin-top:12px;border-top:1px solid var(--bdr);padding-top:12px;">
+                 <div style="font-size:10px;font-weight:700;color:var(--ink3);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px;">
+                   ⚙ System Resources
+                 </div>
+                 <div class="rf-an-grid">
+                   <div class="rf-an-item">
+                     <div class="rf-an-label">Avg CPU</div>
+                     <div class="rf-an-val" style="color:{cpu_color}">{cpu_pct:.1f}%</div>
+                     <div class="rf-an-sub">During processing</div>
+                   </div>
+                   <div class="rf-an-item">
+                     <div class="rf-an-label">Peak RAM</div>
+                     <div class="rf-an-val" style="color:{ram_color}">{ram_peak:.0f} MB</div>
+                     <div class="rf-an-sub">Avg {ram_mb:.0f} MB</div>
+                   </div>
+                   <div class="rf-an-item">
+                     <div class="rf-an-label">Process Time</div>
+                     <div class="rf-an-val">{int(proc_secs//60)}m {int(proc_secs%60):02d}s</div>
+                     <div class="rf-an-sub">Wall clock</div>
+                   </div>
+                 </div>
+               </div>
+
+               <!-- Smoothness Metrics Row -->
                <div style="margin-top: 12px; border-top: 1px solid var(--bdr); padding-top: 12px;">
                  <div style="font-size: 10px; font-weight: 700; color: var(--ink3); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px;">
                    Camera Stability {f"· 🏀 {st.session_state.get('sport_type', '').title()}" if st.session_state.get('sport_type') else ""}
