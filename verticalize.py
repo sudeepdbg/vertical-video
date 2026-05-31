@@ -1,32 +1,25 @@
 """
-verticalize.py — AI Vertical Video Converter v7.3
+verticalize.py — AI Vertical Video Converter v7.2
 ═══════════════════════════════════════════════════════════════════
-v7.3 CHANGES vs v7.2
-• FIXED: kalman_pred_count now tracked inside smooth_centers where Kalman is used.
-• FIXED: _bidir_ema vectorized with scipy.signal.lfilter (2× faster).
-• FIXED: _trim_video accepts crf parameter instead of hardcoding 18.
-• FIXED: temporal_saliency_center uses np.average (no mgrid alloc per frame).
-• FIXED: GameStateEngine REPLAY detection uses peak prominence + auto-reset.
-• FIXED: Magic weights (0.55/0.45, 0.85/0.15) promoted to named constants.
-• FIXED: Rule-of-thirds blend skipped for 3 frames after scene cuts.
-• FIXED: process_clips_batch no longer passes sport_type to process_video.
-• FIXED: _apply_lower_third_guard parameter naming clarified.
-• FIXED: BALL_COLOR_MODEL_BUILD_FRAMES updated to 1 (matches v7.2 behavior).
-• FIXED: Input validation added to public API entry points.
-• FIXED: FFmpeg subtitle path escaping now uses proper shell quoting.
-• FIXED: detect_clips overlap guard uses strict non-overlap check.
-• FIXED: _sports_tracking_pass_optimized error recovery pads all dicts.
-• FIXED: FFmpegVideoReader off-by-one on hwaccel fallback.
-• FIXED: smooth_centers handles empty speeds array safely.
-• FIXED: _render_video refactored — subtitle/vf helpers extracted.
-• FIXED: All stderr prints replaced with logging.getLogger(__name__).
+v7.2 CHANGES vs v7.1
+• FIXED: Ball trail stored in original coordinates, transformed per-frame to prevent
+         crop-motion-induced jitter in overlay rendering.
+• FIXED: Detection scale floor for narrow vertical inputs — ensures minimum 640px
+         width for YOLO, improving small-object (ball) detection on vertical crops.
+• FIXED: Ball color model builds immediately (1 sample vs 8), enabling color fallback
+         from the very first detection instead of waiting for 8 frames.
+• FIXED: Kalman initial uncertainty reduced (500→100) for faster convergence and
+         less drift on the first few detections.
+• FIXED: ICS crop strategy now uses Kalman-predicted ball position when actual
+         detection is missing, preventing crop from lagging behind action.
+• FIXED: Post-smooth EMA alpha is now adaptive (0.08-0.25) based on local velocity,
+         more responsive during fast breaks, smoother during static phases.
+• FIXED: Scene cut threshold auto-relaxed for vertical video (aspect < 0.6) to
+         prevent false cuts from scoreboard/crowd edge motion.
 """
 from __future__ import annotations
-import logging
 import math
 import os
-import re
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -38,46 +31,30 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 from enum import Enum, auto
 import cv2
 import numpy as np
-
 try:
-    from scipy.signal import savgol_filter, lfilter
+    from scipy.signal import savgol_filter
     _SCIPY_AVAILABLE = True
 except ImportError:
     _SCIPY_AVAILABLE = False
-    lfilter = None  # type: ignore
-
 try:
     from scipy.optimize import linear_sum_assignment
     _HUNGARIAN_AVAILABLE = True
 except ImportError:
     _HUNGARIAN_AVAILABLE = False
-
 try:
     from ultralytics import YOLO as _YOLO
     _YOLO_AVAILABLE = True
 except ImportError:
     _YOLO_AVAILABLE = False
-
 try:
     import psutil
     _PSUTIL_AVAILABLE = True
 except ImportError:
     _PSUTIL_AVAILABLE = False
 
-# ── Module logger ─────────────────────────────────────────────────────────────
-_log = logging.getLogger(__name__)
-
 # ── Custom exception ──────────────────────────────────────────────────────────
 class ProcessingError(Exception):
     pass
-
-# ── Named constants (was: magic inline weights) ───────────────────────────────
-BALL_PERSON_BLEND_BALL   = 0.55
-BALL_PERSON_BLEND_PERSON = 0.45
-ROT_DAMPING_KEEP         = 0.85
-ROT_DAMPING_PULL         = 0.15
-TALKING_HEAD_BIAS_DEFAULT = 0.30
-SCENE_CUT_ROT_SKIP_FRAMES = 3
 
 # ── Enums & Constants ─────────────────────────────────────────────────────────
 class PlayPhase(Enum):
@@ -191,8 +168,7 @@ BALL_MAX_ASPECT             = 2.50
 # v7.1 Tuning: Increased gate to prevent rejecting fast moves
 BALL_MAX_GATE_PX            = 150    
 BALL_COLOR_MATCH_THRESHOLD  = 0.30  
-# v7.3 FIX: Updated to 1 to match v7.2 immediate-build behavior
-BALL_COLOR_MODEL_BUILD_FRAMES = 1
+BALL_COLOR_MODEL_BUILD_FRAMES = 8
 
 VELOCITY_SMOOTH_TABLE: List[Tuple[float, int]] = [
     (0.0, 61), (3.0, 53), (8.0, 43), (15.0, 33),
@@ -284,8 +260,8 @@ class PanelModeConfig:
         if not (1 <= self.n_splits <= 4):
             raise ValueError(f"n_splits must be between 1 and 4")
         if self.n_splits > 2:
-            _log.warning(f"[PanelModeConfig] n_splits={self.n_splits} not fully implemented; "
-                         f"falling back to 2 splits.")
+            print(f"[PanelModeConfig] n_splits={self.n_splits} not fully implemented; "
+                  "falling back to 2 splits.", file=sys.stderr)
 
 @dataclass
 class Track:
@@ -506,7 +482,7 @@ class BallColorModel:
         # v7.1 Fix: Allow early passes if model isn't robust yet to speed up init
         if self._model is None or len(self._samples) < 3:
             return 1.0   
-
+        
         x1, y1, x2, y2 = bbox
         patch = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)] 
         if patch.size == 0:
@@ -1016,39 +992,11 @@ class FFmpegVideoReader:
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                     bufsize=buf_size,
                 )
-                # v7.3 FIX: Use select/poll to check readability without consuming frame
-                import select
-                readable, _, _ = select.select([proc.stdout], [], [], 5.0)
-                if readable:
-                    # Peek without consuming — check if at least frame_bytes available
-                    import fcntl
-                    import struct
-                    # Get available bytes in pipe buffer (Linux-specific)
-                    try:
-                        buf_avail = struct.unpack(
-                            'i', 
-                            fcntl.ioctl(proc.stdout.fileno(), 0x541B, struct.pack('i', 0))
-                        )[0]
-                    except (OSError, ImportError):
-                        # Fallback: read one frame but keep it as leftover
-                        test = proc.stdout.read(self._frame_bytes)
-                        if len(test) == self._frame_bytes:
-                            self._proc     = proc
-                            self._leftover = test
-                            return
-                        # Bad — kill and try next
-                        try: proc.stdout.close()
-                        except Exception: pass
-                        try: proc.wait(timeout=2)
-                        except Exception: proc.kill()
-                        continue
-
-                    if buf_avail >= self._frame_bytes:
-                        self._proc = proc
-                        self._leftover = b""
-                        return
-
-                # Not readable or not enough data — kill and retry
+                test = proc.stdout.read(self._frame_bytes)
+                if len(test) == self._frame_bytes:
+                    self._proc     = proc
+                    self._leftover = test
+                    return
                 try: proc.stdout.close()
                 except Exception: pass
                 try: proc.wait(timeout=2)
@@ -1123,26 +1071,15 @@ def _extract_audio_wav(vpath: str, wpath: str) -> bool:
         capture_output=True)
     return r.returncode == 0 and os.path.exists(wpath)
 
-# v7.3 FIX: Added crf parameter instead of hardcoding 18
-def _trim_video(inp: str, out: str, start: float, end: float, crf: int = 18) -> bool:
+def _trim_video(inp: str, out: str, start: float, end: float) -> bool:
     r = subprocess.run(
         ["ffmpeg", "-y", "-hwaccel", "none",
          "-ss", str(start), "-to", str(end), "-i", inp,
-         "-c:v", "libx264", "-preset", "ultrafast", "-crf", str(crf),
+         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
          "-c:a", "aac", "-b:a", "128k",
          "-avoid_negative_ts", "make_zero", "-reset_timestamps", "1", out],
         capture_output=True)
     return r.returncode == 0 and os.path.exists(out)
-
-# v7.3 FIX: Proper subtitle path escaping using shlex.quote-style handling
-def _escape_ffmpeg_path(path: str) -> str:
-    """Escape a path for FFmpeg filter expressions. Handles spaces and special chars."""
-    # FFmpeg subtitles filter expects single-quoted paths with backslash-escaped specials
-    escaped = path.replace("\\", "/").replace(":", "\\:")
-    # Also escape other FFmpeg-special characters in paths
-    for ch in ["'", "]", "[", ",", ";"]:
-        escaped = escaped.replace(ch, "\\" + ch)
-    return escaped
 
 def _open_ffmpeg_encoder(output_path: str, width: int, height: int, fps: float,
                          audio_source: Optional[str], crf: int = 23, preset: str = "fast",
@@ -1161,8 +1098,7 @@ def _open_ffmpeg_encoder(output_path: str, width: int, height: int, fps: float,
     vf: List[str] = []
     if subtitle_path and os.path.exists(subtitle_path):
         s    = subtitle_style or SUBTITLE_STYLES["Bold White (TikTok)"]
-        # v7.3 FIX: Use proper path escaping
-        sesc = _escape_ffmpeg_path(subtitle_path)
+        sesc = subtitle_path.replace("\\", "/").replace(":", r"\:")
         force = (
             f"Fontsize={s.get('fontsize',18)}, "
             f"PrimaryColour={s.get('primary_color','&H00FFFFFF')}, "
@@ -1291,11 +1227,11 @@ def _get_model(weights: str = "yolov8n.pt") -> Optional[Any]:
             try:
                 m = _YOLO(w)
                 _model_cache[weights] = m
-                _log.info(f"[Model] Loaded {w}")
+                print(f"[Model] Loaded {w}", file=sys.stderr)
                 return m
             except Exception:
                 continue
-        _log.warning("YOLO unavailable")
+        print("YOLO unavailable", file=sys.stderr)
         return None
     return _model_cache[weights]
 
@@ -1734,36 +1670,16 @@ class GameStateEngine:
         self.freeze_frame_count = 0
         self.motion_history: deque = deque(maxlen=int(fps*2))
         self.formation_history: deque = deque(maxlen=int(fps*1))
-        self._live_play_frames = 0
-        self._replay_prominence_threshold = 0.3
-        self._state_reset_frames = int(fps * 2)
-
-    def reset_on_transition(self) -> None:
-        """Reset internal counters when a major state transition is detected."""
-        self.freeze_frame_count = 0
-        self._live_play_frames = 0
-        self.motion_history.clear()
-        self.formation_history.clear()
 
     def update(self, persons: List[Tuple], gray_frame: np.ndarray) -> GameState:
         if self.prev_gray is not None:
             diff = float(cv2.absdiff(self.prev_gray, gray_frame).mean())
             self.motion_history.append(diff)
-            if diff < 1.0:
-                self.freeze_frame_count += 1
-            else:
-                self.freeze_frame_count = max(0, self.freeze_frame_count-2)
+            if diff < 1.0: self.freeze_frame_count += 1
+            else:          self.freeze_frame_count = max(0, self.freeze_frame_count-2)
             self.prev_gray = gray_frame.copy()
-        else:
-            self.prev_gray = gray_frame.copy()
-
         if self.freeze_frame_count > self.fps:
-            if self.current_state != GameState.TIMEOUT:
-                self.reset_on_transition()
-            self.current_state = GameState.TIMEOUT
-            return self.current_state
-
-        # v7.3 FIX: REPLAY detection uses peak prominence instead of raw count
+            self.current_state = GameState.TIMEOUT; return self.current_state
         if len(self.motion_history) >= int(self.fps*1.5):
             recent = list(self.motion_history)[-int(self.fps*1.5):]
             if len(recent) > 20:
@@ -1771,42 +1687,18 @@ class GameStateEngine:
                 ac  = np.correlate(arr-arr.mean(), arr-arr.mean(), mode='full')
                 ac  = ac[len(ac)//2:]
                 if len(ac) > 10:
-                    # Find peaks with prominence check
-                    peaks = []
-                    for i in range(5, min(len(ac)-1, int(self.fps))):
-                        if ac[i] > ac[i-1] and ac[i] > ac[i+1]:
-                            # Prominence = peak height relative to local baseline
-                            local_min = min(ac[max(0,i-3):i].min() if i > 0 else ac[i],
-                                          ac[i+1:min(len(ac),i+4)].min() if i < len(ac)-1 else ac[i])
-                            prominence = (ac[i] - local_min) / (ac.max() - ac.min() + 1e-9)
-                            if prominence > self._replay_prominence_threshold:
-                                peaks.append(i)
+                    peaks = [i for i in range(5, min(len(ac), int(self.fps)))
+                             if ac[i] > ac[i-1] and ac[i] > ac[i+1]]
                     if len(peaks) >= 2:
-                        if self.current_state != GameState.REPLAY:
-                            self.reset_on_transition()
-                        self.current_state = GameState.REPLAY
-                        return self.current_state
-
+                        self.current_state = GameState.REPLAY; return self.current_state
         if len(persons) >= 2:
             cy_list = [(p[1]+p[3])/2 for p in persons]
             cx_list = [(p[0]+p[2])/2 for p in persons]
             near_line = sum(1 for y in cy_list if y < self.frame_h*0.4)
             spread    = float(np.std(cx_list))/self.frame_w if len(cx_list) >1 else 0.0
             if near_line >= 1 and spread > 0.2 and len(persons) <= 5:
-                self.current_state = GameState.FREE_THROW
-                return self.current_state
-
-        # v7.3 FIX: Auto-reset to LIVE_PLAY after sustained activity
-        self._live_play_frames += 1
-        if self._live_play_frames >= self._state_reset_frames:
-            if self.current_state in (GameState.TIMEOUT, GameState.REPLAY):
-                self.reset_on_transition()
-            self.current_state = GameState.LIVE_PLAY
-            self._live_play_frames = 0
-        elif self.current_state == GameState.UNKNOWN:
-            self.current_state = GameState.LIVE_PLAY
-
-        return self.current_state
+                self.current_state = GameState.FREE_THROW; return self.current_state
+        self.current_state = GameState.LIVE_PLAY; return self.current_state
 
     def get_zoom_factor(self) -> float:
         if self.current_state == GameState.FREE_THROW: return 1.1
@@ -2001,7 +1893,6 @@ def sports_optical_flow_center(prev: np.ndarray, curr: np.ndarray, w: int, h: in
     except Exception:
         return None
 
-# v7.3 FIX: temporal_saliency_center uses np.average with flat indices instead of mgrid
 def temporal_saliency_center(frame: np.ndarray,
                              prev_saliency: Optional[np.ndarray] = None,
                              decay: float = 0.7) -> Tuple[int, int, np.ndarray]:
@@ -2018,11 +1909,8 @@ def temporal_saliency_center(frame: np.ndarray,
     sal[:,:b]=sal[:,w-b:]=sal[:b,:]=sal[h-b:,:]=0
     t = sal.sum()
     if t < 1e-6: return w//2, h//2, sal
-    # v7.3 FIX: Use np.average with flat indices instead of allocating mgrid
-    flat_sal = sal.ravel()
-    cy = int(np.average(np.arange(h), weights=flat_sal.reshape(h, w).sum(axis=1)))
-    cx = int(np.average(np.arange(w), weights=flat_sal.reshape(h, w).sum(axis=0)))
-    return cx, cy, sal
+    ys, xs = np.mgrid[0:h, 0:w]
+    return int((xs*sal).sum()/t), int((ys*sal).sum()/t), sal
 
 # ── Scene change detection ────────────────────────────────────────────────────
 def _ensure_bgr(img: Optional[np.ndarray]) -> Optional[np.ndarray]:
@@ -2133,7 +2021,7 @@ def detect_subjects(frame: np.ndarray, model: Any, confidence: float = 0.45,
         try:
             results = model(frame, verbose=False, conf=confidence)[0]
         except Exception as e:
-            _log.error(f"det err: {e}"); return None, None, -1
+            print(f"det err: {e}", file=sys.stderr); return None, None, -1
         persons_raw, balls, _ = _parse_yolo_results(
             results.boxes if results.boxes is not None else [], 1.0, confidence)
     if not persons_raw: return None, None, -1
@@ -2204,8 +2092,8 @@ def _validate_ball_detection(
     Returns True if bbox passes all four gates:
     1. Size gate   — area in [BALL_MIN_AREA_PX2, BALL_MAX_AREA_PX2]
     2. Aspect gate — aspect ratio in [BALL_MIN_ASPECT, BALL_MAX_ASPECT]
-    3. Kalman gate — Euclidean distance to Kalman prediction <= BALL_MAX_GATE_PX
-    4. Color model — colour correlation >= BALL_COLOR_MATCH_THRESHOLD (once built)
+    3. Kalman gate — Euclidean distance to Kalman prediction ≤ BALL_MAX_GATE_PX
+    4. Color model — colour correlation ≥ BALL_COLOR_MATCH_THRESHOLD (once built)
     """
     x1, y1, x2, y2 = bbox
     bw = max(x2 - x1, 1)
@@ -2229,15 +2117,9 @@ def _validate_ball_detection(
     return True
 
 # ── Framing helpers ───────────────────────────────────────────────────────────
-# v7.3 FIX: Clarified parameter naming — subject_cy is the subject's Y coordinate
-# (which may differ from the current crop cy being computed)
-def _apply_lower_third_guard(cy: int, crop_h: int, subject_cy: int, orig_h: int) -> int:
-    """
-    Ensure the crop center `cy` does not place the subject below the lower-third guard line.
-    `subject_cy` is the subject's Y coordinate in original frame space.
-    """
+def _apply_lower_third_guard(cy: int, crop_h: int, subject_cy_src: int, orig_h: int) -> int:
     hh    = crop_h // 2
-    max_cy = subject_cy - int((1.0-LOWER_THIRD_GUARD)*crop_h) + hh
+    max_cy = subject_cy_src - int((1.0-LOWER_THIRD_GUARD)*crop_h) + hh
     return min(cy, min(max_cy, orig_h-hh))
 
 def _soi_region_label(cx: int, cy: int, w: int, h: int) -> str:
@@ -2254,7 +2136,7 @@ def frame_for_union(ux1: int, uy1: int, ux2: int, uy2: int,
     return cx, max(hh, min(cy, orig_h-hh))
 
 def talking_head_center(faces: List[Tuple], orig_w: int, orig_h: int,
-                        crop_w: int, crop_h: int, bias: float = TALKING_HEAD_BIAS_DEFAULT) -> Optional[Tuple[int, int]]:
+                        crop_w: int, crop_h: int, bias: float = 0.30) -> Optional[Tuple[int, int]]:
     if not faces: return None
     ux1 = min(f[0] for f in faces); uy1 = min(f[1] for f in faces)
     ux2 = max(f[2] for f in faces); uy2 = max(f[3] for f in faces)
@@ -2320,7 +2202,8 @@ def _detect_panel_mode(input_path: str, model: Any, fps: float, total_frames: in
                 float(np.mean(area_vals) if area_vals else 0) >= min_person_area_frac and
                 float(np.std(count_vals) if len(count_vals) >1 else 0) <= max_count_variance and
                 float(np.mean(aspect_vals) if aspect_vals else 0) >= min_person_aspect)
-    _log.info(f"[panel_detect] multi={multi_hits} stable={stable_split_hits} -> panel={is_panel}")
+    print(f"[panel_detect] multi={multi_hits} stable={stable_split_hits} -> panel={is_panel}",
+          file=sys.stderr)
     return is_panel
 
 class PanelSlotSmoother:
@@ -2485,34 +2368,18 @@ def _gauss_seg(xs: np.ndarray, ys: np.ndarray, window: int) -> Tuple[np.ndarray,
     sy = np.convolve(np.pad(ys, h2, "edge"), k, "valid")[:n]
     return sx, sy
 
-# v7.3 FIX: _bidir_ema vectorized with scipy.signal.lfilter
 def _bidir_ema(xs: np.ndarray, ys: np.ndarray, alpha: float = 0.06) -> Tuple[np.ndarray, np.ndarray]:
     n = len(xs)
     if n < 2: return np.array(xs, dtype=float), np.array(ys, dtype=float)
-
-    if lfilter is not None:
-        # Vectorized: lfilter implements the recursive EMA in C
-        # y[i] = alpha*x[i] + (1-alpha)*y[i-1]
-        # Initial condition: y[0] = x[0]
-        b = [alpha]
-        a = [1, -(1-alpha)]
-        fwd_x = lfilter(b, a, xs, zi=[xs[0]*(1-alpha)])[0]
-        fwd_y = lfilter(b, a, ys, zi=[ys[0]*(1-alpha)])[0]
-        # Backward pass: reverse, filter, reverse back
-        bwd_x = lfilter(b, a, xs[::-1], zi=[xs[-1]*(1-alpha)])[0][::-1]
-        bwd_y = lfilter(b, a, ys[::-1], zi=[ys[-1]*(1-alpha)])[0][::-1]
-        return (fwd_x + bwd_x) / 2, (fwd_y + bwd_y) / 2
-    else:
-        # Fallback: manual Python loops (original behavior)
-        def _fwd(v):
-            out=np.empty(n,dtype=float); out[0]=v[0]
-            for i in range(1,n): out[i]=alpha*v[i]+(1-alpha)*out[i-1]
-            return out
-        def _bwd(v):
-            out=np.empty(n,dtype=float); out[-1]=v[-1]
-            for i in range(n-2,-1,-1): out[i]=alpha*v[i]+(1-alpha)*out[i+1]
-            return out
-        return (_fwd(xs)+_bwd(xs))/2, (_fwd(ys)+_bwd(ys))/2
+    def _fwd(v):
+        out=np.empty(n,dtype=float); out[0]=v[0]
+        for i in range(1,n): out[i]=alpha*v[i]+(1-alpha)*out[i-1]
+        return out
+    def _bwd(v):
+        out=np.empty(n,dtype=float); out[-1]=v[-1]
+        for i in range(n-2,-1,-1): out[i]=alpha*v[i]+(1-alpha)*out[i+1]
+        return out
+    return (_fwd(xs)+_bwd(xs))/2, (_fwd(ys)+_bwd(ys))/2
 
 def _apply_sports_post_smooth(dense_cx: np.ndarray, dense_cy: np.ndarray,
                               fps: float, scene_cuts: List[int],
@@ -2560,7 +2427,6 @@ def _apply_sports_post_smooth(dense_cx: np.ndarray, dense_cy: np.ndarray,
         out_cx[s:e] = seg_cx; out_cy[s:e] = seg_cy
     return out_cx, out_cy
 
-# v7.3 FIX: smooth_centers now properly tracks kalman_pred_count and handles empty speeds
 def smooth_centers(centers: List[Tuple[int, int]], speeds: List[float],
                    base_window: int = 33, adaptive: bool = True,
                    scene_cuts: Optional[List[int]] = None,
@@ -2572,18 +2438,8 @@ def smooth_centers(centers: List[Tuple[int, int]], speeds: List[float],
     n   = len(centers)
     xs  = np.array([c[0] for c in centers], dtype=float)
     ys  = np.array([c[1] for c in centers], dtype=float)
-
-    # v7.3 FIX: Handle empty or short speeds array safely
-    if not speeds:
-        spd = np.zeros(n, dtype=float)
-    else:
-        spd = np.array(speeds[:n], dtype=float)
-        if len(spd) < n:
-            if len(spd) == 0:
-                spd = np.zeros(n, dtype=float)
-            else:
-                spd = np.pad(spd, (0, n-len(spd)), mode="edge")
-
+    spd   = np.array(speeds[:n], dtype=float)
+    if len(spd) < n: spd = np.pad(spd, (0,n-len(spd)), mode="edge")
     dx_raw = np.diff(xs); dy_raw = np.diff(ys)
     dist_r = np.sqrt(dx_raw**2+dy_raw**2)
     jitter_raw = float(np.mean(dist_r)) if len(dist_r) >0 else 0.0
@@ -2685,7 +2541,7 @@ def transcribe_to_srt(video_path: str, srt_path: str, whisper_model: str = "base
         with open(srt_path, "w",encoding="utf-8") as f: f.write("\n".join(lines))
         _p(1.0, f"{len(lines)} subtitle lines"); return True
     except Exception as e:
-        _log.error(f"Whisper failed: {e}"); return False
+        print(f"Whisper failed: {e}", file=sys.stderr); return False
     finally:
         if os.path.exists(wav_path):
             try: os.unlink(wav_path)
@@ -2712,7 +2568,7 @@ def translate_srt(srt_path: str, target_language: str, source_language: str = "a
         with open(srt_path, "w",encoding="utf-8") as f: f.write("\n".join(out)+"\n")
         _p(1.0, "Translation done"); return True
     except Exception as e:
-        _log.error(f"Translation failed: {e}"); return False
+        print(f"Translation failed: {e}",file=sys.stderr); return False
 
 # ── Clip detection ────────────────────────────────────────────────────────────
 def _frame_saliency_score(frame: np.ndarray, prev_frame: Optional[np.ndarray]) -> float:
@@ -2745,7 +2601,7 @@ def _compute_frame_scores(input_path: str, fps: float, total_frames: int,
                     _p(fi/total_frames,f"Scanning {fi}/{total_frames}...")
                 fi+=1
     except Exception as e:
-        _log.error(f"[scan] Error: {e}")
+        print(f"[scan] Error: {e}",file=sys.stderr)
     return np.array(scores,dtype=float), scene_cuts
 
 def detect_clips(input_path: str, min_duration_sec: float = 25.0,
@@ -2788,8 +2644,7 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
     cands=[]
     for pi in peaks:
         s,e=arc(pi); sc=float(ss[pi])
-        # v7.3 FIX: Strict non-overlap check (any overlap at all is rejected)
-        if not any(min(e,ce) > max(s,cs) for cs,ce,_ in cands):
+        if not any(min(e,ce)-max(s,cs)>min_duration_sec*0.5 for cs,ce,_ in cands):
             cands.append((s,e,sc))
     cands.sort(key=lambda x:x[2],reverse=True); cands=cands[:target_n_clips]; cands.sort(key=lambda x:x[0])
     _p(0.55, "SOI per clip...")
@@ -2860,69 +2715,6 @@ def _build_analytics(input_path: str, output_path: str, orig_w: int, orig_h: int
         a.update(resource_stats)
     return a
 
-# v7.3 FIX: Input validation helper for public APIs
-def _validate_paths(input_path: str, output_path: str) -> None:
-    if not isinstance(input_path, str) or not input_path:
-        raise ProcessingError("input_path must be a non-empty string")
-    if not isinstance(output_path, str) or not output_path:
-        raise ProcessingError("output_path must be a non-empty string")
-    if not os.path.exists(input_path):
-        raise ProcessingError(f"Input file not found: {input_path}")
-    if os.path.getsize(input_path) == 0:
-        raise ProcessingError(f"Input file is empty: {input_path}")
-    # Ensure output directory exists or can be created
-    out_dir = os.path.dirname(os.path.abspath(output_path))
-    if out_dir and not os.path.exists(out_dir):
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-        except OSError as e:
-            raise ProcessingError(f"Cannot create output directory {out_dir}: {e}")
-
-# ── v7.3: Extracted helpers for _render_video ─────────────────────────────────
-def _build_subtitle_for_render(
-    input_path: str,
-    burn_subtitles: bool,
-    whisper_model: str,
-    whisper_language: Optional[str],
-    subtitle_max_chars: int,
-    subtitle_translate_to: Optional[str],
-    progress_callback,
-) -> Tuple[Optional[str], Any]:
-    """Returns (srt_path_or_None, progress_value_after_subtitle)."""
-    if not (burn_subtitles and whisper_available()):
-        return None, 0.0
-    fd, srt_path = tempfile.mkstemp(suffix=".srt")
-    os.close(fd)
-    ok = transcribe_to_srt(
-        input_path, srt_path,
-        whisper_model=whisper_model,
-        language=whisper_language,
-        max_chars_per_line=subtitle_max_chars,
-        progress_callback=lambda v, m: progress_callback(0.02 + v * 0.08, m),
-    )
-    if ok and subtitle_translate_to:
-        translate_srt(srt_path, subtitle_translate_to, progress_callback=lambda v, m: progress_callback(0.10 + v * 0.03, m))
-    if not ok:
-        try:
-            os.unlink(srt_path)
-        except OSError:
-            pass
-        return None, 0.10
-    return srt_path, 0.13
-
-
-def _build_vf_chain(
-    color_grade: str,
-    ffmpeg_sharpen: bool,
-    subtitle_path: Optional[str],
-    subtitle_style_name: str,
-) -> Tuple[List[str], Dict[str, Any]]:
-    """Returns (extra_vf_list, subtitle_style_dict)."""
-    extra_vf = _build_ffmpeg_vf(color_grade, ffmpeg_sharpen)
-    subtitle_style = SUBTITLE_STYLES.get(subtitle_style_name, SUBTITLE_STYLES["Bold White (TikTok)"])
-    return extra_vf, subtitle_style
-
-
 # ── Core rendering engine ─────────────────────────────────────────────────────
 def _render_video(input_path: str, output_path: str,
                   out_w: int, out_h: int, crop_w: int, crop_h: int,
@@ -2948,7 +2740,6 @@ def _render_video(input_path: str, output_path: str,
                   overlay_config: Optional[OverlayConfig] = None,
                   ) -> Dict[str,Any]:
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
-
     # Resolve overlay config — backward compat: draw_tracking_boxes=True → default OverlayConfig
     eff_overlay: Optional[OverlayConfig] = None
     if overlay_config is not None:
@@ -2956,17 +2747,21 @@ def _render_video(input_path: str, output_path: str,
     elif draw_tracking_boxes:
         eff_overlay = OverlayConfig()
 
-    eff_fps=output_fps or fps
-
-    # v7.3: Extracted subtitle building
-    srt_path, subtitle_progress = _build_subtitle_for_render(
-        input_path, burn_subtitles, whisper_model, whisper_language,
-        subtitle_max_chars, subtitle_translate_to, _p,
-    )
-
-    # v7.3: Extracted vf chain building
-    extra_vf, subtitle_style = _build_vf_chain(color_grade, ffmpeg_sharpen, srt_path, subtitle_style_name)
-
+    eff_fps=output_fps or fps; srt_path=None
+    if burn_subtitles and whisper_available():
+        fd,srt_path=tempfile.mkstemp(suffix=".srt"); os.close(fd)
+        _p(0.02, "Transcribing...")
+        ok=transcribe_to_srt(input_path,srt_path,whisper_model=whisper_model,
+                             language=whisper_language,max_chars_per_line=subtitle_max_chars,
+                             progress_callback=lambda v,m:_p(0.02+v*0.08,m))
+        if ok and subtitle_translate_to:
+            translate_srt(srt_path,subtitle_translate_to,progress_callback=lambda v,m:_p(0.10+v*0.03,m))
+        if not ok:
+            try: os.unlink(srt_path)
+            except OSError: pass
+            srt_path=None
+    extra_vf=_build_ffmpeg_vf(color_grade, ffmpeg_sharpen)
+    subtitle_style=SUBTITLE_STYLES.get(subtitle_style_name,SUBTITLE_STYLES["Bold White (TikTok)"])
     enc=_open_ffmpeg_encoder(output_path,out_w,out_h,eff_fps,audio_source=input_path,
                              crf=crf,preset=encoder_preset,audio_bitrate=audio_bitrate,
                              subtitle_path=srt_path,subtitle_style=subtitle_style,extra_vf=extra_vf)
@@ -3073,20 +2868,18 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
                    fps: float, total_frames: int, tracking_mode: str, model: Any,
                    confidence: float, smooth_window: int, adaptive_smoothing: bool,
                    use_optical_flow: bool, rule_of_thirds: bool, scene_cut_threshold: float,
-                   talking_head_bias: float = TALKING_HEAD_BIAS_DEFAULT, use_kalman: bool = False,
+                   talking_head_bias: float = 0.30, use_kalman: bool = False,
                    panel_mode_active: bool = False,
-                   progress_callback=None) -> Tuple[List,List,List,Dict]:
+                   progress_callback=None) -> Tuple[List,List,List,Dict,int]:
     def _p(v,msg=""): progress_callback and progress_callback(v,msg)
     hw,hh=crop_w//2,crop_h//2
     centers: List[Tuple[int,int]]=[]; speeds: List[float]=[]; scene_cuts: List[int]=[]
     persons_map: Dict[int,List]={}
     prev_gray=prev_frame=prev_cx=prev_cy=prev_hist=None
-    last_cut_frame=-100; prev_ball_carrier=None; prev_saliency=None
+    last_cut_frame=-100; prev_ball_carrier=None; prev_saliency=None; kalman_pred_count=0
     det_scale=min(1.0, 960/orig_w)
     det_w=max(1,int(orig_w*det_scale)); det_h=max(1,int(orig_h*det_scale))
     fi=0
-    # v7.3 FIX: Track frames since last scene cut for rule-of-thirds skip
-    frames_since_cut = SCENE_CUT_ROT_SKIP_FRAMES + 1
     try:
         with FFmpegVideoReader(input_path,orig_w,orig_h,scale_w=det_w,scale_h=det_h) as reader:
             for det_frame in reader:
@@ -3096,12 +2889,7 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
                     prev_frame,det_frame,threshold=scene_cut_threshold,
                     prev_hist=prev_hist,frame_count=fi,last_cut_frame=last_cut_frame,
                     mode="sports" if tracking_mode=="sports_action" else "default")
-                if is_cut:
-                    scene_cuts.append(fi)
-                    prev_gray=prev_cx=prev_cy=None
-                    frames_since_cut = 0
-                else:
-                    frames_since_cut += 1
+                if is_cut: scene_cuts.append(fi); prev_gray=prev_cx=prev_cy=None
                 cx=cy=None
                 if tracking_mode=="talking_head":
                     faces=detect_faces(det_frame)
@@ -3138,12 +2926,9 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
                     scx,scy,prev_saliency=temporal_saliency_center(det_frame,prev_saliency)
                     cx=int(scx/det_scale); cy=int(scy/det_scale)
                 cx=max(hw,min(cx,orig_w-hw)); cy=max(hh,min(cy,orig_h-hh))
-
-                # v7.3 FIX: Skip rule-of-thirds blend for SCENE_CUT_ROT_SKIP_FRAMES after a cut
-                if rule_of_thirds and prev_cx is not None and frames_since_cut > SCENE_CUT_ROT_SKIP_FRAMES:
+                if rule_of_thirds and prev_cx is not None:
                     rot_cx=orig_w//3 if cx<orig_w//2 else 2*orig_w//3
-                    cx=max(hw,min(int(cx*ROT_DAMPING_KEEP+rot_cx*ROT_DAMPING_PULL),orig_w-hw))
-
+                    cx=max(hw,min(int(cx*0.85+rot_cx*0.15),orig_w-hw))
                 cy=_apply_lower_third_guard(cy,crop_h,cy,orig_h)
                 cy=max(hh,min(cy,orig_h-hh))
                 speed=math.hypot(cx-prev_cx,cy-prev_cy) if prev_cx is not None else 0.0
@@ -3153,11 +2938,10 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
                     _p(fi/total_frames,f"Tracking {fi}/{total_frames}...")
                 fi+=1
     except Exception as e:
-        _log.error(f"[tracking_pass] Error at frame {fi}: {e}")
+        print(f"[tracking_pass] Error at frame {fi}: {e}",file=sys.stderr)
         while len(centers)<total_frames:
             centers.append(centers[-1] if centers else (orig_w//2,orig_h//2)); speeds.append(0.0)
-    # v7.3 FIX: Removed kalman_pred_count from return (it was always 0 and unused here)
-    return centers,speeds,scene_cuts,persons_map
+    return centers,speeds,scene_cuts,persons_map,kalman_pred_count
 
 # ── v7.0: Optimized sports tracking pass with Kalman, colour model, and 4-gate validation ──
 def _sports_tracking_pass_optimized(
@@ -3191,7 +2975,7 @@ def _sports_tracking_pass_optimized(
     speeds: List[float] = []
     scene_cuts: List[int] = []
     ball_records: Dict[int, BallFrameRecord] = {}
-    person_boxes_map: Dict[int, List[Tuple[int,int,int,int]]]] = {}
+    person_boxes_map: Dict[int, List[Tuple[int,int,int,int]]] = {}
     det_cache    = DetectionCache()
     ball_tracker = BallROITracker(BALL_TRACKER_TYPE, max_age=BALL_ROI_MAX_AGE_FRAMES)
 
@@ -3256,12 +3040,12 @@ def _sports_tracking_pass_optimized(
                     or is_cut
                     or (ball_found_ever and det_cache.ball_confidence < min_ball_confidence * 0.8)
                 )
-
+                
                 if run_yolo:
                     frames_since_yolo = 0
                 else:
                     frames_since_yolo += 1
-
+                    
                 tracker_lost_ball = False
 
                 this_ball_rec = BallFrameRecord(bbox=None, confidence=0.0, source="none")
@@ -3341,7 +3125,7 @@ def _sports_tracking_pass_optimized(
                         mot_tracker.update(persons_orig, ball_box_orig, det_frame, p_confs)
 
                     except Exception as e:
-                        _log.error(f"[yolo] frame {fi}: {e}")
+                        print(f"[yolo] frame {fi}: {e}", file=sys.stderr)
 
                 else:
                     # ── Skipped-frame ball tracking (ROI → colour → Kalman) ──
@@ -3457,9 +3241,8 @@ def _sports_tracking_pass_optimized(
                     if active_tracks:
                         nearest = min(active_tracks, key=lambda t: math.hypot(
                             t.center[0]-ball_center[0], t.center[1]-ball_center[1]))
-                        # v7.3 FIX: Use named constants for magic weights
-                        raw_cx = ball_center[0]*BALL_PERSON_BLEND_BALL + nearest.center[0]*BALL_PERSON_BLEND_PERSON
-                        raw_cy = ball_center[1]*BALL_PERSON_BLEND_BALL + nearest.center[1]*BALL_PERSON_BLEND_PERSON
+                        raw_cx = ball_center[0]*0.55 + nearest.center[0]*0.45
+                        raw_cy = ball_center[1]*0.55 + nearest.center[1]*0.45
                     else:
                         raw_cx = float(ball_center[0])
                         raw_cy = float(ball_center[1])
@@ -3519,17 +3302,15 @@ def _sports_tracking_pass_optimized(
                        f"ball={ball_src}, focus={focus})...")
 
     except Exception as e:
-        _log.error(f"[sports_tracking_opt] Error: {e}")
-        # v7.3 FIX: Pad ALL data structures to total_frames, not just centers/speeds
+        print(f"[sports_tracking_opt] Error: {e}", file=sys.stderr)
         while len(raw_centers) < total_frames:
             raw_centers.append(raw_centers[-1] if raw_centers else (orig_w//2, orig_h//2))
             speeds.append(0.0)
-        # Ensure ball_records and person_boxes_map have entries for all frames
-        for i in range(total_frames):
-            if i not in ball_records:
-                ball_records[i] = BallFrameRecord(bbox=None, confidence=0.0, source="none")
-            if i not in person_boxes_map:
-                person_boxes_map[i] = []
+            missing_fi = len(raw_centers) - 1
+            if missing_fi not in ball_records:
+                ball_records[missing_fi] = BallFrameRecord(bbox=None, confidence=0.0, source="none")
+            if missing_fi not in person_boxes_map:
+                person_boxes_map[missing_fi] = []
 
     # Synchronize — pad everything to the exact same length
     actual_frames = len(raw_centers)
@@ -3553,7 +3334,7 @@ def _sports_tracking_pass_optimized(
 # ── process_video — main public API ───────────────────────────────────────────
 def process_video(input_path: str, output_path: str,
                   target_preset_label: str = "720p   (720x1280  - HD)",
-                  tracking_mode: str = "subject", talking_head_bias: float = TALKING_HEAD_BIAS_DEFAULT,
+                  tracking_mode: str = "subject", talking_head_bias: float = 0.30,
                   confidence: float = 0.45, smooth_window: int = 15,
                   adaptive_smoothing: bool = True, use_optical_flow: bool = True,
                   rule_of_thirds: bool = True,  scene_cut_threshold: float = 0.35,
@@ -3568,13 +3349,6 @@ def process_video(input_path: str, output_path: str,
                   ken_burns: bool = False, use_kalman: bool = False,
                   panel_config: Optional[PanelModeConfig] = None,
                   progress_callback=None) -> Dict[str, Any]:
-    # v7.3 FIX: Input validation at public API entry
-    _validate_paths(input_path, output_path)
-    if not (0 <= confidence <= 1.0):
-        raise ProcessingError(f"confidence must be in [0,1], got {confidence}")
-    if crf < 0 or crf > 51:
-        raise ProcessingError(f"crf must be in [0,51], got {crf}")
-
     res_mon = ResourceMonitor()
     res_mon.start()
 
@@ -3598,8 +3372,7 @@ def process_video(input_path: str, output_path: str,
                                           max_count_variance=panel_cfg.max_count_variance,
                                           stability_frac=panel_cfg.stability_frac)
     _p(0.05, "Tracking subjects...")
-    # v7.3 FIX: _tracking_pass no longer returns kalman_pred_count (it was always 0)
-    raw_centers,speeds,scene_cuts,persons_map=_tracking_pass(
+    raw_centers,speeds,scene_cuts,persons_map,kalman_preds=_tracking_pass(
         input_path=input_path,orig_w=orig_w,orig_h=orig_h,crop_w=crop_w,crop_h=crop_h,
         fps=fps,total_frames=total_frames,tracking_mode=tracking_mode,model=model,
         confidence=confidence,smooth_window=smooth_window,adaptive_smoothing=adaptive_smoothing,
@@ -3608,7 +3381,6 @@ def process_video(input_path: str, output_path: str,
         use_kalman=use_kalman,panel_mode_active=use_panel_mode,
         progress_callback=lambda v,m:_p(0.05+v*0.45,m))
     _p(0.50, "Smoothing camera path...")
-    # v7.3 FIX: smooth_centers now returns kalman_prediction_frames in metrics
     smoothed,smooth_metrics=smooth_centers(raw_centers,speeds,base_window=smooth_window,
                                            adaptive=adaptive_smoothing,scene_cuts=scene_cuts,
                                            use_kalman=use_kalman)
@@ -3635,7 +3407,6 @@ def process_video(input_path: str, output_path: str,
     res_mon.stop()
     resource_stats = res_mon.get_stats()
     _p(1.0, "Done!")
-    # v7.3 FIX: kalman_predictions now comes from smooth_metrics where it was actually tracked
     analytics=_build_analytics(input_path,output_path,orig_w=orig_w,orig_h=orig_h,
                                out_w=out_w,out_h=out_h,smooth_metrics=smooth_metrics,
                                panel_mode=use_panel_mode,
@@ -3667,15 +3438,6 @@ def process_sports_video(input_path: str, output_path: str,
                          overlay_config: Optional[OverlayConfig] = None,
                          min_ball_confidence: float = SPORTS_BALL_CONFIDENCE,
                          progress_callback=None) -> Dict[str, Any]:
-    # v7.3 FIX: Input validation at public API entry
-    _validate_paths(input_path, output_path)
-    if not (0 <= confidence <= 1.0):
-        raise ProcessingError(f"confidence must be in [0,1], got {confidence}")
-    if crf < 0 or crf > 51:
-        raise ProcessingError(f"crf must be in [0,51], got {crf}")
-    if sport_type not in ("auto", "basketball", "football", "soccer", "hockey"):
-        raise ProcessingError(f"sport_type must be one of: auto, basketball, football, soccer, hockey")
-
     res_mon = ResourceMonitor()
     res_mon.start()
 
@@ -3696,7 +3458,8 @@ def process_sports_video(input_path: str, output_path: str,
     ics            = IntelligentCropStrategy(orig_w,orig_h,crop_w,crop_h,fps)
     phase_detector = SportsPlayPhaseDetector(fps)
     _p(0.05, "Sports tracking (v7.1 — Kalman + colour model + 4-gate validation)...")
-    raw_centers, speeds, scene_cuts, ball_records, person_boxes_map =         _sports_tracking_pass_optimized(
+    raw_centers, speeds, scene_cuts, ball_records, person_boxes_map = \
+        _sports_tracking_pass_optimized(
             input_path=input_path, orig_w=orig_w, orig_h=orig_h,
             crop_w=crop_w, crop_h=crop_h, fps=fps, total_frames=total_frames,
             model=model, confidence=confidence,
@@ -3765,7 +3528,7 @@ def process_sports_video(input_path: str, output_path: str,
 # ── process_clips_batch ───────────────────────────────────────────────────────
 def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegment],
                         target_preset_label: str = "720p   (720x1280  - HD)",
-                        tracking_mode: str = "subject", talking_head_bias: float = TALKING_HEAD_BIAS_DEFAULT,
+                        tracking_mode: str = "subject", talking_head_bias: float = 0.30,
                         confidence: float = 0.45, smooth_window: int = 15,
                         adaptive_smoothing: bool = True, rule_of_thirds: bool = True,
                         crf: int = 23, encoder_preset: str = "fast",
@@ -3786,8 +3549,7 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
         def _cp(v,msg="",_cs=cs,_ce=ce): _p(_cs+v*(ce-_cs),msg)
         _cp(0.0,f"Clip {i+1}/{n}: trimming...")
         fd,trim_path=tempfile.mkstemp(suffix=".mp4"); os.close(fd)
-        # v7.3 FIX: Pass crf to _trim_video instead of hardcoding 18
-        ok=_trim_video(input_path,trim_path,clip.start_sec,clip.end_sec,crf=crf)
+        ok=_trim_video(input_path,trim_path,clip.start_sec,clip.end_sec)
         if not ok:
             results.append({"clip":clip, "output_path":None, "error":"Trim failed", "analytics":{}})
             if os.path.exists(trim_path):
@@ -3810,7 +3572,6 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
                                           min_ball_confidence=min_ball_confidence,
                                           progress_callback=lambda v,m:_cp(0.05+v*0.90,m))
             else:
-                # v7.3 FIX: Do NOT pass sport_type to process_video (it doesn't accept it)
                 meta=process_video(trim_path,out_path,target_preset_label=target_preset_label,
                                    tracking_mode=tracking_mode,talking_head_bias=talking_head_bias,
                                    confidence=confidence,smooth_window=smooth_window,
@@ -3824,7 +3585,7 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
                                    progress_callback=lambda v,m:_cp(0.05+v*0.90,m))
             results.append({"clip":clip, "output_path":out_path, "analytics":meta.get("analytics",{})})
         except Exception as e:
-            _log.error(f"[batch] Clip {i+1} error: {e}")
+            print(f"[batch] Clip {i+1} error: {e}",file=sys.stderr)
             results.append({"clip":clip, "output_path":None, "error":str(e), "analytics":{}})
         finally:
             if os.path.exists(trim_path):
