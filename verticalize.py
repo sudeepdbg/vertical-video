@@ -21,6 +21,10 @@ v7.3 CHANGES vs v7.2
          explicit shifted arrays, eliminating circular boundary artifacts.
 • FIXED: _detect_panel_mode uses a single FFmpegVideoReader pass for probing
          instead of one seek per frame — dramatically faster on large files.
+• FIXED: resolve_target_size and calculate_crop_dims now guarantee even,
+         positive dimensions and safe upscaling from low‑resolution sources.
+• FIXED: _render_video replaces np.clip with manual safe clamping and adds
+         fallback crop to prevent crashes when upscaling (e.g., 480p → 1080p).
 • IMPROVED: Replaced all print(..., file=sys.stderr) with stdlib logging.
 • IMPROVED: BallFrameRecord made frozen (immutable) to prevent accidental aliasing.
 • IMPROVED: Added OrigCoord / DetCoord type aliases for coordinate-space clarity.
@@ -1365,27 +1369,55 @@ def extract_thumbnail(path: str, t: float = 1.0) -> Optional[bytes]:
     return buf.tobytes() if ok else None
 
 def resolve_target_size(label: str, orig_w: int, orig_h: int) -> Tuple[int, int]:
+    """Return target width and height (both even, at least 2x2)."""
     tw, th = RESOLUTION_PRESETS.get(label, (0, 0))
     if tw == 0 and th == 0:
+        # "Match source" — derive from source, never upscale
         cw = int(orig_h * 9 / 16)
-        if cw > orig_w: cw = orig_w
+        if cw > orig_w:
+            cw = orig_w
         ch = int(cw * 16 / 9)
+        if ch > orig_h:
+            scale = orig_h / ch
+            cw = int(cw * scale)
+            ch = int(orig_h)
+        if cw > orig_w:
+            scale = orig_w / cw
+            cw = int(orig_w)
+            ch = int(ch * scale)
     else:
+        # Explicit preset selected — honour it (allow upscaling)
         cw, ch = tw, th
-    if ch > orig_h:
-        scale = orig_h / ch; cw = int(cw * scale); ch = int(orig_h)
-    if cw > orig_w:
-        scale = orig_w / cw; cw = int(orig_w); ch = int(ch * scale)
-    return max(cw - (cw % 2), 2), max(ch - (ch % 2), 2)
+    # Ensure at least 2x2 and even
+    cw = max(cw, 2)
+    ch = max(ch, 2)
+    cw = cw if cw % 2 == 0 else cw - 1
+    ch = ch if ch % 2 == 0 else ch - 1
+    return cw, ch
 
 def calculate_crop_dims(orig_w: int, orig_h: int, tw: int, th: int) -> Tuple[int, int]:
-    th    = max(th, 2)
+    """
+    Returns crop dimensions (crop_w, crop_h) that fit within the original frame.
+    Both dimensions are at least 2 and even.
+    """
+    th = max(th, 2)
     ratio = tw / th
     if (orig_w / orig_h) > ratio:
-        ch = orig_h; cw = int(round(ch * ratio))
+        ch = orig_h
+        cw = int(round(ch * ratio))
     else:
-        cw = orig_w; ch = int(round(cw / ratio))
-    return min(cw, orig_w), min(ch, orig_h)
+        cw = orig_w
+        ch = int(round(cw / ratio))
+    # Clamp to original dimensions and ensure minimum size
+    crop_w = min(max(cw, 2), orig_w)
+    crop_h = min(max(ch, 2), orig_h)
+    # Make even (required by some encoders)
+    crop_w = crop_w if crop_w % 2 == 0 else crop_w - 1
+    crop_h = crop_h if crop_h % 2 == 0 else crop_h - 1
+    # Final sanity
+    if crop_w < 2 or crop_h < 2:
+        raise ValueError(f"Crop dimensions too small: {crop_w}x{crop_h}")
+    return crop_w, crop_h
 
 
 # ── Model Cache & Face Detection ──────────────────────────────────────────────
@@ -3136,14 +3168,38 @@ def _render_video(input_path: str, output_path: str,
                     cx, cy = (smoothed_centers[fi] if fi < len(smoothed_centers)
                               else (orig_w//2, orig_h//2))
                     hw, hh = crop_w//2, crop_h//2
-                    x1 = int(np.clip(cx-hw, 0, orig_w-crop_w))
-                    y1 = int(np.clip(cy-hh, 0, orig_h-crop_h))
-                    x2 = min(x1+crop_w, orig_w); y2 = min(y1+crop_h, orig_h)
-                    x1 = max(0, x2-crop_w);      y1 = max(0, y2-crop_h)
+
+                    # ----- SAFE CLAMPING (FIXED) -----
+                    max_x = max(0, orig_w - crop_w)
+                    max_y = max(0, orig_h - crop_h)
+                    x1 = int(max(0, min(cx - hw, max_x)))
+                    y1 = int(max(0, min(cy - hh, max_y)))
+                    x2 = min(x1 + crop_w, orig_w)
+                    y2 = min(y1 + crop_h, orig_h)
+                    x1 = max(0, x2 - crop_w)
+                    y1 = max(0, y2 - crop_h)
+
+                    # ----- VALIDATE SLICE -----
+                    if x2 <= x1 or y2 <= y1:
+                        logger.warning("Invalid crop slice (%d,%d)-(%d,%d) – falling back to center",
+                                       x1, y1, x2, y2)
+                        # Fallback: center crop
+                        x1 = (orig_w - crop_w) // 2
+                        y1 = (orig_h - crop_h) // 2
+                        x2 = x1 + crop_w
+                        y2 = y1 + crop_h
+                        x1 = max(0, min(x1, max_x))
+                        y1 = max(0, min(y1, max_y))
+                        x2 = min(x1 + crop_w, orig_w)
+                        y2 = min(y1 + crop_h, orig_h)
+
                     crop = frame[y1:y2, x1:x2]
                     if crop.shape[0] == 0 or crop.shape[1] == 0:
-                        crop = (frame[:crop_h, :crop_w]
-                                if orig_h >= crop_h and orig_w >= crop_w else frame)
+                        # Emergency fallback: take top‑left corner
+                        crop = frame[:crop_h, :crop_w]
+                        if crop.shape[0] == 0 or crop.shape[1] == 0:
+                            raise ProcessingError(f"Unable to extract any crop from frame {fi}")
+
                     out_frame = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
 
                     if eff_overlay is not None:
@@ -3319,10 +3375,11 @@ def _sports_tracking_pass_optimized(
     Dict[int, List[Tuple[int,int,int,int]]],
 ]:
     def _p(v, msg=""): progress_callback and progress_callback(v, msg)
-    # Ensure minimum 640px width for vertical inputs
+    # Ensure minimum 640px width for vertical inputs and cap upscale to 2x
     det_scale = min(1.0, 960 / orig_w)
     if orig_w < 640:
         det_scale = 640 / orig_w
+    det_scale = min(det_scale, 2.0)   # FIXED: cap upscale to avoid memory explosion
     det_w = max(1, int(orig_w * det_scale))
     det_h = max(1, int(orig_h * det_scale))
     hw, hh = crop_w//2, crop_h//2
