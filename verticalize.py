@@ -1367,23 +1367,15 @@ def extract_thumbnail(path: str, t: float = 1.0) -> Optional[bytes]:
 def resolve_target_size(label: str, orig_w: int, orig_h: int) -> Tuple[int, int]:
     tw, th = RESOLUTION_PRESETS.get(label, (0, 0))
     if tw == 0 and th == 0:
-        # "Match source" — derive from source, never upscale
         cw = int(orig_h * 9 / 16)
-        if cw > orig_w:
-            cw = orig_w
+        if cw > orig_w: cw = orig_w
         ch = int(cw * 16 / 9)
-        # Only apply downscale guards for "match source" mode
-        if ch > orig_h:
-            scale = orig_h / ch
-            cw = int(cw * scale)
-            ch = int(orig_h)
-        if cw > orig_w:
-            scale = orig_w / cw
-            cw = int(orig_w)
-            ch = int(ch * scale)
     else:
-        # Explicit preset selected — honour it (allow upscaling)
         cw, ch = tw, th
+    if ch > orig_h:
+        scale = orig_h / ch; cw = int(cw * scale); ch = int(orig_h)
+    if cw > orig_w:
+        scale = orig_w / cw; cw = int(orig_w); ch = int(ch * scale)
     return max(cw - (cw % 2), 2), max(ch - (ch % 2), 2)
 
 def calculate_crop_dims(orig_w: int, orig_h: int, tw: int, th: int) -> Tuple[int, int]:
