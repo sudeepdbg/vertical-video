@@ -909,12 +909,15 @@ def apply_vignette(frame: np.ndarray, strength: float = VIGNETTE_STRENGTH) -> np
         return frame
     h, w = frame.shape[:2]
     mask = _build_vignette(w, h, strength)
-    # Guard: mask must be (h, w, 1); rebuild if cached shape is stale
-    if mask.shape[0] != h or mask.shape[1] != w:
-        key = (w, h, round(strength, 3), round(VIGNETTE_FALLOFF, 3))
-        _vignette_cache.pop(key, None)
-        if key in _vignette_insert_order:
-            _vignette_insert_order.remove(key)
+    # FIXED: proper stale-cache eviction when dimensions don't match.
+    # The cache key includes (w, h) so a true key hit should always match,
+    # but if the cache was corrupted we force a rebuild.
+    if mask.shape[:2] != (h, w) or mask.shape[2] != 1:
+        stale_keys = [k for k in list(_vignette_cache.keys()) if k[0] == w and k[1] == h]
+        for sk in stale_keys:
+            _vignette_cache.pop(sk, None)
+            if sk in _vignette_insert_order:
+                _vignette_insert_order.remove(sk)
         mask = _build_vignette(w, h, strength)
     return (frame.astype(np.float32) * mask).clip(0, 255).astype(np.uint8)
 
@@ -1009,32 +1012,50 @@ def _draw_tracking_overlays(
 
             style = cfg.ball_box_style
             if style == "rect":
-                layer = out.copy() if alpha < 1.0 else out
-                cv2.rectangle(layer, (bx1c, by1c), (bx2c, by2c), color, 2, cv2.LINE_AA)
                 if alpha < 1.0:
-                    cv2.addWeighted(layer, alpha, out, 1.0 - alpha, 0, out)
+                    layer = out.copy()
+                    cv2.rectangle(layer, (bx1c, by1c), (bx2c, by2c), color, 2, cv2.LINE_AA)
+                    # FIXED: avoid dst aliasing in addWeighted — write to temp then copy
+                    blended = cv2.addWeighted(layer, alpha, out, 1.0 - alpha, 0)
+                    out[:] = blended
+                else:
+                    cv2.rectangle(out, (bx1c, by1c), (bx2c, by2c), color, 2, cv2.LINE_AA)
             elif style == "dot":
                 bcx = (bx1c+bx2c)//2; bcy = (by1c+by2c)//2
                 r   = max(4, (bx2c-bx1c)//4)
-                layer = out.copy() if alpha < 1.0 else out
-                cv2.circle(layer, (bcx, bcy), r, color, -1, cv2.LINE_AA)
                 if alpha < 1.0:
-                    cv2.addWeighted(layer, alpha, out, 1.0 - alpha, 0, out)
+                    layer = out.copy()
+                    cv2.circle(layer, (bcx, bcy), r, color, -1, cv2.LINE_AA)
+                    blended = cv2.addWeighted(layer, alpha, out, 1.0 - alpha, 0)
+                    out[:] = blended
+                else:
+                    cv2.circle(out, (bcx, bcy), r, color, -1, cv2.LINE_AA)
             elif style in ("corners", "none"):
                 if style == "corners":
                     clen  = max(6, min((bx2c-bx1c)//4, (by2c-by1c)//4, 18))
-                    layer = out.copy() if alpha < 1.0 else out
-                    for (px, py, dx, dy) in [
-                        (bx1c, by1c,  clen,  clen), (bx2c, by1c, -clen,  clen),
-                        (bx1c, by2c,  clen, -clen), (bx2c, by2c, -clen, -clen),
-                    ]:
-                        cv2.line(layer, (px, py), (px+dx, py), color, 2, cv2.LINE_AA)
-                        cv2.line(layer, (px, py), (px, py+dy), color, 2, cv2.LINE_AA)
-                    bcx = (bx1c+bx2c)//2; bcy = (by1c+by2c)//2
-                    cv2.circle(layer, (bcx, bcy), max(2, (bx2c-bx1c)//6),
-                               color, -1, cv2.LINE_AA)
                     if alpha < 1.0:
-                        cv2.addWeighted(layer, alpha, out, 1.0 - alpha, 0, out)
+                        layer = out.copy()
+                        for (px, py, dx, dy) in [
+                            (bx1c, by1c,  clen,  clen), (bx2c, by1c, -clen,  clen),
+                            (bx1c, by2c,  clen, -clen), (bx2c, by2c, -clen, -clen),
+                        ]:
+                            cv2.line(layer, (px, py), (px+dx, py), color, 2, cv2.LINE_AA)
+                            cv2.line(layer, (px, py), (px, py+dy), color, 2, cv2.LINE_AA)
+                        bcx = (bx1c+bx2c)//2; bcy = (by1c+by2c)//2
+                        cv2.circle(layer, (bcx, bcy), max(2, (bx2c-bx1c)//6),
+                                   color, -1, cv2.LINE_AA)
+                        blended = cv2.addWeighted(layer, alpha, out, 1.0 - alpha, 0)
+                        out[:] = blended
+                    else:
+                        for (px, py, dx, dy) in [
+                            (bx1c, by1c,  clen,  clen), (bx2c, by1c, -clen,  clen),
+                            (bx1c, by2c,  clen, -clen), (bx2c, by2c, -clen, -clen),
+                        ]:
+                            cv2.line(out, (px, py), (px+dx, py), color, 2, cv2.LINE_AA)
+                            cv2.line(out, (px, py), (px, py+dy), color, 2, cv2.LINE_AA)
+                        bcx = (bx1c+bx2c)//2; bcy = (by1c+by2c)//2
+                        cv2.circle(out, (bcx, bcy), max(2, (bx2c-bx1c)//6),
+                                   color, -1, cv2.LINE_AA)
 
             if cfg.show_confidence_label and ball_record.confidence > 0:
                 label = f"{ball_record.source[0].upper()}{ball_record.confidence:.2f}"
@@ -1079,7 +1100,10 @@ class DissolveBuffer:
             self._buf = cv2.resize(self._buf,
                                    (new_frame.shape[1], new_frame.shape[0]),
                                    interpolation=cv2.INTER_LINEAR)
-        return cv2.addWeighted(self._buf, alpha, new_frame, 1.0 - alpha, 0)
+        # FIXED: ensure addWeighted result is captured (OpenCV 4.13 may have issues
+        # with in-place dst; we return the new array directly)
+        result = cv2.addWeighted(self._buf, alpha, new_frame, 1.0 - alpha, 0)
+        return result
 
     @property
     def active(self) -> bool:
@@ -1837,10 +1861,15 @@ class GameStateEngine:
 
     def update(self, persons: List[Tuple], gray_frame: np.ndarray) -> GameState:
         if self.prev_gray is not None:
-            diff = float(cv2.absdiff(self.prev_gray, gray_frame).mean())
-            self.motion_history.append(diff)
-            if diff < 1.0: self.freeze_frame_count += 1
-            else:          self.freeze_frame_count = max(0, self.freeze_frame_count - 2)
+            # FIXED: guard against shape mismatch before absdiff
+            if self.prev_gray.shape == gray_frame.shape:
+                diff = float(cv2.absdiff(self.prev_gray, gray_frame).mean())
+                self.motion_history.append(diff)
+                if diff < 1.0: self.freeze_frame_count += 1
+                else:          self.freeze_frame_count = max(0, self.freeze_frame_count - 2)
+            else:
+                self.motion_history.append(0.0)
+                self.freeze_frame_count = max(0, self.freeze_frame_count - 1)
         self.prev_gray = gray_frame.copy()
         if self.freeze_frame_count > self.fps:
             self.current_state = GameState.TIMEOUT
@@ -2094,6 +2123,10 @@ def is_sports_scene_change(prev: Optional[np.ndarray], curr: np.ndarray,
     ch = cv2.calcHist([cb], [0,1,2], None, [8,8,8], [0,256,0,256,0,256])
     ch = cv2.normalize(ch, ch).flatten()
     if pb is None: return False, ch, last_cut_frame
+    # FIXED: guard against shape mismatch before absdiff
+    if pb.shape != cb.shape:
+        logger.debug("Shape mismatch in is_sports_scene_change: %s vs %s", pb.shape, cb.shape)
+        return False, ch, last_cut_frame
     pixel_diff = float(cv2.absdiff(pb, cb).mean()) / 255.0
     hist_corr  = (cv2.compareHist(prev_hist.astype(np.float32), ch.astype(np.float32),
                                   cv2.HISTCMP_CORREL) if prev_hist is not None else 0.0)
@@ -2113,6 +2146,10 @@ def is_scene_change(prev: Optional[np.ndarray], curr: np.ndarray,
     ch = cv2.calcHist([cb], [0,1,2], None, [8,8,8], [0,256,0,256,0,256])
     ch = cv2.normalize(ch, ch).flatten()
     if pb is None: return False, ch, last_cut_frame
+    # FIXED: guard against shape mismatch before absdiff
+    if pb.shape != cb.shape:
+        logger.debug("Shape mismatch in is_scene_change: %s vs %s", pb.shape, cb.shape)
+        return False, ch, last_cut_frame
     is_cut = float(cv2.absdiff(pb, cb).mean()) / 255.0 > threshold
     if is_cut: last_cut_frame = frame_count
     return is_cut, ch, last_cut_frame
@@ -2815,8 +2852,13 @@ def _frame_saliency_score(frame: np.ndarray,
     lap    = min(float(cv2.Laplacian(gray, cv2.CV_64F).var()) / 3000.0, 1.0)
     motion = 0.0
     if prev_frame is not None:
-        motion = min(float(cv2.absdiff(
-            gray, cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)).mean()) / 30.0, 1.0)
+        prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+        # FIXED: guard against shape mismatch before absdiff
+        if prev_gray.shape == gray.shape:
+            motion = min(float(cv2.absdiff(gray, prev_gray).mean()) / 30.0, 1.0)
+        else:
+            logger.debug("Shape mismatch in _frame_saliency_score: %s vs %s",
+                         prev_gray.shape, gray.shape)
     sat = min(float(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:,:,1].mean()) / 128.0, 1.0)
     return 0.4*motion + 0.4*lap + 0.2*sat
 
@@ -2833,8 +2875,14 @@ def _compute_frame_scores(input_path: str, fps: float, total_frames: int,
                 if fi >= total_frames: break
                 if fi % sample_every == 0:
                     cg = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    if prev_gray is not None and float(cv2.absdiff(prev_gray, cg).mean())/255.0 > 0.30:
-                        scene_cuts.append(fi)
+                    if prev_gray is not None:
+                        # FIXED: guard against shape mismatch before absdiff
+                        if prev_gray.shape == cg.shape:
+                            if float(cv2.absdiff(prev_gray, cg).mean())/255.0 > 0.30:
+                                scene_cuts.append(fi)
+                        else:
+                            logger.debug("Shape mismatch in _compute_frame_scores: %s vs %s",
+                                         prev_gray.shape, cg.shape)
                     scores.append(_frame_saliency_score(frame, prev_frame))
                     prev_gray = cg; prev_frame = frame.copy()
                 if fi % max(1, total_frames//20) == 0:
@@ -3065,7 +3113,14 @@ def _render_video(input_path: str, output_path: str,
                 if fi in scene_cut_set:
                     ball_trail_buf.clear()
                     if _prev_out_frame is not None:
-                        dissolve.on_cut(_prev_out_frame)
+                        # FIXED: ensure _prev_out_frame matches current output dimensions
+                        # before passing to dissolve.on_cut (panel mode can change sizes)
+                        if _prev_out_frame.shape[:2] == (out_h, out_w):
+                            dissolve.on_cut(_prev_out_frame)
+                        else:
+                            resized = cv2.resize(_prev_out_frame, (out_w, out_h),
+                                                 interpolation=cv2.INTER_LINEAR)
+                            dissolve.on_cut(resized)
 
                 if use_panel_mode:
                     persons = (panel_persons_map or {}).get(fi, [])
@@ -3230,7 +3285,9 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
                 cy = max(hh, min(cy, orig_h-hh))
                 speed = math.hypot(cx-prev_cx, cy-prev_cy) if prev_cx is not None else 0.0
                 centers.append((cx, cy)); speeds.append(speed)
-                prev_cx = cx; prev_cy = cy; prev_gray = gray; prev_frame = det_frame
+                prev_cx = cx; prev_cy = cy; prev_gray = gray.copy()
+                # FIXED: store a copy to prevent aliasing with FFmpegVideoReader buffer
+                prev_frame = det_frame.copy()
                 if fi % max(1, total_frames//50) == 0:
                     _p(fi/total_frames, f"Tracking {fi}/{total_frames}...")
                 fi += 1
@@ -3554,7 +3611,9 @@ def _sports_tracking_pass_optimized(
                 speed = math.hypot(cx_out-(prev_cx or cx_out), cy_out-(prev_cy or cy_out))
                 raw_centers.append((cx_out, cy_out)); speeds.append(speed)
                 prev_cx = float(cx_out); prev_cy = float(cy_out)
-                prev_gray = gray; prev_frame = det_frame
+                prev_gray = gray.copy()
+                # FIXED: store a copy to prevent aliasing with FFmpegVideoReader buffer
+                prev_frame = det_frame.copy()
 
                 if fi % max(1, total_frames//50) == 0:
                     ball_src = this_ball_rec.source
