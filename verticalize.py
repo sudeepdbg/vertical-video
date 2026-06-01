@@ -908,7 +908,15 @@ def apply_vignette(frame: np.ndarray, strength: float = VIGNETTE_STRENGTH) -> np
     if strength <= 0:
         return frame
     h, w = frame.shape[:2]
-    return (frame.astype(np.float32) * _build_vignette(w, h, strength)).clip(0, 255).astype(np.uint8)
+    mask = _build_vignette(w, h, strength)
+    # Guard: mask must be (h, w, 1); rebuild if cached shape is stale
+    if mask.shape[0] != h or mask.shape[1] != w:
+        key = (w, h, round(strength, 3), round(VIGNETTE_FALLOFF, 3))
+        _vignette_cache.pop(key, None)
+        if key in _vignette_insert_order:
+            _vignette_insert_order.remove(key)
+        mask = _build_vignette(w, h, strength)
+    return (frame.astype(np.float32) * mask).clip(0, 255).astype(np.uint8)
 
 # FIXED: single-pass sharpening kernel instead of two-pass GaussianBlur + addWeighted
 _SHARPEN_KERNEL_CACHE: Dict[Tuple[float, int], np.ndarray] = {}
@@ -1065,6 +1073,12 @@ class DissolveBuffer:
             return new_frame
         alpha     = self._rem / self.n
         self._rem -= 1
+        # Guard: if stored frame shape differs (e.g. first frame after resize change),
+        # resize the buffer to match rather than crashing.
+        if self._buf.shape != new_frame.shape:
+            self._buf = cv2.resize(self._buf,
+                                   (new_frame.shape[1], new_frame.shape[0]),
+                                   interpolation=cv2.INTER_LINEAR)
         return cv2.addWeighted(self._buf, alpha, new_frame, 1.0 - alpha, 0)
 
     @property
@@ -3040,15 +3054,18 @@ def _render_video(input_path: str, output_path: str,
     ball_trail_buf: deque = deque(maxlen=(eff_overlay.trail_length if eff_overlay else 20))
 
     fi = 0
+    _prev_out_frame: Optional[np.ndarray] = None   # last rendered output frame (output-res)
     try:
         with FFmpegVideoReader(input_path, orig_w, orig_h) as reader:
             for frame in reader:
                 if fi >= total_frames: break
 
-                # FIXED: clear trail BEFORE dissolve.on_cut (not after)
+                # Scene cut: clear trail and prime dissolve with the PREVIOUS
+                # output-resolution frame — not the raw orig-res input frame.
                 if fi in scene_cut_set:
                     ball_trail_buf.clear()
-                    dissolve.on_cut(frame)
+                    if _prev_out_frame is not None:
+                        dissolve.on_cut(_prev_out_frame)
 
                 if use_panel_mode:
                     persons = (panel_persons_map or {}).get(fi, [])
@@ -3113,6 +3130,9 @@ def _render_video(input_path: str, output_path: str,
 
                 if dissolve.active:
                     out_frame = dissolve.blend(out_frame)
+
+                # Save output-res frame for next scene-cut dissolve
+                _prev_out_frame = out_frame
 
                 try: enc.stdin.write(out_frame.tobytes())
                 except BrokenPipeError: break
