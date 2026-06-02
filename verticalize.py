@@ -21,10 +21,6 @@ v7.3 CHANGES vs v7.2
          explicit shifted arrays, eliminating circular boundary artifacts.
 • FIXED: _detect_panel_mode uses a single FFmpegVideoReader pass for probing
          instead of one seek per frame — dramatically faster on large files.
-• FIXED: resolve_target_size and calculate_crop_dims now guarantee even,
-         positive dimensions and safe upscaling from low‑resolution sources.
-• FIXED: _render_video replaces np.clip with manual safe clamping and adds
-         fallback crop to prevent crashes when upscaling (e.g., 480p → 1080p).
 • IMPROVED: Replaced all print(..., file=sys.stderr) with stdlib logging.
 • IMPROVED: BallFrameRecord made frozen (immutable) to prevent accidental aliasing.
 • IMPROVED: Added OrigCoord / DetCoord type aliases for coordinate-space clarity.
@@ -39,7 +35,6 @@ v7.3 CHANGES vs v7.2
 """
 from __future__ import annotations
 
-import bisect
 import logging
 import math
 import os
@@ -557,7 +552,7 @@ class BallColorModel:
         Returns correlation [0-1]; 1.0 = perfect match.
         Returns 1.0 (pass-through) when model not yet built.
         """
-        if self._model is None or len(self._samples) < 3:
+        if self._model is None:
             return 1.0
         x1, y1, x2, y2 = bbox
         patch = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
@@ -1369,55 +1364,27 @@ def extract_thumbnail(path: str, t: float = 1.0) -> Optional[bytes]:
     return buf.tobytes() if ok else None
 
 def resolve_target_size(label: str, orig_w: int, orig_h: int) -> Tuple[int, int]:
-    """Return target width and height (both even, at least 2x2)."""
     tw, th = RESOLUTION_PRESETS.get(label, (0, 0))
     if tw == 0 and th == 0:
-        # "Match source" — derive from source, never upscale
         cw = int(orig_h * 9 / 16)
-        if cw > orig_w:
-            cw = orig_w
+        if cw > orig_w: cw = orig_w
         ch = int(cw * 16 / 9)
-        if ch > orig_h:
-            scale = orig_h / ch
-            cw = int(cw * scale)
-            ch = int(orig_h)
-        if cw > orig_w:
-            scale = orig_w / cw
-            cw = int(orig_w)
-            ch = int(ch * scale)
     else:
-        # Explicit preset selected — honour it (allow upscaling)
         cw, ch = tw, th
-    # Ensure at least 2x2 and even
-    cw = max(cw, 2)
-    ch = max(ch, 2)
-    cw = cw if cw % 2 == 0 else cw - 1
-    ch = ch if ch % 2 == 0 else ch - 1
-    return cw, ch
+    if ch > orig_h:
+        scale = orig_h / ch; cw = int(cw * scale); ch = int(orig_h)
+    if cw > orig_w:
+        scale = orig_w / cw; cw = int(orig_w); ch = int(ch * scale)
+    return max(cw - (cw % 2), 2), max(ch - (ch % 2), 2)
 
 def calculate_crop_dims(orig_w: int, orig_h: int, tw: int, th: int) -> Tuple[int, int]:
-    """
-    Returns crop dimensions (crop_w, crop_h) that fit within the original frame.
-    Both dimensions are at least 2 and even.
-    """
-    th = max(th, 2)
+    th    = max(th, 2)
     ratio = tw / th
     if (orig_w / orig_h) > ratio:
-        ch = orig_h
-        cw = int(round(ch * ratio))
+        ch = orig_h; cw = int(round(ch * ratio))
     else:
-        cw = orig_w
-        ch = int(round(cw / ratio))
-    # Clamp to original dimensions and ensure minimum size
-    crop_w = min(max(cw, 2), orig_w)
-    crop_h = min(max(ch, 2), orig_h)
-    # Make even (required by some encoders)
-    crop_w = crop_w if crop_w % 2 == 0 else crop_w - 1
-    crop_h = crop_h if crop_h % 2 == 0 else crop_h - 1
-    # Final sanity
-    if crop_w < 2 or crop_h < 2:
-        raise ValueError(f"Crop dimensions too small: {crop_w}x{crop_h}")
-    return crop_w, crop_h
+        cw = orig_w; ch = int(round(cw / ratio))
+    return min(cw, orig_w), min(ch, orig_h)
 
 
 # ── Model Cache & Face Detection ──────────────────────────────────────────────
@@ -1800,13 +1767,18 @@ class AdaptiveVelocityAwareSmoother:
                 smooth_cx = self.prev_smooth_cx + dvx * 0.5
                 smooth_cy = self.prev_smooth_cy + dvy * 0.5
 
+        # Update prev_velocity with actual smooth frame-to-frame delta (post-damping)
+        self.prev_velocity = (
+            smooth_cx - self.prev_smooth_cx if self.prev_smooth_cx is not None else 0.0,
+            smooth_cy - self.prev_smooth_cy if self.prev_smooth_cy is not None else 0.0,
+        )
+
         if self.prev_smooth_cx is not None:
             self._smooth_diffs.append(
                 math.hypot(smooth_cx - self.prev_smooth_cx,
                            smooth_cy - self.prev_smooth_cy))
         self.prev_smooth_cx = smooth_cx
         self.prev_smooth_cy = smooth_cy
-        self.prev_velocity  = (smooth_cx - cx, smooth_cy - cy)
         return float(smooth_cx), float(smooth_cy)
 
     def get_metrics(self) -> Dict[str, float]:
@@ -2862,13 +2834,13 @@ def translate_srt(srt_path: str, target_language: str, source_language: str = "a
     import re
     try:
         with open(srt_path, "r", encoding="utf-8") as f: content = f.read()
-        blocks = re.split(r"\n+", content.strip())
+        blocks = re.split(r"\n\n+", content.strip())
         out: List[str] = []; tr = GoogleTranslator(source=source_language, target=target_language)
         for i, block in enumerate(blocks):
             ls = block.strip().splitlines()
             if len(ls) < 3: out.append(block); continue
             try:    translated = tr.translate(" ".join(ls[2:])) or " ".join(ls[2:])
-            except: translated = " ".join(ls[2:])
+            except Exception: translated = " ".join(ls[2:])
             out.append(f"{ls[0]}\n{ls[1]}\n{translated}")
             if i % 10 == 0: _p(i / max(len(blocks), 1), f"{i}/{len(blocks)}")
         with open(srt_path, "w", encoding="utf-8") as f: f.write("\n".join(out) + "\n")
@@ -3020,7 +2992,7 @@ def _build_analytics(input_path: str, output_path: str, orig_w: int, orig_h: int
                                 "default=noprint_wrappers=1:nokey=1", p],
                                capture_output=True, text=True, timeout=10)
             return int(r.stdout.strip()) // 1000
-        except: return 0
+        except Exception: return 0
     in_sz  = _sz(input_path); out_sz = _sz(output_path)
     jitter_raw = jitter_smooth = smoothness_pct = 0.0
     if smooth_metrics:
@@ -3168,38 +3140,14 @@ def _render_video(input_path: str, output_path: str,
                     cx, cy = (smoothed_centers[fi] if fi < len(smoothed_centers)
                               else (orig_w//2, orig_h//2))
                     hw, hh = crop_w//2, crop_h//2
-
-                    # ----- SAFE CLAMPING (FIXED) -----
-                    max_x = max(0, orig_w - crop_w)
-                    max_y = max(0, orig_h - crop_h)
-                    x1 = int(max(0, min(cx - hw, max_x)))
-                    y1 = int(max(0, min(cy - hh, max_y)))
-                    x2 = min(x1 + crop_w, orig_w)
-                    y2 = min(y1 + crop_h, orig_h)
-                    x1 = max(0, x2 - crop_w)
-                    y1 = max(0, y2 - crop_h)
-
-                    # ----- VALIDATE SLICE -----
-                    if x2 <= x1 or y2 <= y1:
-                        logger.warning("Invalid crop slice (%d,%d)-(%d,%d) – falling back to center",
-                                       x1, y1, x2, y2)
-                        # Fallback: center crop
-                        x1 = (orig_w - crop_w) // 2
-                        y1 = (orig_h - crop_h) // 2
-                        x2 = x1 + crop_w
-                        y2 = y1 + crop_h
-                        x1 = max(0, min(x1, max_x))
-                        y1 = max(0, min(y1, max_y))
-                        x2 = min(x1 + crop_w, orig_w)
-                        y2 = min(y1 + crop_h, orig_h)
-
+                    x1 = int(np.clip(cx-hw, 0, orig_w-crop_w))
+                    y1 = int(np.clip(cy-hh, 0, orig_h-crop_h))
+                    x2 = min(x1+crop_w, orig_w); y2 = min(y1+crop_h, orig_h)
+                    x1 = max(0, x2-crop_w);      y1 = max(0, y2-crop_h)
                     crop = frame[y1:y2, x1:x2]
                     if crop.shape[0] == 0 or crop.shape[1] == 0:
-                        # Emergency fallback: take top‑left corner
-                        crop = frame[:crop_h, :crop_w]
-                        if crop.shape[0] == 0 or crop.shape[1] == 0:
-                            raise ProcessingError(f"Unable to extract any crop from frame {fi}")
-
+                        crop = (frame[:crop_h, :crop_w]
+                                if orig_h >= crop_h and orig_w >= crop_w else frame)
                     out_frame = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
 
                     if eff_overlay is not None:
@@ -3281,7 +3229,6 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
     scene_cuts: List[int] = []; persons_map: Dict[int, List] = {}
     prev_gray = prev_frame = prev_cx = prev_cy = prev_hist = None
     last_cut_frame = -100; prev_ball_carrier = None; prev_saliency = None
-    kalman_pred_count = 0
     det_scale = min(1.0, 960/orig_w)
     det_w = max(1, int(orig_w*det_scale)); det_h = max(1, int(orig_h*det_scale))
     fi = 0
@@ -3352,7 +3299,7 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
         while len(centers) < total_frames:
             centers.append(centers[-1] if centers else (orig_w//2, orig_h//2))
             speeds.append(0.0)
-    return centers, speeds, scene_cuts, persons_map, kalman_pred_count
+    return centers, speeds, scene_cuts, persons_map
 
 
 # ── Optimized sports tracking pass ───────────────────────────────────────────
@@ -3375,11 +3322,10 @@ def _sports_tracking_pass_optimized(
     Dict[int, List[Tuple[int,int,int,int]]],
 ]:
     def _p(v, msg=""): progress_callback and progress_callback(v, msg)
-    # Ensure minimum 640px width for vertical inputs and cap upscale to 2x
+    # Ensure minimum 640px width for vertical inputs
     det_scale = min(1.0, 960 / orig_w)
     if orig_w < 640:
         det_scale = 640 / orig_w
-    det_scale = min(det_scale, 2.0)   # FIXED: cap upscale to avoid memory explosion
     det_w = max(1, int(orig_w * det_scale))
     det_h = max(1, int(orig_h * det_scale))
     hw, hh = crop_w//2, crop_h//2
@@ -3555,6 +3501,7 @@ def _sports_tracking_pass_optimized(
                             tracker_lost_ball = True; det_cache.ball_box = None
 
                     if not resolved and use_ball_tracking and ball_found_ever:
+                        ball_kalman.predict()  # Advance Kalman state before reading position
                         pred_center = ball_kalman.position if ball_kalman.initialized else None
                         color_bbox  = ball_color_det.detect(
                             det_frame, pred_center,
@@ -3573,7 +3520,7 @@ def _sports_tracking_pass_optimized(
 
                     if not resolved:
                         if ball_kalman.initialized and ball_found_ever:
-                            kpx, kpy = ball_kalman.position
+                            kpx, kpy = ball_kalman.predict()  # Advance state + get predicted position
                             avg_w = avg_h = 40
                             if ball_size_history:
                                 avg_w = int(np.mean([s[0] for s in ball_size_history]))
