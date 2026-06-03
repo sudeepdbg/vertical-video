@@ -533,7 +533,10 @@ if uploaded_file is not None and st.session_state.input_path:
                 st.session_state.last_settings = current_settings
                 prog = st.progress(0.0); status = st.empty(); status.info("⚡ Starting…")
                 try:
-                    def _cb(v,msg=""): prog.progress(min(v,1.0)); msg and status.info(msg)
+                    def _cb(v, msg=""):
+                        prog.progress(min(v, 1.0))
+                        if msg:
+                            status.info(msg)
                     if tracking_mode == "sports_action":
                         meta = process_sports_video(st.session_state.input_path, st.session_state.output_path,
                             sport_type=st.session_state.get("sport_type","auto"),
@@ -575,10 +578,7 @@ if uploaded_file is not None and st.session_state.input_path:
                             except OSError: pass
                         st.session_state.processing_done = True; status.success("✅ Done!"); st.rerun()
                     else: status.error("Output is empty — check FFmpeg.")
-                except Exception as exc:
-                    import traceback
-                    traceback.print_exc()
-                    status.error(f"Error: {exc}")
+                except Exception as exc: status.error(f"Error: {exc}")
         else:
             r1, _, r2 = st.columns([2,5,2])
             with r1:
@@ -593,7 +593,10 @@ if uploaded_file is not None and st.session_state.input_path:
             if scan_btn:
                 prog=st.progress(0.0); status=st.empty(); status.info("🔍 Scanning…")
                 try:
-                    def _scb(v,msg=""): prog.progress(min(v,1.0)); msg and status.info(msg)
+                    def _scb(v, msg=""):
+                        prog.progress(min(v, 1.0))
+                        if msg:
+                            status.info(msg)
                     clips = detect_clips(st.session_state.input_path, min_duration_sec=float(clip_min_dur), max_duration_sec=float(clip_max_dur), target_n_clips=int(clip_target_n), model=None, confidence=confidence, progress_callback=_scb)
                     prog.progress(1.0)
                     if not clips: status.warning("⚠ No clips detected."); st.session_state.detected_clips=[]; st.session_state.selected_clip_indices=set()
@@ -620,7 +623,10 @@ if uploaded_file is not None and st.session_state.input_path:
                 if pb and sel:
                     sc = [clips[i] for i in sorted(sel)]; od = tempfile.mkdtemp(); st.session_state.clip_out_dir = od
                     prog=st.progress(0.0); status=st.empty(); status.info(f"⚡ Processing {len(sc)} clips…")
-                    def _bcb(v,msg=""): prog.progress(min(v,1.0)); msg and status.info(msg)
+                    def _bcb(v, msg=""):
+                        prog.progress(min(v, 1.0))
+                        if msg:
+                            status.info(msg)
                     try:
                         results = process_clips_batch(input_path=st.session_state.input_path, output_dir=od, clips=sc,
                             target_preset_label=resolution_label, tracking_mode=tracking_mode,
@@ -639,10 +645,7 @@ if uploaded_file is not None and st.session_state.input_path:
                         prog.progress(1.0); st.session_state.clip_results=results
                         nk = sum(1 for r in results if not r.get("error"))
                         status.success(f"✅ {nk}/{len(results)} clips converted!"); st.rerun()
-                    except Exception as exc:
-                        import traceback
-                        traceback.print_exc()
-                        status.error(f"Error: {exc}")
+                    except Exception as exc: status.error(f"Error: {exc}")
             else:
                 results = st.session_state.clip_results; nk = sum(1 for r in results if not r.get("error"))
                 if clips: st.markdown(f'<div class="rf-ok">✓ {nk} clip{"s" if nk!=1 else ""} ready — download from cards above</div>', unsafe_allow_html=True)
