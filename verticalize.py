@@ -677,17 +677,32 @@ class BallROITracker:
         self._max_age         = max_age
         self._last_velocity:  Tuple[float, float] = (0.0, 0.0)
         self._last_conf:      float = 0.0
-        self._has_cv_tracker  = hasattr(cv2, "TrackerCSRT_create")
+        self._has_cv_tracker  = (
+            hasattr(cv2, "TrackerCSRT_create") or
+            (hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create"))
+        )
 
     def _make_tracker(self) -> Optional[Any]:
         if not self._has_cv_tracker:
             return None
         try:
+            # Try modern API first, then legacy namespace (OpenCV 4.5+)
             if self._type == "CSRT":
-                return cv2.TrackerCSRT_create()
+                if hasattr(cv2, "TrackerCSRT_create"):
+                    return cv2.TrackerCSRT_create()
+                elif hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create"):
+                    return cv2.legacy.TrackerCSRT_create()
             if self._type == "KCF":
-                return cv2.TrackerKCF_create()
-            return cv2.TrackerCSRT_create()
+                if hasattr(cv2, "TrackerKCF_create"):
+                    return cv2.TrackerKCF_create()
+                elif hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerKCF_create"):
+                    return cv2.legacy.TrackerKCF_create()
+            # Default fallback
+            if hasattr(cv2, "TrackerCSRT_create"):
+                return cv2.TrackerCSRT_create()
+            elif hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create"):
+                return cv2.legacy.TrackerCSRT_create()
+            return None
         except Exception:
             self._has_cv_tracker = False
             return None
@@ -1267,7 +1282,7 @@ def _has_audio(path: str) -> bool:
 def _extract_audio_wav(vpath: str, wpath: str) -> bool:
     r = subprocess.run(
         ["ffmpeg", "-y", "-i", vpath, "-ar", "16000", "-ac", "1", "-f", "wav", wpath],
-        capture_output=True)
+        capture_output=True, timeout=300)
     return r.returncode == 0 and os.path.exists(wpath)
 
 def _trim_video(inp: str, out: str, start: float, end: float,
@@ -3586,10 +3601,22 @@ def _render_video(input_path: str, output_path: str,
                                     else (orig_w//2, orig_h//2))
                         hw = min(crop_w//2, orig_w//4); hh = min(crop_h//4, orig_h//4)
                         persons = [(scx-hw, scy-hh, scx+hw, scy+hh)]
-                    out_frame, prev_slots = _render_panel_frame(
-                        frame, persons, out_w, out_h, prev_slots=prev_slots,
-                        slot_smoother=slot_smoother, orientation=orientation,
-                        panel_config=panel_config, layout_manager=layout_mgr)
+                    try:
+                        out_frame, prev_slots = _render_panel_frame(
+                            frame, persons, out_w, out_h, prev_slots=prev_slots,
+                            slot_smoother=slot_smoother, orientation=orientation,
+                            panel_config=panel_config, layout_manager=layout_mgr)
+                    except (IndexError, ValueError):
+                        cx, cy = (smoothed_centers[fi] if fi < len(smoothed_centers)
+                                  else (orig_w//2, orig_h//2))
+                        hw, hh = crop_w//2, crop_h//2
+                        x1 = int(np.clip(cx-hw, 0, orig_w-crop_w))
+                        y1 = int(np.clip(cy-hh, 0, orig_h-crop_h))
+                        x2 = min(x1+crop_w, orig_w)
+                        y2 = min(y1+crop_h, orig_h)
+                        out_frame = cv2.resize(
+                            frame[y1:y2, x1:x2], (out_w, out_h),
+                            interpolation=cv2.INTER_LANCZOS4)
                 else:
                     cx, cy = (smoothed_centers[fi] if fi < len(smoothed_centers)
                               else (orig_w//2, orig_h//2))
@@ -4162,7 +4189,7 @@ def process_video(input_path: str, output_path: str,
         raw_centers, speeds, base_window=smooth_window, adaptive=adaptive_smoothing,
         scene_cuts=scene_cuts, use_kalman=use_kalman)
     _p(0.55, "Rendering...")
-    _render_video(
+    render_meta = _render_video(
         input_path=input_path, output_path=output_path,
         out_w=out_w, out_h=out_h, crop_w=crop_w, crop_h=crop_h,
         orig_w=orig_w, orig_h=orig_h, fps=fps, total_frames=total_frames,
@@ -4184,7 +4211,7 @@ def process_video(input_path: str, output_path: str,
         smooth_metrics=smooth_metrics, panel_mode=use_panel_mode,
         kalman_predictions=smooth_metrics.get("kalman_prediction_frames", 0),
         resource_stats=res_mon.get_stats())
-    return {"analytics": analytics}
+    return {"analytics": analytics, "subtitle_path": render_meta.get("subtitle_path")}
 
 
 # ── process_sports_video — optimized sports pipeline ─────────────────────────
@@ -4277,10 +4304,11 @@ def process_sports_video(input_path: str, output_path: str,
         input_path, output_path, orig_w=orig_w, orig_h=orig_h,
         out_w=out_w, out_h=out_h, smooth_metrics=final_smooth_metrics,
         panel_mode=False, resource_stats=res_mon.get_stats())
-    return {"analytics": analytics}
+    return {"analytics": analytics, "subtitle_path": render_meta.get("subtitle_path")}
 
 
 # ── process_clips_batch ───────────────────────────────────────────────────────
+# -------------
 def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegment],
                         target_preset_label: str = "720p   (720x1280  - HD)",
                         tracking_mode: str = "subject", talking_head_bias: float = 0.30,
