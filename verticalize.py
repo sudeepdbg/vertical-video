@@ -4174,7 +4174,7 @@ def process_video(input_path: str, output_path: str,
         output_fps=output_fps, color_grade=color_grade,
         vignette_strength=vignette_strength, sharpen_strength=sharpen_strength,
         ffmpeg_sharpen=ffmpeg_sharpen, scene_cuts=scene_cuts,
-        use_panel_mode=use_panel_mode, panel_config=panel_confg,
+        use_panel_mode=use_panel_mode, panel_config=panel_config,
         panel_persons_map=persons_map,
         progress_callback=lambda v, m: _p(0.55+v*0.43, m))
     res_mon.stop()
