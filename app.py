@@ -14,29 +14,25 @@ It replaces the old version in verticalize.py with these fixes:
 To apply: in verticalize.py, replace the old ResourceMonitor class with
 the one from resource_monitor.py (or import from it).
 """
-"""
-app.py — Reframe · AI Vertical Video Studio
-Mobile-first · Light theme · Single Clip + Auto-Clip modes
-"""
 import streamlit as st
 import tempfile
 import os
-import glob
+import shutil  # FIX 3: needed for temp directory cleanup
 from verticalize import (
     process_video, process_sports_video, get_video_info, detect_clips, process_clips_batch,
     RESOLUTION_PRESETS, SUBTITLE_STYLES, TRANSLATION_LANGUAGES,
     resolve_target_size, whisper_available, translation_available,
-    ClipSegment, PanelModeConfig, OverlayConfig,
+    PanelModeConfig,
 )
 
 st.set_page_config(
     page_title="Reframe",
-    page_icon="📱",
+    page_icon="\U0001F4F1",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
-# ─── CSS ────────────────────────────────────────────────────────────────────
+# \u2500\u2500\u2500 CSS \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=DM+Serif+Display:ital@0;1&display=swap');
@@ -178,7 +174,7 @@ video { border-radius: var(--r) !important; width: 100% !important; }
     border-radius:4px; font-size:10px; font-weight:600; color:var(--pur); padding:1px 6px; margin-top:5px; margin-left:4px; }
 
 /* Buttons */
-.stButton >button { font-family:'DM Sans',sans-serif !important; border-radius:var(--rs) !important; font-weight:600 !important; font-size:13px !important; transition:all 0.15s !important; } 
+.stButton >button { font-family:'DM Sans',sans-serif !important; border-radius:var(--rs) !important; font-weight:600 !important; font-size:13px !important; transition:all 0.15s !important; }
 .stButton >button[kind="primary"]   { background:var(--ink) !important; color:#fff !important; border:none !important; padding:10px 20px !important; }
 .stButton >button[kind="primary"]:hover  { background:#000 !important; transform:translateY(-1px) !important; }
 .stButton >button[kind="primary"]:disabled { background:var(--bdr2) !important; color:var(--ink3) !important; transform:none !important; }
@@ -245,7 +241,7 @@ video { border-radius: var(--r) !important; width: 100% !important; }
 [data-testid="stRadio"] [data-testid="stMarkdownContainer"] p { font-size:12px !important; }
 [data-testid="stRadio"]  > div { gap:6px !important; }
 
-/* Vertical 9:16 player — height matches landscape player (~360px) so width = 360*9/16 = 202px */
+/* Vertical 9:16 player */
 .rf-vplayer { width:202px; flex-shrink:0; }
 .rf-vplayer [data-testid="stVideo"] {
     border-radius:10px !important;
@@ -262,9 +258,9 @@ video { border-radius: var(--r) !important; width: 100% !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
+# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 # Session state init
-# ─────────────────────────────────────────────────────────────────────────────
+# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 _DEFAULTS = dict(
     input_path=None, uploaded_file_name=None, video_info=None,
     app_mode="single", tracking_mode="subject",
@@ -277,7 +273,7 @@ _DEFAULTS = dict(
     detected_clips=None, selected_clip_indices=None,
     clip_results=None, scan_done=False,
     clip_out_dir=None,
-    # vertical player: index of the clip currently being previewed (-1 = none)
+    # vertical player
     playing_clip_idx=-1,
     # panel mode (v4.1)
     panel_mode_override="auto",
@@ -296,6 +292,11 @@ def _cleanup() -> None:
         if p and os.path.exists(p):
             try: os.unlink(p)
             except OSError: pass
+    # FIX 3: also remove the temp clip output directory
+    clip_dir = st.session_state.get("clip_out_dir")
+    if clip_dir and os.path.isdir(clip_dir):
+        try: shutil.rmtree(clip_dir)
+        except OSError: pass
     st.session_state.update(
         input_path=None, output_path=None, output_bytes=None,
         srt_bytes=None, video_info=None, processing_done=False,
@@ -398,15 +399,10 @@ with tm2:
     if st.button("👤  Talking Head  ✦", type="secondary", use_container_width=True):
         st.session_state.tracking_mode = "talking_head"
 
-# NEW v4.0: Sports Action mode
+# FIX 8: Merged two duplicate sports buttons into one full-width button
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-tm3, tm4 = st.columns(2, gap="small")
-with tm3:
-    if st.button("🏀  Sports Action  ✦", type="secondary", use_container_width=True):
-        st.session_state.tracking_mode = "sports_action"
-with tm4:
-    if st.button("⚽  Sports (Ball-aware)", type="secondary", use_container_width=True):
-        st.session_state.tracking_mode = "sports_action"
+if st.button("🏀  Sports Action  ✦  (Ball-aware · Kalman)", type="secondary", use_container_width=True):
+    st.session_state.tracking_mode = "sports_action"
 
 tracking_mode = st.session_state.tracking_mode
 
@@ -518,7 +514,7 @@ if app_mode == "autoClip":
     tab_out, tab_trk, tab_sub, tab_adv, tab_clip, tab_analytics = st.tabs(tab_list)
 else:
     tab_out, tab_trk, tab_sub, tab_adv = st.tabs(tab_list)
-    tab_clip = None  # not used in single mode
+    tab_clip = None
     tab_analytics = None
 
 with tab_out:
@@ -552,6 +548,9 @@ with tab_trk:
             rule_of_thirds      = st.toggle("Horizontal rule-of-thirds", value=True)
             confidence          = 0.5
             scene_cut_threshold = 0.35
+        # FIX 5: defaults for sports-only toggles
+        use_ball_tracking = False
+        use_kalman = False
     elif tracking_mode == "sports_action":
         # v4.0 SPORTS TRACKING SETTINGS
         st.markdown("""
@@ -571,11 +570,7 @@ with tab_trk:
             scene_cut_threshold = st.slider("Scene-cut sensitivity", 0.10, 0.60, 0.22, 0.05)
             use_kalman          = st.toggle("Kalman prediction", value=True, help="Zero-lag predictive tracking")
         talking_head_bias = 0.30
-        # Sports-specific defaults
-        ken_burns = False
-        vignette_strength = 0.275
-        sharpen_strength = 0.3
-        ffmpeg_sharpen = True
+        # FIX 4: Removed dead variables (ken_burns, vignette_strength, sharpen_strength, ffmpeg_sharpen)
     else:
         t1, t2 = st.columns(2, gap="medium")
         with t1:
@@ -587,6 +582,9 @@ with tab_trk:
             rule_of_thirds      = st.toggle("Look-room / Rule-of-thirds", value=True)
             scene_cut_threshold = st.slider("Scene-cut sensitivity", 0.10, 0.60, 0.35, 0.05)
         talking_head_bias = 0.30
+        # FIX 5: defaults for sports-only toggles
+        use_ball_tracking = False
+        use_kalman = False
 
 with tab_sub:
     st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
@@ -712,16 +710,10 @@ if app_mode == "autoClip" and tab_analytics is not None:
                 
                 for i, r in enumerate(valid_results):
                     a = r["analytics"]
-                    
-                    # Extract smoothness metrics if available
                     jitter_raw = a.get('jitter_raw', 0)
                     jitter_smooth = a.get('jitter_smooth', 0)
                     smoothness_pct = a.get('smoothness_pct', 0)
-                    
-                    # Determine color for smoothness score
                     smooth_color_var = "var(--grn)" if smoothness_pct > 80 else ("var(--amb)" if smoothness_pct > 50 else "var(--acc)")
-
-                    # CPU / RAM / time fields from ResourceMonitor (per-clip)
                     b_cpu_pct   = a.get('cpu_avg_pct', 0)
                     b_ram_mb    = a.get('ram_avg_mb', 0)
                     b_ram_peak  = a.get('ram_max_mb', b_ram_mb)
@@ -739,7 +731,6 @@ if app_mode == "autoClip" and tab_analytics is not None:
                        <span style="color:var(--grn); font-weight:600;">{a['compression_ratio']:.2f}x</span>
                      </div>
                    </div>
-
                    <!-- System Resources Row -->
                    <div style="margin-top:8px;padding-top:8px;border-top:1px dashed var(--bdr);">
                      <div style="font-size:9px;font-weight:700;color:var(--ink3);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">
@@ -761,7 +752,6 @@ if app_mode == "autoClip" and tab_analytics is not None:
                        </div>
                      </div>
                    </div>
-
                    <!-- Smoothness Metrics Row -->
                    <div style="margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--bdr);">
                      <div style="font-size:9px; font-weight:700; color:var(--ink3); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:4px;">
@@ -791,7 +781,7 @@ if app_mode == "autoClip" and tab_analytics is not None:
 
 st.markdown("</div>", unsafe_allow_html=True)  # close settings div
 
-# Settings fingerprint for change detection
+# FIX 7: Settings fingerprint — added missing fields
 current_settings = dict(
     app_mode=app_mode, tracking_mode=tracking_mode,
     sport_type=st.session_state.get("sport_type", "auto"),
@@ -810,6 +800,12 @@ current_settings = dict(
     panel_min_area=st.session_state.get("panel_min_area", 0.03),
     panel_max_variance=st.session_state.get("panel_max_variance", 2.5),
     panel_stability=st.session_state.get("panel_stability", 0.60),
+    # FIX 7: previously missing fields
+    yolo_weights=yolo_weights,
+    subtitle_style_name=subtitle_style_name if burn_subtitles else "",
+    subtitle_max_chars=subtitle_max_chars if burn_subtitles else 0,
+    whisper_language=whisper_language if burn_subtitles else None,
+    subtitle_translate_to=subtitle_translate_to if burn_subtitles else None,
 )
 _invalidate_if_changed(current_settings)
 
@@ -821,7 +817,7 @@ st.markdown("<div style='height:2px;background:var(--bdr);margin:10px 0 0'></div
 # ─────────────────────────────────────────────────────────────────────────────
 col_src, col_out = st.columns(2, gap="small")
 
-# ─── Source column ─────────────────────────────────────────────────────────────
+# ─── Source column ───────────────────────────────────────────────────────────
 with col_src:
     st.markdown("<div class='rf-panel'>", unsafe_allow_html=True)
     st.markdown('<div class="rf-sec">Source Video</div>', unsafe_allow_html=True)
@@ -890,11 +886,11 @@ with col_src:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ─── Output column ─────────────────────────────────────────────────────────────
+# ─── Output column ───────────────────────────────────────────────────────────
 with col_out:
     st.markdown("<div class='rf-panelr'>", unsafe_allow_html=True)
     
-    # ─── SINGLE CLIP OUTPUT ───────────────────────────────────────────────
+    # ─── SINGLE CLIP OUTPUT ─────────────────────────────────────────────
     if app_mode == "single":
         st.markdown('<div class="rf-sec">Output · 9:16</div>', unsafe_allow_html=True)
 
@@ -916,16 +912,10 @@ with col_out:
                 elif st.session_state.get('panel_mode_override') == 'force_on':
                     st.markdown('<div class="rf-warn">🎛 Panel mode forced ON but not detected in output</div>', unsafe_allow_html=True)
                 
-                # Extract smoothness metrics if available
                 jitter_raw = a.get('jitter_raw', 0)
                 jitter_smooth = a.get('jitter_smooth', 0)
                 smoothness_pct = a.get('smoothness_pct', 0)
-
-                # Determine color for smoothness score
-                smooth_class = "good" if smoothness_pct > 80 else ("amb" if smoothness_pct > 50 else "bad")
                 smooth_color_var = "var(--grn)" if smoothness_pct > 80 else ("var(--amb)" if smoothness_pct > 50 else "var(--acc)")
-
-                # CPU / RAM / time fields from ResourceMonitor
                 cpu_pct   = a.get('cpu_avg_pct', 0)
                 ram_mb    = a.get('ram_avg_mb', 0)
                 ram_peak  = a.get('ram_max_mb', ram_mb)
@@ -1028,7 +1018,7 @@ with col_out:
          </div>
          """, unsafe_allow_html=True)
 
-    # ─── AUTO-CLIP PANEL ──────────────────────────────────────────────────
+    # ─── AUTO-CLIP PANEL ────────────────────────────────────────────────
     else:
         st.markdown('<div class="rf-sec">Detected Clips</div>', unsafe_allow_html=True)
 
@@ -1051,27 +1041,22 @@ with col_out:
                 f"<div style='font-size:11px;color:var(--ink3);margin-bottom:8px;'>{len(clips)} clips found · {len(sel)} selected</div>",
                 unsafe_allow_html=True)
 
-            # Build index-based results map: clip_index -> result dict
-            # (reliable across reruns unlike id())
             clip_results_map: dict = {}
             if st.session_state.clip_results:
-                # clip_results are stored in selection order; map by start_sec key
                 for r in st.session_state.clip_results:
                     clip_obj = r.get("clip")
                     if clip_obj is not None:
-                        # Key = (start_sec, end_sec) tuple — stable across reruns
                         clip_results_map[(round(clip_obj.start_sec, 1),
                                           round(clip_obj.end_sec, 1))] = r
 
             playing_idx = st.session_state.playing_clip_idx
 
-            for ci, clip in enumerate(clips): 
+            for ci, clip in enumerate(clips):
                 score_pct = int(clip.score * 100)
                 score_cls = "h" if clip.score > 0.7 else ("m" if clip.score > 0.4 else "")
                 is_sel    = ci in sel
                 is_playing = (playing_idx == ci)
 
-                # Stable key lookup
                 clip_key = (round(clip.start_sec, 1), round(clip.end_sec, 1))
                 result_for_clip = clip_results_map.get(clip_key)
                 is_done = (
@@ -1104,7 +1089,6 @@ with col_out:
              """, unsafe_allow_html=True)
 
                 if is_done:
-                    # Buttons row: Play toggle | Download
                     btn_col, dl_col = st.columns([1, 1])
                     with btn_col:
                         play_label = "⏹ Close" if is_playing else "▶ Play 9:16"
@@ -1126,13 +1110,10 @@ with col_out:
                         except Exception:
                             pass
 
-                    # Vertical player — only for the active clip, same height as landscape player
                     if is_playing:
                         try:
                             with open(result_for_clip["output_path"], "rb") as f:
                                 clip_bytes_play = f.read()
-                            # Use columns: narrow (9:16 width) | spacer
-                            # 202px ≈ 360px * 9/16   so it matches horizontal player height
                             vcol, _ = st.columns([202, 400])
                             with vcol:
                                 st.markdown('<div class="rf-vplayer">',
@@ -1143,7 +1124,6 @@ with col_out:
                             pass
 
                 else:
-                    # Not yet converted — show include checkbox
                     cb_col, _ = st.columns([2, 1])
                     with cb_col:
                         toggled = st.checkbox(
@@ -1177,7 +1157,7 @@ if uploaded_file is not None and st.session_state.input_path:
                 unsafe_allow_html=True)
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
-    # ─── SINGLE CLIP ACTIONS ──────────────────────────────────────────────
+    # ─── SINGLE CLIP ACTIONS ────────────────────────────────────────────
     if app_mode == "single":
         if not st.session_state.processing_done:
             a1, a2, a3 = st.columns([4, 5, 2])
@@ -1189,7 +1169,7 @@ if uploaded_file is not None and st.session_state.input_path:
                 if info:
                     eff_w, eff_h = resolve_target_size(
                         resolution_label, info["width"], info["height"])
-                    mode_t = "Talking Head" if tracking_mode == "talking_head" else "Subject"
+                    mode_t = "Talking Head" if tracking_mode == "talking_head" else ("Sports" if tracking_mode == "sports_action" else "Subject")
                     st.markdown(
                         f"<p style='color:var(--ink3);font-size:11px;margin-top:12px;'>{mode_t} · {eff_w}×{eff_h} · CRF {crf}</p>",
                         unsafe_allow_html=True)
@@ -1211,12 +1191,18 @@ if uploaded_file is not None and st.session_state.input_path:
 
                     # v4.0: Use process_sports_video for sports mode
                     if tracking_mode == "sports_action":
+                        # FIX 6: pass ALL applicable params to process_sports_video
                         meta = process_sports_video(
                             st.session_state.input_path,
                             st.session_state.output_path,
                             sport_type=st.session_state.get("sport_type", "auto"),
                             target_preset_label=resolution_label,
                             confidence=confidence,
+                            smooth_window=smooth_window,
+                            adaptive_smoothing=adaptive_smoothing,
+                            use_optical_flow=use_optical_flow,
+                            rule_of_thirds=rule_of_thirds,
+                            scene_cut_threshold=scene_cut_threshold,
                             output_fps=output_fps,
                             crf=crf,
                             encoder_preset=encoder_preset_label,
@@ -1224,8 +1210,12 @@ if uploaded_file is not None and st.session_state.input_path:
                             yolo_weights=yolo_weights,
                             burn_subtitles=burn_subtitles,
                             whisper_model=whisper_model,
+                            whisper_language=whisper_language,
                             subtitle_style_name=subtitle_style_name,
                             subtitle_max_chars=subtitle_max_chars,
+                            subtitle_translate_to=subtitle_translate_to,
+                            use_ball_tracking=use_ball_tracking,
+                            use_kalman=use_kalman,
                             progress_callback=_cb,
                         )
                     else:
@@ -1305,17 +1295,12 @@ if uploaded_file is not None and st.session_state.input_path:
                         f"<span style='color:{dcol}'>({delta:+.1f} MB)</span></p>",
                         unsafe_allow_html=True)
 
-    # ─── AUTO-CLIP ACTIONS ────────────────────────────────────────────────
+    # ─── AUTO-CLIP ACTIONS ──────────────────────────────────────────────
     else:
-        # Check if we have detected clips. 
-        # Note: [] is falsy, so we check specifically for None to distinguish 
-        # between "not scanned yet" and "scanned but found nothing".
+        # Check if we have detected clips.
         if st.session_state.detected_clips is None:
             st.session_state.scan_done = False
-            st.warning("Clip data missing. Please scan again.")
-            # Don't stop here, let the flow continue to the "not scan_done" block below
-            # which will render the Scan button.
-        
+
         if not st.session_state.scan_done:
             b1, b2, b3 = st.columns([4, 4, 2])
             with b1:
@@ -1357,7 +1342,6 @@ if uploaded_file is not None and st.session_state.input_path:
                     
                     prog.progress(1.0)
                     
-                    # Handle empty results gracefully
                     if not clips:
                         status.warning("⚠ No clips detected. Try adjusting clip duration settings.")
                         st.session_state.detected_clips = []
@@ -1367,8 +1351,7 @@ if uploaded_file is not None and st.session_state.input_path:
                         st.session_state.detected_clips          = clips
                         st.session_state.selected_clip_indices   = set(range(len(clips)))
                         st.session_state.scan_done               = True
-                        # Clear old results when scanning new clips
-                        st.session_state.clip_results            = None 
+                        st.session_state.clip_results            = None
                         status.success(f"✅ Found {len(clips)} clips!")
                     
                     st.rerun()
@@ -1380,7 +1363,6 @@ if uploaded_file is not None and st.session_state.input_path:
         else:
             clips = st.session_state.detected_clips or []
             
-            # If clips list is empty, show a message and allow re-scan
             if not clips:
                 st.markdown('<div class="rf-warn">⚠ No clips were detected during the last scan. Please adjust settings and scan again.</div>', unsafe_allow_html=True)
                 if st.button("🔄 Adjust Settings & Re-scan", type="secondary"):
@@ -1389,7 +1371,6 @@ if uploaded_file is not None and st.session_state.input_path:
                     st.rerun()
                 st.stop()
 
-            # Initialize selection if not present
             if st.session_state.selected_clip_indices is None:
                 st.session_state.selected_clip_indices = set(range(len(clips)))
             
@@ -1429,6 +1410,7 @@ if uploaded_file is not None and st.session_state.input_path:
                         if msg: status.info(msg)
 
                     try:
+                        # FIX 9: pass all applicable params to process_clips_batch
                         results = process_clips_batch(
                             input_path=st.session_state.input_path,
                             output_dir=out_dir,
@@ -1439,15 +1421,19 @@ if uploaded_file is not None and st.session_state.input_path:
                             confidence=confidence,
                             smooth_window=smooth_window,
                             adaptive_smoothing=adaptive_smoothing,
+                            use_optical_flow=use_optical_flow,
                             rule_of_thirds=rule_of_thirds,
+                            scene_cut_threshold=scene_cut_threshold,
                             crf=crf,
                             encoder_preset=encoder_preset_label,
                             audio_bitrate=audio_bitrate_label,
                             yolo_weights=yolo_weights,
                             burn_subtitles=burn_subtitles,
                             whisper_model=whisper_model,
+                            whisper_language=whisper_language,
                             subtitle_style_name=subtitle_style_name,
                             subtitle_max_chars=subtitle_max_chars,
+                            subtitle_translate_to=subtitle_translate_to,
                             progress_callback=_batch_cb,
                             sport_type=st.session_state.get("sport_type", "auto"),
                             # v4.1 panel mode params
@@ -1473,7 +1459,6 @@ if uploaded_file is not None and st.session_state.input_path:
                 results = st.session_state.clip_results
                 n_ok = sum(1 for r in results if not r.get("error"))
                 
-                # Only show the "Ready" banner if we actually have clips detected
                 if clips:
                     st.markdown(
                         f'<div class="rf-ok">✓ {n_ok} clip{"s" if n_ok!=1 else ""} ready — download from the cards above</div>',
