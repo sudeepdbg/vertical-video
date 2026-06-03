@@ -2901,7 +2901,6 @@ def _compute_audio_energy(input_path: str, duration: float,
     try:
         if not _extract_audio_wav(input_path, wav_path):
             return None
-        # Read raw PCM via FFmpeg (16-bit mono) — avoids scipy/wave dependency
         cmd = [
             "ffmpeg", "-y", "-i", wav_path,
             "-f", "s16le", "-acodec", "pcm_s16le",
@@ -2911,9 +2910,8 @@ def _compute_audio_energy(input_path: str, duration: float,
         if r.returncode != 0 or len(r.stdout) < sample_rate * 2:
             return None
         pcm = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
-        # Compute per-second RMS
         n_seconds = max(1, int(duration))
-        block = sample_rate  # 1 second per block
+        block = sample_rate
         energy = np.zeros(n_seconds, dtype=np.float32)
         for i in range(n_seconds):
             start = i * block
@@ -2922,7 +2920,6 @@ def _compute_audio_energy(input_path: str, duration: float,
                 break
             chunk = pcm[start:end]
             energy[i] = float(np.sqrt(np.mean(chunk ** 2)))
-        # Normalize to [0, 1]
         mx = energy.max()
         if mx > 0:
             energy /= mx
@@ -2988,9 +2985,8 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
                  progress_callback=None) -> List[ClipSegment]:
     """
     Detect high-engagement clips using visual saliency + audio energy.
-
-    P0 fixes: arc() guarantees end>start, SOI coord scaling, 5s smooth window.
-    P1 fixes: audio energy blending, adaptive peak threshold, batched SOI pass.
+    P0: arc() end>start, SOI coord scaling, 5s smooth window.
+    P1: audio energy blending, adaptive threshold, batched SOI.
     """
     def _p(v, msg=""): progress_callback and progress_callback(v, msg)
     info         = get_video_info(input_path)
@@ -3005,42 +3001,32 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
         progress_callback=lambda v, m: _p(v*0.35, m))
     if len(scores) == 0: return []
 
-    # ── P1-1: Audio energy blending ──────────────────────────────────
+    # P1-1: Audio energy blending
     _p(0.35, "Analyzing audio...")
     audio_energy = _compute_audio_energy(input_path, duration)
     if audio_energy is not None and len(scores) > 0:
-        # Resample audio energy to match visual score sample count
-        n_visual = len(scores)
-        n_audio  = len(audio_energy)
+        n_visual = len(scores); n_audio = len(audio_energy)
         if n_audio > 1 and n_visual > 1:
             audio_interp = np.interp(
                 np.linspace(0, n_audio - 1, n_visual),
-                np.arange(n_audio),
-                audio_energy,
-            )
+                np.arange(n_audio), audio_energy)
         else:
             audio_interp = np.zeros(n_visual, dtype=np.float32)
-        # Normalize visual scores to [0, 1]
         vs = np.array(scores, dtype=np.float32)
         vs_max = vs.max()
-        if vs_max > 0:
-            vs /= vs_max
-        # Blend: 65% visual + 35% audio
-        blended = 0.65 * vs + 0.35 * audio_interp
-        scores = blended
+        if vs_max > 0: vs /= vs_max
+        scores = 0.65 * vs + 0.35 * audio_interp
     else:
         scores = np.array(scores, dtype=np.float32)
         vs_max = scores.max()
-        if vs_max > 0:
-            scores /= vs_max
+        if vs_max > 0: scores /= vs_max
 
     _p(0.45, "Computing arcs...")
-    # P0-3: Use ~5-second smoothing window instead of ~30-second
+    # P0-3: 5-second smoothing window
     window = max(5, int(5 / (sample_every / fps)))
     ss     = (np.convolve(scores, np.ones(window)/window, "same")
               if len(scores) >= window else scores.copy())
     if ss.max() > 0: ss /= ss.max()
-
     min_gap = max(1, int(min_duration_sec * fps / sample_every))
 
     # P1-2: Adaptive peak threshold
@@ -3063,7 +3049,7 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
         for sc in scene_cut_frames:
             sc_s = sc / fps
             if 0 < sc_s - ps < 15.0: re = min(duration, sc_s + 0.5); break
-        # P0-1: guarantee end > start after scene-cut snapping
+        # P0-1: guarantee end > start
         if re <= rs + 1.0:
             rs = max(0.0, ps - max_duration_sec * 0.4)
             re = min(duration, rs + min_duration_sec)
@@ -3072,7 +3058,6 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
         elif cd > max_duration_sec:
             c = (rs+re)/2; rs = max(0.0, c-max_duration_sec/2)
             re = min(duration, rs+max_duration_sec)
-        # Final safety: ensure end > start
         if re <= rs:
             re = min(duration, rs + min_duration_sec)
         return rs, re
@@ -3085,59 +3070,44 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
     cands.sort(key=lambda x: x[2], reverse=True)
     cands = cands[:target_n_clips]; cands.sort(key=lambda x: x[0])
 
-    # ── P1-3: Batched SOI pass ───────────────────────────────────────
+    # P1-3: Batched SOI pass with P0-2 coordinate scaling
     _p(0.55, "SOI per clip...")
     segments: List[ClipSegment] = []
     det_w = min(orig_w, 640); det_h = max(1, int(det_w * orig_h / orig_w))
-    sx = orig_w / max(det_w, 1)  # P0-2: scale factor for coordinate mapping
+    sx = orig_w / max(det_w, 1)
     sy = orig_h / max(det_h, 1)
 
-    # Build a list of (clip_index, sample_time) tuples for all clips
     clip_samples: List[Tuple[int, float]] = []
     for ci, (ss2, se, score) in enumerate(cands):
         n_s = min(8, max(2, int(se - ss2)))
         for t in np.linspace(ss2+1, se-1, n_s):
             clip_samples.append((ci, float(t)))
 
-    # Collect SOI data per clip
     soi_data: Dict[int, Tuple[List[int], List[int]]] = {ci: ([], []) for ci in range(len(cands))}
-
     if clip_samples:
-        # Sort by time for sequential reading
         clip_samples.sort(key=lambda x: x[1])
-
         if model is not None:
-            # Batch: single FFmpegVideoReader pass across all sample times
-            # Group samples into time-ordered list; use seek-based reader per sample
-            # (true batch reading is complex with non-uniform times, so we use sorted seeks)
             for ci, t in clip_samples:
                 frame = _read_frame_at(input_path, orig_w, orig_h, t,
                                        scale_w=det_w, scale_h=det_h)
-                if frame is None:
-                    continue
+                if frame is None: continue
                 try:
                     res = model(frame, verbose=False, conf=confidence)[0]
                     if res.boxes is not None:
                         for box in res.boxes:
                             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                            # P0-2: scale from det coords to orig coords
                             soi_data[ci][0].append(int((x1+x2)/2 * sx))
                             soi_data[ci][1].append(int((y1+y2)/2 * sy))
-                except Exception:
-                    pass
+                except Exception: pass
         else:
-            # Fallback: saliency-based SOI
             for ci, t in clip_samples:
                 frame = _read_frame_at(input_path, orig_w, orig_h, t,
                                        scale_w=det_w, scale_h=det_h)
-                if frame is None:
-                    continue
+                if frame is None: continue
                 scx, scy = saliency_center(frame)
-                # P0-2: scale from det coords to orig coords
                 soi_data[ci][0].append(int(scx * sx))
                 soi_data[ci][1].append(int(scy * sy))
 
-    # Build ClipSegment objects
     for ci, (ss2, se, score) in enumerate(cands):
         _p(0.55 + 0.35*(ci/max(len(cands), 1)), f"Clip {ci+1}/{len(cands)}...")
         soi_xs, soi_ys = soi_data[ci]
@@ -3146,7 +3116,6 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
             sr = _soi_region_label(int(np.median(soi_xs)), int(np.median(soi_ys)),
                                    orig_w, orig_h)
         ms = int(ss2//60); secs = int(ss2%60); me = int(se//60); sece = int(se%60)
-        # P0-1: wrap in try/except in case of any remaining edge cases
         try:
             segments.append(ClipSegment(start_sec=ss2, end_sec=se, score=score,
                                         soi_region=sr,
@@ -4013,11 +3982,16 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
                         tracking_mode: str = "subject", talking_head_bias: float = 0.30,
                         confidence: float = 0.45, smooth_window: int = 15,
                         adaptive_smoothing: bool = True, rule_of_thirds: bool = True,
+                        use_optical_flow: bool = True,
+                        scene_cut_threshold: float = 0.35,
                         crf: int = 23, encoder_preset: str = "fast",
                         audio_bitrate: str = "128k", yolo_weights: str = "yolov8n.pt",
                         burn_subtitles: bool = False, whisper_model: str = "base",
+                        whisper_language: Optional[str] = None,
                         subtitle_style_name: str = "Bold White (TikTok)",
-                        subtitle_max_chars: int = 42, sport_type: str = "auto",
+                        subtitle_max_chars: int = 42,
+                        subtitle_translate_to: Optional[str] = None,
+                        sport_type: str = "auto",
                         output_fps: Optional[float] = None,
                         panel_config: Optional[PanelModeConfig] = None,
                         draw_tracking_boxes: bool = True,
@@ -4047,11 +4021,16 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
                 meta = process_sports_video(
                     trim_path, out_path, sport_type=sport_type,
                     target_preset_label=target_preset_label, confidence=confidence,
+                    smooth_window=smooth_window, adaptive_smoothing=adaptive_smoothing,
+                    use_optical_flow=use_optical_flow, rule_of_thirds=rule_of_thirds,
+                    scene_cut_threshold=scene_cut_threshold,
                     output_fps=output_fps, crf=crf, encoder_preset=encoder_preset,
                     audio_bitrate=audio_bitrate, yolo_weights=yolo_weights,
                     burn_subtitles=burn_subtitles, whisper_model=whisper_model,
+                    whisper_language=whisper_language,
                     subtitle_style_name=subtitle_style_name,
                     subtitle_max_chars=subtitle_max_chars,
+                    subtitle_translate_to=subtitle_translate_to,
                     draw_tracking_boxes=draw_tracking_boxes, overlay_config=overlay_config,
                     min_ball_confidence=min_ball_confidence,
                     progress_callback=lambda v, m: _cp(0.05+v*0.90, m))
@@ -4060,23 +4039,34 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
                     trim_path, out_path, target_preset_label=target_preset_label,
                     tracking_mode=tracking_mode, talking_head_bias=talking_head_bias,
                     confidence=confidence, smooth_window=smooth_window,
-                    adaptive_smoothing=adaptive_smoothing, use_optical_flow=True,
-                    rule_of_thirds=rule_of_thirds, scene_cut_threshold=0.35,
+                    adaptive_smoothing=adaptive_smoothing,
+                    use_optical_flow=use_optical_flow,
+                    rule_of_thirds=rule_of_thirds,
+                    scene_cut_threshold=scene_cut_threshold,
                     output_fps=output_fps, crf=crf, encoder_preset=encoder_preset,
                     audio_bitrate=audio_bitrate, yolo_weights=yolo_weights,
                     burn_subtitles=burn_subtitles, whisper_model=whisper_model,
+                    whisper_language=whisper_language,
                     subtitle_style_name=subtitle_style_name,
-                    subtitle_max_chars=subtitle_max_chars, panel_config=panel_config,
+                    subtitle_max_chars=subtitle_max_chars,
+                    subtitle_translate_to=subtitle_translate_to,
+                    panel_config=panel_config,
                     progress_callback=lambda v, m: _cp(0.05+v*0.90, m))
-            results.append({"clip": clip, "output_path": out_path,
-                            "analytics": meta.get("analytics", {})})
-        except Exception as e:
-            logger.error("[batch] Clip %d error: %s", i+1, e)
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                results.append({"clip": clip, "output_path": out_path,
+                                "error": None, "analytics": meta.get("analytics", {})})
+            else:
+                results.append({"clip": clip, "output_path": None,
+                                "error": "Empty output", "analytics": {}})
+        except Exception as exc:
+            logger.error("Clip %d failed: %s", i+1, exc)
             results.append({"clip": clip, "output_path": None,
-                            "error": str(e), "analytics": {}})
+                            "error": str(exc), "analytics": {}})
         finally:
             if os.path.exists(trim_path):
                 try: os.unlink(trim_path)
                 except OSError: pass
-    _p(1.0, f"Batch done: {sum(1 for r in results if not r.get('error'))}/{n} clips")
+    _p(1.0, f"Done — {sum(1 for r in results if not r.get('error'))}/{n} clips")
     return results
+
+
