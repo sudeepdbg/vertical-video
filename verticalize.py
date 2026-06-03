@@ -290,15 +290,15 @@ KEN_BURNS_PERIOD     = 8.0
 DISSOLVE_FRAMES      = 3
 PANEL_DIVIDER_PX     = 3
 PANEL_DIVIDER_COLOR  = (15, 15, 15)
-PANEL_CROP_EXPAND    = 1.55
+PANEL_CROP_EXPAND    = 1.15
 PANEL_TRANSITION_FRAMES = 6
 PANEL_MAX_SLOTS              = 4
-PANEL_SPEAKER_FOCUS_RATIO    = 0.60   # 60% of height for active speaker
-PANEL_HEAD_TARGET_FRAC       = 0.12   # target face height as fraction of strip
-PANEL_LOWER_THIRD_HEIGHT_FRAC = 0.15  # bottom 15% scanned for text
-PANEL_PORTRAIT_HEAD_RATIO    = 2.5    # head-to-shoulder crop height ratio
-PANEL_VELOCITY_DAMPING       = 0.85   # damping when slot velocity spikes
-PANEL_LAYOUT_SWITCH_COOLDOWN = 30     # min frames between layout switches
+PANEL_SPEAKER_FOCUS_RATIO    = 0.60
+PANEL_HEAD_TARGET_FRAC       = 0.12
+PANEL_LOWER_THIRD_HEIGHT_FRAC = 0.15
+PANEL_PORTRAIT_HEAD_RATIO    = 2.5
+PANEL_VELOCITY_DAMPING       = 0.85
+PANEL_LAYOUT_SWITCH_COOLDOWN = 30
 
 # Cache size limits to prevent unbounded memory growth
 _CACHE_MAX_ENTRIES = 32
@@ -2519,20 +2519,15 @@ def _detect_panel_mode(input_path: str, model: Any, fps: float, total_frames: in
 
 
 class DynamicPanelSlotSmoother:
-    """
-    N-slot panel smoother with Hungarian assignment, velocity damping,
-    and optional speaker-focus weighting.
-
-    Backward-compatible: 2-slot mode works identically to old PanelSlotSmoother.
-    """
+    """N-slot panel smoother with Hungarian assignment and velocity damping."""
 
     def __init__(self, max_slots: int = PANEL_MAX_SLOTS,
                  alpha: float = PANEL_SLOT_EMA,
                  max_jump_frac: float = PANEL_SLOT_MAX_JUMP,
                  velocity_damping: float = PANEL_VELOCITY_DAMPING) -> None:
-        self.max_slots       = max_slots
-        self.alpha           = alpha
-        self.max_jump_frac   = max_jump_frac
+        self.max_slots = max_slots
+        self.alpha = alpha
+        self.max_jump_frac = max_jump_frac
         self.velocity_damping = velocity_damping
         self._slots:    List[Optional[Tuple]] = [None] * max_slots
         self._slot_cx:  List[Optional[float]] = [None] * max_slots
@@ -2541,7 +2536,6 @@ class DynamicPanelSlotSmoother:
         self._speaker_weights: List[float] = [1.0] * max_slots
 
     def set_speaker_weights(self, weights: List[float]) -> None:
-        """Set per-slot loudness weights (0-1). Louder slot gets more space."""
         for i in range(min(len(weights), self.max_slots)):
             self._speaker_weights[i] = max(0.0, min(1.0, weights[i]))
 
@@ -2549,44 +2543,28 @@ class DynamicPanelSlotSmoother:
                  axis_size: float, slot_idx: int = 0) -> Tuple:
         if prev is None:
             return tuple(float(v) for v in new_box)
-        a = self.alpha
-        mj = axis_size * self.max_jump_frac
-        raw = tuple(prev[i]*(1-a) + new_box[i]*a for i in range(4))
-        # Velocity damping: if this frame's jump >> prev velocity, damp it
-        vel = tuple(raw[i] - prev[i] for i in range(4))
-        prev_vel = self._slot_vel[slot_idx]
-        for dim in range(4):
-            if abs(vel[dim]) > abs(prev_vel[dim]) * 2.5 and abs(prev_vel[dim]) > 2.0:
-                raw = list(raw)
-                raw[dim] = prev[dim] + vel[dim] * self.velocity_damping
-                raw = tuple(raw)
-        self._slot_vel[slot_idx] = vel
+        a = self.alpha; mj = axis_size * self.max_jump_frac
+        raw = list(prev[i]*(1-a) + new_box[i]*a for i in range(4))
+        vel = [raw[i] - prev[i] for i in range(4)]
+        pv = self._slot_vel[slot_idx]
+        for d in range(4):
+            if abs(vel[d]) > abs(pv[d]) * 2.5 and abs(pv[d]) > 2.0:
+                raw[d] = prev[d] + vel[d] * self.velocity_damping
+        self._slot_vel[slot_idx] = tuple(vel)
         return tuple(float(np.clip(raw[i], prev[i]-mj, prev[i]+mj)) for i in range(4))
 
     def _assign_slots_hungarian(self, groups: List[List]) -> List[List]:
-        """Assign N person-groups to N slots using Hungarian algorithm."""
-        n_groups = len(groups)
-        n_slots  = self.max_slots
-        result   = [[] for _ in range(n_slots)]
-
-        # Filter non-empty groups
-        active = [(gi, groups[gi]) for gi in range(n_groups) if groups[gi]]
+        n_slots = self.max_slots
+        result = [[] for _ in range(n_slots)]
+        active = [(gi, groups[gi]) for gi in range(len(groups)) if groups[gi]]
         if not active:
             return result
-
-        gcx = []
-        for gi, g in active:
-            gcx.append(float(np.mean([(p[0]+p[2])//2 for p in g])))
-
-        # First run: simple left-to-right assignment
+        gcx = [float(np.mean([(p[0]+p[2])//2 for p in g])) for _, g in active]
         if all(sc is None for sc in self._slot_cx[:len(active)]):
-            sorted_groups = sorted(zip(gcx, [g for _, g in active]))
-            for si, (_, g) in enumerate(sorted_groups[:n_slots]):
+            for si, (_, g) in enumerate(sorted(zip(gcx, [g for _, g in active]))[:n_slots]):
                 result[si] = g
             self._active_count = min(len(active), n_slots)
             return result
-
-        # Subsequent: minimize distance to existing slot centers
         if _HUNGARIAN_AVAILABLE and len(active) >= 2:
             n = max(len(active), sum(1 for sc in self._slot_cx if sc is not None))
             cost = np.full((n, n), 1e6)
@@ -2595,58 +2573,42 @@ class DynamicPanelSlotSmoother:
                     if self._slot_cx[si] is not None:
                         cost[ai, si] = abs(gcx[ai] - self._slot_cx[si])
                     else:
-                        cost[ai, si] = 500.0  # penalty for new slot
+                        cost[ai, si] = 500.0
             row_ind, col_ind = linear_sum_assignment(cost[:len(active), :n_slots])
             for ai, si in zip(row_ind, col_ind):
                 if cost[ai, si] < 1e5:
                     result[si] = active[ai][1]
         else:
-            # Greedy fallback
             used: Set[int] = set()
             for si in range(n_slots):
-                if self._slot_cx[si] is None:
-                    continue
+                if self._slot_cx[si] is None: continue
                 best_g, best_d = -1, float("inf")
                 for ai, (gi, _) in enumerate(active):
-                    if ai in used:
-                        continue
+                    if ai in used: continue
                     d = abs(gcx[ai] - self._slot_cx[si])
-                    if d < best_d:
-                        best_d, best_g = d, ai
-                if best_g >= 0:
-                    result[si] = active[best_g][1]
-                    used.add(best_g)
-            # Assign remaining groups to empty slots
+                    if d < best_d: best_d, best_g = d, ai
+                if best_g >= 0: result[si] = active[best_g][1]; used.add(best_g)
             for ai, (gi, g) in enumerate(active):
                 if ai not in used:
                     for si in range(n_slots):
-                        if not result[si]:
-                            result[si] = g
-                            used.add(ai)
-                            break
-
+                        if not result[si]: result[si] = g; used.add(ai); break
         self._active_count = sum(1 for r in result if r)
         return result
 
     def update(self, *groups, strip_w: float) -> List[List]:
-        """
-        Accept N groups, assign to slots, smooth, return N slot groups.
-        Backward-compatible: update(group_a, group_b, strip_w=W) still works.
-        """
         group_list = list(groups)
         assigned = self._assign_slots_hungarian(group_list)
         result: List[List] = [[] for _ in range(self.max_slots)]
         for i in range(self.max_slots):
             grp = assigned[i]
             if grp:
-                union  = _group_union(grp)
+                union = _group_union(grp)
                 smooth = self._ema_box(self._slots[i], union, strip_w, slot_idx=i)
-                self._slots[i]   = smooth
+                self._slots[i] = smooth
                 self._slot_cx[i] = (smooth[0] + smooth[2]) / 2.0
                 result[i] = [tuple(int(v) for v in smooth)]
             elif self._slots[i] is not None:
                 result[i] = [tuple(int(v) for v in self._slots[i])]
-        # Backward compat: if called with 2 groups, return tuple of 2
         if len(group_list) == 2:
             return result[0], result[1]
         return result
@@ -2668,27 +2630,22 @@ def _group_union(persons: List[Tuple]) -> Tuple[int, int, int, int]:
 def _detect_faces_for_panel(frame: np.ndarray,
                             persons: List[Tuple[int,int,int,int]]
                             ) -> List[Optional[Tuple[int,int,int,int]]]:
-    """
-    Detect one face per person box. Returns list aligned with persons:
-    each entry is (fx1,fy1,fx2,fy2) or None if no face found.
-    Uses Haar cascade (fast, no extra model needed).
-    """
+    """Detect one face per person box using Haar cascade."""
     haar_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     if not os.path.exists(haar_path):
         return [None] * len(persons)
     cascade = cv2.CascadeClassifier(haar_path)
     results: List[Optional[Tuple[int,int,int,int]]] = []
     for (px1, py1, px2, py2) in persons:
-        px1c = max(0, px1); py1c = max(0, py1)
-        px2c = min(frame.shape[1], px2); py2c = min(frame.shape[0], py2)
+        px1c, py1c = max(0, px1), max(0, py1)
+        px2c, py2c = min(frame.shape[1], px2), min(frame.shape[0], py2)
         if px2c <= px1c or py2c <= py1c:
             results.append(None); continue
         roi_gray = cv2.cvtColor(frame[py1c:py2c, px1c:px2c], cv2.COLOR_BGR2GRAY)
-        rw = px2c - px1c; rh = py2c - py1c
+        rw, rh = px2c - px1c, py2c - py1c
         faces = cascade.detectMultiScale(roi_gray, 1.15, 4,
                                          minSize=(max(20, rw//8), max(20, rh//8)))
         if len(faces) > 0:
-            # Take largest face
             fx, fy, fw, fh = max(faces, key=lambda f: f[2]*f[3])
             results.append((px1c+fx, py1c+fy, px1c+fx+fw, py1c+fy+fh))
         else:
@@ -2696,90 +2653,161 @@ def _detect_faces_for_panel(frame: np.ndarray,
     return results
 
 
-def _compute_head_normalized_crops(
-    persons: List[Tuple[int,int,int,int]],
-    faces: List[Optional[Tuple[int,int,int,int]]],
-    target_face_frac: float = PANEL_HEAD_TARGET_FRAC,
-    strip_h: int = 960,
-) -> List[float]:
-    """
-    Compute per-person expand factors so all faces appear at ~same pixel height.
-    Returns list of expand multipliers (1.0 = no change).
-    """
-    face_heights = []
-    for face in faces:
-        if face is not None:
-            face_heights.append(face[3] - face[1])
-        else:
-            face_heights.append(None)
-    # Target face height in output pixels
-    target_h = strip_h * target_face_frac
-    expands = []
-    for i, fh in enumerate(face_heights):
-        if fh is not None and fh > 10:
-            # How much to scale the crop so face = target_h in output
-            person_h = max(persons[i][3] - persons[i][1], 1)
-            current_face_ratio = fh / person_h  # face as fraction of person box
-            # We want: (face_h / person_h) * person_h_in_output = target_h
-            # person_h_in_output = strip_h * (person_h / crop_h)
-            # Expand = factor to multiply person_h to get crop_h
-            desired_expand = (fh / target_h) * (strip_h / person_h) if person_h > 0 else 1.0
-            expands.append(max(0.8, min(2.5, desired_expand)))
-        else:
-            expands.append(PANEL_CROP_EXPAND)
-    return expands
-
-
 def _detect_lower_third_region(frame: np.ndarray,
                                 height_frac: float = PANEL_LOWER_THIRD_HEIGHT_FRAC
                                 ) -> Optional[int]:
-    """
-    Detect if there's a text banner/lower-third in the bottom portion.
-    Returns the y-coordinate of the top of the detected region, or None.
-    Uses edge density: text areas have high horizontal edge count.
-    """
+    """Detect text banner in bottom portion using edge density."""
     h, w = frame.shape[:2]
     y_start = int(h * (1.0 - height_frac))
     roi = frame[y_start:, :]
-    if roi.size == 0:
-        return None
+    if roi.size == 0: return None
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 100, 200)
-    edge_density = float(edges.mean()) / 255.0
-    if edge_density > 0.08:  # significant text/graphics detected
+    if float(edges.mean()) / 255.0 > 0.08:
         return y_start
     return None
 
 
-def _portrait_crop_from_face(
-    person_box: Tuple[int,int,int,int],
-    face_box: Optional[Tuple[int,int,int,int]],
-    frame_h: int, frame_w: int,
-    head_ratio: float = PANEL_PORTRAIT_HEAD_RATIO,
-) -> Tuple[int,int,int,int]:
-    """
-    Compute a head-and-shoulders crop centered on the face.
-    Falls back to upper portion of person box if no face detected.
-    """
+def _portrait_crop_from_face(person_box, face_box, frame_h, frame_w,
+                              head_ratio=PANEL_PORTRAIT_HEAD_RATIO):
+    """Head-and-shoulders crop centered on face."""
     px1, py1, px2, py2 = person_box
     if face_box is not None:
         fx1, fy1, fx2, fy2 = face_box
         face_h = max(fy2 - fy1, 1)
-        face_cx = (fx1 + fx2) // 2
-        face_cy = (fy1 + fy2) // 2
-        # Portrait crop: face_h * head_ratio tall, centered on face
+        face_cx, face_cy = (fx1+fx2)//2, (fy1+fy2)//2
         crop_h = int(face_h * head_ratio)
-        crop_w = int(crop_h * 9 / 16)  # 9:16 aspect
-        cx1 = max(0, face_cx - crop_w // 2)
-        cy1 = max(0, face_cy - int(face_h * 0.3))  # bias up slightly
-        cx2 = min(frame_w, cx1 + crop_w)
-        cy2 = min(frame_h, cy1 + crop_h)
-        return (cx1, cy1, cx2, cy2)
-    else:
-        # Fallback: top 60% of person box
-        ph = py2 - py1
-        crop_h = int(ph * 0.6)
-        return (px1, py1, px2, min(py1 + crop_h, frame_h))
+        crop_w = int(crop_h * 9 / 16)
+        cx1 = max(0, face_cx - crop_w//2)
+        cy1 = max(0, face_cy - int(face_h * 0.3))
+        return (cx1, cy1, min(frame_w, cx1+crop_w), min(frame_h, cy1+crop_h))
+    ph = py2 - py1
+    return (px1, py1, px2, min(py1 + int(ph*0.6), frame_h))
+
+
+class LayoutTransitionManager:
+    """
+    Manages smooth transitions when panel person count changes.
+    - Holdover: keeps layout stable when person briefly disappears
+    - Stability: requires N frames of consistent count before switching
+    - Cross-dissolve: blends old→new layout during transitions
+    """
+
+    def __init__(self, stability_frames: int = 15,
+                 transition_frames: int = 6,
+                 holdover_frames: int = 30) -> None:
+        self.stability_frames = stability_frames
+        self.transition_frames = transition_frames
+        self.holdover_frames = holdover_frames
+        self._current_count = 0
+        self._pending_count = 0
+        self._pending_frames = 0
+        self._transitioning = False
+        self._transition_progress = 0
+        self._old_frame: Optional[np.ndarray] = None
+        self._last_persons: List[Tuple] = []
+        self._frames_since_last_seen: Dict[int, int] = {}
+        self._person_slots: Dict[int, Tuple] = {}
+
+    def update(self, persons: List[Tuple], frame_shape: Tuple) -> Tuple[List[Tuple], int, bool, float]:
+        """
+        Returns: (stable_persons, layout_count, is_transitioning, blend_alpha)
+        - stable_persons: person list with holdover (missing persons kept)
+        - layout_count: which grid to use (1/2/3/4)
+        - is_transitioning: True during cross-dissolve
+        - blend_alpha: 0.0 = fully old layout, 1.0 = fully new layout
+        """
+        n = len(persons)
+
+        # Track person persistence by approximate position
+        self._update_person_tracking(persons)
+
+        # Add held-over persons (recently disappeared)
+        stable_persons = list(persons)
+        for slot_id, bbox in list(self._person_slots.items()):
+            age = self._frames_since_last_seen.get(slot_id, 999)
+            if age > 0 and age <= self.holdover_frames:
+                # Person not in current frame but recently seen - keep their slot
+                already_covered = any(
+                    abs((p[0]+p[2])//2 - (bbox[0]+bbox[2])//2) < 50
+                    for p in stable_persons
+                )
+                if not already_covered:
+                    stable_persons.append(bbox)
+
+        stable_n = len(stable_persons)
+
+        # Layout stability check
+        if stable_n != self._current_count:
+            if stable_n == self._pending_count:
+                self._pending_frames += 1
+            else:
+                self._pending_count = stable_n
+                self._pending_frames = 1
+
+            if self._pending_frames >= self.stability_frames:
+                # Commit layout change
+                self._transitioning = True
+                self._transition_progress = 0
+                self._current_count = stable_n
+                self._pending_count = stable_n
+                self._pending_frames = 0
+        else:
+            self._pending_count = stable_n
+            self._pending_frames = 0
+
+        # Progress transition
+        blend_alpha = 1.0
+        if self._transitioning:
+            self._transition_progress += 1
+            blend_alpha = min(1.0, self._transition_progress / max(self.transition_frames, 1))
+            if self._transition_progress >= self.transition_frames:
+                self._transitioning = False
+
+        layout_count = max(1, self._current_count)
+        return stable_persons[:layout_count], layout_count, self._transitioning, blend_alpha
+
+    def _update_person_tracking(self, persons: List[Tuple]) -> None:
+        """Track person positions across frames for holdover."""
+        # Match current persons to known slots by proximity
+        matched: set = set()
+        for p in persons:
+            pcx = (p[0] + p[2]) // 2
+            best_id, best_dist = -1, 999999
+            for sid, sbbox in self._person_slots.items():
+                scx = (sbbox[0] + sbbox[2]) // 2
+                dist = abs(pcx - scx)
+                if dist < best_dist and sid not in matched:
+                    best_dist, best_id = dist, sid
+            if best_id >= 0 and best_dist < 200:
+                self._person_slots[best_id] = p
+                self._frames_since_last_seen[best_id] = 0
+                matched.add(best_id)
+            else:
+                new_id = max(self._person_slots.keys(), default=-1) + 1
+                self._person_slots[new_id] = p
+                self._frames_since_last_seen[new_id] = 0
+
+        # Age out unmatched slots
+        for sid in list(self._frames_since_last_seen.keys()):
+            if sid not in matched:
+                self._frames_since_last_seen[sid] = self._frames_since_last_seen.get(sid, 0) + 1
+                if self._frames_since_last_seen[sid] > self.holdover_frames * 2:
+                    del self._frames_since_last_seen[sid]
+                    self._person_slots.pop(sid, None)
+
+    def store_old_frame(self, frame: np.ndarray) -> None:
+        """Store current rendered frame for cross-dissolve."""
+        self._old_frame = frame.copy()
+
+    def blend_transition(self, new_frame: np.ndarray, alpha: float) -> np.ndarray:
+        """Blend old and new frames during transition."""
+        if self._old_frame is None or alpha >= 1.0:
+            return new_frame
+        if self._old_frame.shape != new_frame.shape:
+            self._old_frame = cv2.resize(self._old_frame,
+                                          (new_frame.shape[1], new_frame.shape[0]))
+        return cv2.addWeighted(new_frame, alpha, self._old_frame, 1.0 - alpha, 0)
 
 
 def _crop_group_to_strip(frame: np.ndarray, group: List[Tuple], strip_w: int, strip_h: int,
@@ -2787,45 +2815,43 @@ def _crop_group_to_strip(frame: np.ndarray, group: List[Tuple], strip_w: int, st
                          color_grade: str = "none",
                          face_boxes: Optional[List[Optional[Tuple]]] = None,
                          portrait_mode: bool = False,
-                         lower_third_y: Optional[int] = None) -> np.ndarray:
+                         lower_third_y: Optional[int] = None,
+                         upper_body_bias: float = 0.15) -> np.ndarray:
     """
-    Crop a group of persons to a strip. Enhanced with:
-    - Portrait mode: head-and-shoulders crop from face
-    - Lower-third awareness: avoid cropping into text banners
+    Crop a person/group to fill a strip. Biases upward for head-and-shoulders framing.
     """
     fh, fw = frame.shape[:2]
     if not group:
         crop = frame
     else:
         ux1, uy1, ux2, uy2 = _group_union(group)
-
-        # Portrait mode: use face-centered crop if available
         if portrait_mode and face_boxes:
             valid_faces = [fb for fb in face_boxes if fb is not None]
             if valid_faces:
-                # Use first valid face for portrait crop
-                pcrop = _portrait_crop_from_face(
+                ux1, uy1, ux2, uy2 = _portrait_crop_from_face(
                     (ux1, uy1, ux2, uy2), valid_faces[0], fh, fw)
-                ux1, uy1, ux2, uy2 = pcrop
-
-        ucx = (ux1+ux2)//2; ucy = (uy1+uy2)//2
-        uw  = max(ux2-ux1, 1)
-        sr  = strip_w / max(strip_h, 1)
-        cw  = int(uw * expand); ch = int(cw / sr)
+        ucx = (ux1 + ux2) // 2
+        person_h = max(uy2 - uy1, 1)
+        ucy = (uy1 + uy2) // 2 - int(person_h * upper_body_bias)
+        ucy = max(0, ucy)
+        uw = max(ux2 - ux1, 1)
+        sr = strip_w / max(strip_h, 1)
+        cw = int(max(uw, person_h * sr) * expand)
+        ch = int(cw / sr)
         if ch > fh: ch = fh; cw = int(ch * sr)
         if cw > fw: cw = fw; ch = int(cw / sr)
-        cw = max(cw, 2); ch = max(ch, 2)
-        x1 = max(0, min(ucx-cw//2, fw-cw)); y1 = max(0, min(ucy-ch//2, fh-ch))
-
-        # Lower-third awareness: push crop up if it extends into text region
+        cw, ch = max(cw, 2), max(ch, 2)
+        x1 = max(0, min(ucx - cw // 2, fw - cw))
+        y1 = max(0, min(ucy - ch // 2, fh - ch))
         if lower_third_y is not None and (y1 + ch) > lower_third_y:
             y1 = max(0, lower_third_y - ch)
-
         crop = frame[y1:y1+ch, x1:x1+cw]
         if crop.size == 0: crop = frame
     result = cv2.resize(crop, (strip_w, strip_h), interpolation=cv2.INTER_LANCZOS4)
-    if color_grade and color_grade != "none": result = apply_color_grade(result, color_grade)
-    if vignette_strength > 0:                result = apply_vignette(result, vignette_strength)
+    if color_grade and color_grade != "none":
+        result = apply_color_grade(result, color_grade)
+    if vignette_strength > 0:
+        result = apply_vignette(result, vignette_strength)
     return result
 
 
@@ -2836,204 +2862,145 @@ def _render_panel_frame(frame: np.ndarray, persons: List[Tuple], out_w: int, out
                         orientation: str = "horizontal",
                         panel_config: Optional[PanelModeConfig] = None,
                         audio_rms_per_person: Optional[List[float]] = None,
+                        layout_manager: Optional[LayoutTransitionManager] = None,
                         ) -> Tuple[np.ndarray, List]:
     """
-    Enhanced panel renderer supporting:
-    - N-person layouts (2-4+)
-    - Dynamic layout modes: equal, speaker_focus, solo_spotlight, auto
-    - Head normalization, portrait mode, lower-third awareness
+    Render panel frame with intelligent grid layouts and smooth transitions.
+    - 1 person:  full frame solo
+    - 2 people:  top/bottom 50-50 split
+    - 3 people:  top 40% + bottom 60% split (1 top, 2 bottom)
+    - 4 people:  2x2 grid
+    Transitions smoothly between layouts using LayoutTransitionManager.
     """
     cfg = panel_config or PanelModeConfig()
     persons = sorted(persons, key=lambda b: (b[0]+b[2])//2)
     n = len(persons)
 
-    # Detect faces if head_normalize or portrait_mode is on
+    # Detect faces if needed
     face_boxes = None
     if cfg.head_normalize or cfg.portrait_mode:
         face_boxes = _detect_faces_for_panel(frame, persons[:cfg.max_slots])
 
-    # Detect lower-third text region
+    # Detect lower-third
     lower_third_y = None
     if cfg.lower_third_aware:
         lower_third_y = _detect_lower_third_region(frame)
 
-    # ── Determine layout mode ────────────────────────────────────────
-    layout = cfg.layout_mode
-    if layout == "auto":
-        # Auto-select based on audio energy and person count
-        if n == 1:
-            layout = "solo_spotlight"
-        elif audio_rms_per_person and max(audio_rms_per_person) > 0:
-            energies = audio_rms_per_person[:n]
-            if max(energies) > 2.0 * (sum(energies) / max(len(energies), 1)):
-                layout = "speaker_focus"
-            else:
-                layout = "equal"
-        else:
-            layout = "equal"
-
-    # ── Build groups ─────────────────────────────────────────────────
-    n_slots = min(max(n, 2), cfg.max_slots)
-    if n == 0:
-        groups = [prev_slots[si] if prev_slots and si < len(prev_slots) else []
-                  for si in range(n_slots)]
-    elif n == 1:
-        groups = [persons]
-        while len(groups) < n_slots:
-            groups.append(prev_slots[len(groups)] if prev_slots and len(groups) < len(prev_slots) else persons)
+    # Layout transition management
+    if layout_manager is not None:
+        stable_persons, layout_count, is_transitioning, blend_alpha = \
+            layout_manager.update(persons, frame.shape)
+        # Use stable person list (includes holdover)
+        persons = stable_persons[:cfg.max_slots]
+        n = len(persons)
     else:
-        # Distribute persons across n_slots using k-means-like split by x-center
-        cx_list = [(p[0]+p[2])//2 for p in persons]
-        if n <= n_slots:
-            groups = [[p] for p in persons]
-            while len(groups) < n_slots:
-                groups.append([])
-        else:
-            # Split into n_slots groups by x-coordinate quantiles
-            sorted_persons = sorted(persons, key=lambda p: (p[0]+p[2])//2)
-            chunk = max(1, n // n_slots)
-            groups = []
-            for si in range(n_slots):
-                start_idx = si * chunk
-                end_idx = start_idx + chunk if si < n_slots - 1 else n
-                groups.append(sorted_persons[start_idx:end_idx])
+        layout_count = min(max(n, 1), cfg.max_slots)
+        is_transitioning = False
+        blend_alpha = 1.0
 
-    # ── Apply smoother ───────────────────────────────────────────────
-    if slot_smoother is not None:
+    # Build groups: each person = 1 group
+    groups = []
+    if n == 0:
+        if prev_slots:
+            groups = list(prev_slots)
+        else:
+            groups = [[(out_w//4, out_h//4, out_w*3//4, out_h*3//4)]]
+    else:
+        groups = [[p] for p in persons[:cfg.max_slots]]
+
+    # Smooth slot positions
+    if slot_smoother is not None and len(groups) >= 2:
         if len(groups) == 2:
             groups[0], groups[1] = slot_smoother.update(
                 groups[0], groups[1], strip_w=float(out_w))
         else:
-            smoothed = slot_smoother.update(*groups, strip_w=float(out_w))
-            if isinstance(smoothed, list):
-                groups = smoothed
-            else:
-                groups = list(smoothed)
+            sm = slot_smoother.update(*groups, strip_w=float(out_w))
+            if isinstance(sm, (list, tuple)):
+                groups = list(sm)
 
-    # ── Speaker weights for focus layout ─────────────────────────────
-    if audio_rms_per_person and slot_smoother is not None:
-        weights = [0.5] * n_slots
-        for si in range(min(len(audio_rms_per_person), n_slots)):
-            weights[si] = audio_rms_per_person[si]
-        slot_smoother.set_speaker_weights(weights)
+    n_active = len([g for g in groups if g])
+    canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    div = PANEL_DIVIDER_PX
+    div_color = PANEL_DIVIDER_COLOR
 
-    # ── Compute head-normalized expand factors ───────────────────────
-    expand_factors = [PANEL_CROP_EXPAND] * n_slots
-    if cfg.head_normalize and face_boxes:
-        # Map faces to slots
-        for si in range(min(n_slots, len(groups))):
-            if groups[si]:
-                slot_faces = [face_boxes[persons.index(p)]
-                              for p in groups[si]
-                              if p in persons and persons.index(p) < len(face_boxes)]
-                if slot_faces:
-                    factors = _compute_head_normalized_crops(
-                        groups[si], slot_faces, strip_h=out_h // max(n_slots, 1))
-                    if factors:
-                        expand_factors[si] = float(np.mean(factors))
+    def _crop_person(group, w, h, face_idx=None):
+        fb = None
+        if face_boxes and face_idx is not None and face_idx < len(face_boxes):
+            fb = [face_boxes[face_idx]]
+        return _crop_group_to_strip(frame, group, w, h,
+                                     vignette_strength=vignette_strength,
+                                     color_grade=color_grade,
+                                     face_boxes=fb,
+                                     portrait_mode=cfg.portrait_mode,
+                                     lower_third_y=lower_third_y)
 
-    # ── Render canvas ────────────────────────────────────────────────
-    canvas = np.empty((out_h, out_w, 3), dtype=np.uint8)
-    active_slots = [si for si in range(n_slots) if groups[si]]
-    n_active = max(len(active_slots), 1)
+    # Use layout_count (from transition manager) not n_active for grid selection
+    effective_count = layout_count if layout_manager else n_active
 
-    if orientation == "vertical":
-        # Side-by-side strips
-        if layout == "speaker_focus" and audio_rms_per_person and n_active >= 2:
-            # Dominant speaker gets wider strip
-            focus_ratio = cfg.speaker_focus_ratio
-            widths = [int(out_w * (1 - focus_ratio) / max(n_active - 1, 1))] * n_active
-            # Find loudest slot
-            slot_energies = []
-            for si in active_slots:
-                if si < len(audio_rms_per_person or []):
-                    slot_energies.append(audio_rms_per_person[si])
-                else:
-                    slot_energies.append(0.0)
-            loudest = slot_energies.index(max(slot_energies)) if slot_energies else 0
-            widths[loudest] = int(out_w * focus_ratio)
-            # Adjust others to fill
-            remaining = out_w - widths[loudest]
-            for i in range(n_active):
-                if i != loudest:
-                    widths[i] = remaining // max(n_active - 1, 1)
-        else:
-            widths = [out_w // n_active] * n_active
-        # Fix rounding
-        widths[-1] = out_w - sum(widths[:-1])
-        x_offset = 0
-        for idx, si in enumerate(active_slots):
-            w = widths[idx]
-            slot_faces = None
-            if face_boxes and si < len(groups):
-                slot_faces = [face_boxes[persons.index(p)]
-                              for p in groups[si]
-                              if p in persons and persons.index(p) < len(face_boxes)]
-            strip = _crop_group_to_strip(
-                frame, groups[si], w, out_h,
-                expand=expand_factors[si],
-                vignette_strength=vignette_strength,
-                color_grade=color_grade,
-                face_boxes=slot_faces,
-                portrait_mode=cfg.portrait_mode,
-                lower_third_y=lower_third_y)
-            canvas[:, x_offset:x_offset+w] = strip
-            x_offset += w
-            # Divider
-            if idx < n_active - 1:
-                dx = min(x_offset, out_w - 1)
-                d1 = max(0, dx - PANEL_DIVIDER_PX // 2)
-                d2 = min(out_w, dx + (PANEL_DIVIDER_PX + 1) // 2)
-                canvas[:, d1:d2] = PANEL_DIVIDER_COLOR
+    if effective_count <= 1:
+        # Solo: full frame
+        g = groups[0] if groups and groups[0] else []
+        canvas[:, :] = _crop_person(g, out_w, out_h, face_idx=0)
+
+    elif effective_count == 2:
+        # 2 people: top/bottom 50-50 split
+        h_top = out_h // 2
+        h_bot = out_h - h_top
+        g0 = groups[0] if len(groups) > 0 and groups[0] else []
+        g1 = groups[1] if len(groups) > 1 and groups[1] else g0
+        canvas[0:h_top, :] = _crop_person(g0, out_w, h_top, face_idx=0)
+        canvas[h_top:out_h, :] = _crop_person(g1, out_w, h_bot, face_idx=1)
+        d1 = max(0, h_top - div // 2)
+        d2 = min(out_h, h_top + (div + 1) // 2)
+        canvas[d1:d2, :] = div_color
+
+    elif effective_count == 3:
+        # 3 people: top = 1 person (40%), bottom = 2 side-by-side (60%)
+        h_top = int(out_h * 0.40)
+        h_bot = out_h - h_top
+        w_half = out_w // 2
+        g0 = groups[0] if len(groups) > 0 and groups[0] else []
+        g1 = groups[1] if len(groups) > 1 and groups[1] else g0
+        g2 = groups[2] if len(groups) > 2 and groups[2] else g1
+        canvas[0:h_top, :] = _crop_person(g0, out_w, h_top, face_idx=0)
+        canvas[h_top:out_h, 0:w_half] = _crop_person(g1, w_half, h_bot, face_idx=1)
+        canvas[h_top:out_h, w_half:out_w] = _crop_person(g2, out_w - w_half, h_bot, face_idx=2)
+        # Horizontal divider
+        d1 = max(0, h_top - div // 2)
+        d2 = min(out_h, h_top + (div + 1) // 2)
+        canvas[d1:d2, :] = div_color
+        # Vertical divider in bottom half
+        vd1 = max(0, w_half - div // 2)
+        vd2 = min(out_w, w_half + (div + 1) // 2)
+        canvas[h_top:out_h, vd1:vd2] = div_color
+
     else:
-        # Stacked strips (horizontal orientation = top/bottom)
-        if layout == "speaker_focus" and audio_rms_per_person and n_active >= 2:
-            focus_ratio = cfg.speaker_focus_ratio
-            heights = [int(out_h * (1 - focus_ratio) / max(n_active - 1, 1))] * n_active
-            slot_energies = []
-            for si in active_slots:
-                if si < len(audio_rms_per_person or []):
-                    slot_energies.append(audio_rms_per_person[si])
-                else:
-                    slot_energies.append(0.0)
-            loudest = slot_energies.index(max(slot_energies)) if slot_energies else 0
-            heights[loudest] = int(out_h * focus_ratio)
-            remaining = out_h - heights[loudest]
-            for i in range(n_active):
-                if i != loudest:
-                    heights[i] = remaining // max(n_active - 1, 1)
-        elif layout == "solo_spotlight" and n_active >= 1:
-            heights = [out_h]  # single person fills frame
-            active_slots = active_slots[:1]
-            n_active = 1
-        else:
-            heights = [out_h // n_active] * n_active
-        heights[-1] = out_h - sum(heights[:-1])
-        y_offset = 0
-        for idx, si in enumerate(active_slots):
-            h = heights[idx]
-            slot_faces = None
-            if face_boxes and si < len(groups):
-                slot_faces = [face_boxes[persons.index(p)]
-                              for p in groups[si]
-                              if p in persons and persons.index(p) < len(face_boxes)]
-            strip = _crop_group_to_strip(
-                frame, groups[si], out_w, h,
-                expand=expand_factors[si],
-                vignette_strength=vignette_strength,
-                color_grade=color_grade,
-                face_boxes=slot_faces,
-                portrait_mode=cfg.portrait_mode,
-                lower_third_y=lower_third_y)
-            canvas[y_offset:y_offset+h, :] = strip
-            y_offset += h
-            if idx < n_active - 1:
-                dy = min(y_offset, out_h - 1)
-                d1 = max(0, dy - PANEL_DIVIDER_PX // 2)
-                d2 = min(out_h, dy + (PANEL_DIVIDER_PX + 1) // 2)
-                canvas[d1:d2, :] = PANEL_DIVIDER_COLOR
+        # 4+ people: 2x2 grid
+        h_half = out_h // 2
+        w_half = out_w // 2
+        active_groups = [g for g in groups if g][:4]
+        while len(active_groups) < 4:
+            active_groups.append(active_groups[-1] if active_groups else [])
+        canvas[0:h_half, 0:w_half] = _crop_person(active_groups[0], w_half, h_half, face_idx=0)
+        canvas[0:h_half, w_half:out_w] = _crop_person(active_groups[1], out_w - w_half, h_half, face_idx=1)
+        canvas[h_half:out_h, 0:w_half] = _crop_person(active_groups[2], w_half, out_h - h_half, face_idx=2)
+        canvas[h_half:out_h, w_half:out_w] = _crop_person(active_groups[3], out_w - w_half, out_h - h_half, face_idx=3)
+        # Horizontal divider
+        d1 = max(0, h_half - div // 2)
+        d2 = min(out_h, h_half + (div + 1) // 2)
+        canvas[d1:d2, :] = div_color
+        # Vertical divider
+        vd1 = max(0, w_half - div // 2)
+        vd2 = min(out_w, w_half + (div + 1) // 2)
+        canvas[:, vd1:vd2] = div_color
 
-    return canvas, [list(g) for g in groups[:n_slots]]
+    # Cross-dissolve during transitions
+    if layout_manager is not None:
+        if is_transitioning and blend_alpha < 1.0:
+            canvas = layout_manager.blend_transition(canvas, blend_alpha)
+        layout_manager.store_old_frame(canvas)
+
+    return canvas, [list(g) for g in groups[:max(n_active, 1)]]
 
 
 # ── Legacy optical flow / saliency ────────────────────────────────────────────
@@ -3300,6 +3267,40 @@ def translate_srt(srt_path: str, target_language: str, source_language: str = "a
 
 
 # ── Clip detection ────────────────────────────────────────────────────────────
+def _compute_audio_energy(input_path: str, duration: float,
+                          sample_rate: int = 16000) -> Optional[np.ndarray]:
+    """Extract audio -> compute per-second RMS energy, normalized to [0, 1]."""
+    if not _has_audio(input_path):
+        return None
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        if not _extract_audio_wav(input_path, wav_path):
+            return None
+        cmd = ["ffmpeg", "-y", "-i", wav_path, "-f", "s16le", "-acodec", "pcm_s16le",
+               "-ar", str(sample_rate), "-ac", "1", "pipe:1"]
+        r = subprocess.run(cmd, capture_output=True, timeout=120)
+        if r.returncode != 0 or len(r.stdout) < sample_rate * 2:
+            return None
+        pcm = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+        n_seconds = max(1, int(duration))
+        energy = np.zeros(n_seconds, dtype=np.float32)
+        for i in range(n_seconds):
+            s = i * sample_rate; e = min(s + sample_rate, len(pcm))
+            if s >= len(pcm): break
+            energy[i] = float(np.sqrt(np.mean(pcm[s:e] ** 2)))
+        mx = energy.max()
+        if mx > 0: energy /= mx
+        return energy
+    except Exception as exc:
+        logger.debug("Audio energy extraction failed: %s", exc)
+        return None
+    finally:
+        if os.path.exists(wav_path):
+            try: os.unlink(wav_path)
+            except OSError: pass
+
+
 def _frame_saliency_score(frame: np.ndarray,
                           prev_frame: Optional[np.ndarray]) -> float:
     gray   = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -3549,6 +3550,7 @@ def _render_video(input_path: str, output_path: str,
 
     dissolve       = DissolveBuffer(DISSOLVE_FRAMES)
     slot_smoother  = PanelSlotSmoother() if use_panel_mode else None
+    layout_mgr     = LayoutTransitionManager() if use_panel_mode else None
     prev_slots     = None
     orientation    = panel_config.split_orientation if panel_config else "horizontal"
     scene_cut_set  = set(scene_cuts or [])
@@ -3586,7 +3588,8 @@ def _render_video(input_path: str, output_path: str,
                         persons = [(scx-hw, scy-hh, scx+hw, scy+hh)]
                     out_frame, prev_slots = _render_panel_frame(
                         frame, persons, out_w, out_h, prev_slots=prev_slots,
-                        slot_smoother=slot_smoother, orientation=orientation)
+                        slot_smoother=slot_smoother, orientation=orientation,
+                        panel_config=panel_cfg, layout_manager=layout_mgr)
                 else:
                     cx, cy = (smoothed_centers[fi] if fi < len(smoothed_centers)
                               else (orig_w//2, orig_h//2))
@@ -4287,7 +4290,12 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
                         audio_bitrate: str = "128k", yolo_weights: str = "yolov8n.pt",
                         burn_subtitles: bool = False, whisper_model: str = "base",
                         subtitle_style_name: str = "Bold White (TikTok)",
-                        subtitle_max_chars: int = 42, sport_type: str = "auto",
+                        subtitle_max_chars: int = 42,
+                        subtitle_translate_to: Optional[str] = None,
+                        sport_type: str = "auto",
+                        use_optical_flow: bool = True,
+                        scene_cut_threshold: float = 0.35,
+                        whisper_language: Optional[str] = None,
                         output_fps: Optional[float] = None,
                         panel_config: Optional[PanelModeConfig] = None,
                         draw_tracking_boxes: bool = True,
@@ -4330,8 +4338,8 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
                     trim_path, out_path, target_preset_label=target_preset_label,
                     tracking_mode=tracking_mode, talking_head_bias=talking_head_bias,
                     confidence=confidence, smooth_window=smooth_window,
-                    adaptive_smoothing=adaptive_smoothing, use_optical_flow=True,
-                    rule_of_thirds=rule_of_thirds, scene_cut_threshold=0.35,
+                    adaptive_smoothing=adaptive_smoothing, use_optical_flow=use_optical_flow,
+                    rule_of_thirds=rule_of_thirds, scene_cut_threshold=scene_cut_threshold,
                     output_fps=output_fps, crf=crf, encoder_preset=encoder_preset,
                     audio_bitrate=audio_bitrate, yolo_weights=yolo_weights,
                     burn_subtitles=burn_subtitles, whisper_model=whisper_model,
