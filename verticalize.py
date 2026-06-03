@@ -3586,12 +3586,10 @@ def _render_video(input_path: str, output_path: str,
                                     else (orig_w//2, orig_h//2))
                         hw = min(crop_w//2, orig_w//4); hh = min(crop_h//4, orig_h//4)
                         persons = [(scx-hw, scy-hh, scx+hw, scy+hh)]
-                        
-out_frame, prev_slots = _render_panel_frame(
-    frame, persons, out_w, out_h, prev_slots=prev_slots,
-    slot_smoother=slot_smoother, orientation=orientation,
-    panel_config=panel_config, layout_manager=layout_mgr)
-
+                    out_frame, prev_slots = _render_panel_frame(
+                        frame, persons, out_w, out_h, prev_slots=prev_slots,
+                        slot_smoother=slot_smoother, orientation=orientation,
+                        panel_config=panel_cfg, layout_manager=layout_mgr)
                 else:
                     cx, cy = (smoothed_centers[fi] if fi < len(smoothed_centers)
                               else (orig_w//2, orig_h//2))
