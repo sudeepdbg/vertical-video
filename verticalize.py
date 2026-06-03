@@ -3589,7 +3589,7 @@ def _render_video(input_path: str, output_path: str,
                     out_frame, prev_slots = _render_panel_frame(
                         frame, persons, out_w, out_h, prev_slots=prev_slots,
                         slot_smoother=slot_smoother, orientation=orientation,
-                        panel_config=panel_cfg, layout_manager=layout_mgr)
+                        panel_config=panel_config, layout_manager=layout_mgr)
                 else:
                     cx, cy = (smoothed_centers[fi] if fi < len(smoothed_centers)
                               else (orig_w//2, orig_h//2))
@@ -4135,19 +4135,19 @@ def process_video(input_path: str, output_path: str,
         load_model=(tracking_mode != "talking_head"),
     )
     crop_w, crop_h = calculate_crop_dims(orig_w, orig_h, out_w, out_h)
-    panel_cfg      = panel_config or PanelModeConfig()
+    panel_config      = panel_config or PanelModeConfig()
     use_panel_mode = False
-    if panel_cfg.split_mode == "force_on":
+    if panel_config.split_mode == "force_on":
         use_panel_mode = True
-    elif panel_cfg.split_mode == "auto" and tracking_mode == "subject":
+    elif panel_config.split_mode == "auto" and tracking_mode == "subject":
         _p(0.03, "Detecting panel layout...")
         use_panel_mode = _detect_panel_mode(
             input_path, model, fps, total_frames, orig_w, orig_h,
             confidence=confidence,
-            max_person_motion=panel_cfg.max_person_motion,
-            min_person_area_frac=panel_cfg.min_person_area_frac,
-            max_count_variance=panel_cfg.max_count_variance,
-            stability_frac=panel_cfg.stability_frac)
+            max_person_motion=panel_config.max_person_motion,
+            min_person_area_frac=panel_config.min_person_area_frac,
+            max_count_variance=panel_config.max_count_variance,
+            stability_frac=panel_config.stability_frac)
     _p(0.05, "Tracking subjects...")
     raw_centers, speeds, scene_cuts, persons_map, kalman_preds = _tracking_pass(
         input_path=input_path, orig_w=orig_w, orig_h=orig_h, crop_w=crop_w, crop_h=crop_h,
@@ -4174,7 +4174,7 @@ def process_video(input_path: str, output_path: str,
         output_fps=output_fps, color_grade=color_grade,
         vignette_strength=vignette_strength, sharpen_strength=sharpen_strength,
         ffmpeg_sharpen=ffmpeg_sharpen, scene_cuts=scene_cuts,
-        use_panel_mode=use_panel_mode, panel_config=panel_cfg,
+        use_panel_mode=use_panel_mode, panel_config=panel_confg,
         panel_persons_map=persons_map,
         progress_callback=lambda v, m: _p(0.55+v*0.43, m))
     res_mon.stop()
