@@ -575,11 +575,12 @@ if uploaded_file is not None and st.session_state.input_path:
                             except OSError: pass
                         st.session_state.processing_done = True; status.success("✅ Done!"); st.rerun()
                     else: status.error("Output is empty — check FFmpeg.")
+               
  except Exception as exc:
                     import traceback
                     status.error(f"Error: {exc}")
                     print(traceback.format_exc())
-status.error(f"Error: {exc}")
+ status.error(f"Error: {exc}")
         else:
             r1, _, r2 = st.columns([2,5,2])
             with r1:
