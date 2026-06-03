@@ -191,7 +191,7 @@ with tm2:
     if st.button("👤  Talking Head  ✦", type="secondary", use_container_width=True):
         st.session_state.tracking_mode = "talking_head"
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-if st.button("🏀  Sports Action  ✦  (Ball-aware · Kalman)", type="secondary", use_container_width=True):
+if st.button("🏀  Sports Action  ✦  Ball-aware · Kalman", type="secondary", use_container_width=True):
     st.session_state.tracking_mode = "sports_action"
 
 tracking_mode = st.session_state.tracking_mode
@@ -216,18 +216,16 @@ if tracking_mode == "subject":
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     with st.expander("🎛 Panel Mode Settings", expanded=False):
         st.caption("For news panels, podcasts, interviews with 2+ people")
-        _panel_mode_labels = {"auto":"🤖 Auto-detect (recommended)","force_on":"✅ Force ON","force_off":"❌ Force OFF"}
         panel_mode_override = st.radio("Panel mode", ["auto","force_on","force_off"],
-            format_func=lambda x: _panel_mode_labels.get(x, x),
+            format_func={"auto":"🤖 Auto-detect","force_on":"✅ Force ON","force_off":"❌ Force OFF"}.get,
             index=["auto","force_on","force_off"].index(st.session_state.get("panel_mode_override","auto")),
             help="Auto = detect panel layout automatically.")
         st.session_state.panel_mode_override = panel_mode_override
         if panel_mode_override != "force_off":
             st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
             st.markdown('<div class="rf-sec">Layout & Features</div>', unsafe_allow_html=True)
-            _layout_labels = {"equal":"➖ Equal Split","speaker_focus":"🔊 Speaker Focus 60-40","solo_spotlight":"💡 Solo Spotlight","auto":"🤖 Auto switches by audio"}
             layout_mode = st.radio("Layout mode", ["equal","speaker_focus","solo_spotlight","auto"],
-                format_func=lambda x: _layout_labels.get(x, x),
+                format_func={"equal":"➖ Equal Split","speaker_focus":"🔊 Speaker Focus","solo_spotlight":"💡 Solo Spotlight","auto":"🤖 Auto"}.get,
                 index=["equal","speaker_focus","solo_spotlight","auto"].index(st.session_state.get("panel_layout_mode","equal")),
                 help="How to distribute screen space among detected persons.")
             st.session_state.panel_layout_mode = layout_mode
@@ -247,8 +245,8 @@ if tracking_mode == "subject":
             st.markdown('<div class="rf-sec">Detection Sensitivity</div>', unsafe_allow_html=True)
             c1, c2 = st.columns(2)
             with c1:
-                st.session_state.panel_max_motion = st.slider("Max motion (px)", 5.0, 40.0, float(st.session_state.get("panel_max_motion", 20.0)), 1.0)
-                st.session_state.panel_min_area = st.slider("Min person area (%)", 0.01, 0.10, float(st.session_state.get("panel_min_area", 0.03)), 0.01, format="%.2f")
+                st.session_state.panel_max_motion = st.slider("Max motion px", 5.0, 40.0, float(st.session_state.get("panel_max_motion", 20.0)), 1.0)
+                st.session_state.panel_min_area = st.slider("Min person area pct", 0.01, 0.10, float(st.session_state.get("panel_min_area", 0.03)), 0.01, format="%.2f")
             with c2:
                 st.session_state.panel_max_variance = st.slider("Max count variance", 0.5, 5.0, float(st.session_state.get("panel_max_variance", 2.5)), 0.5)
                 st.session_state.panel_stability = st.slider("Stability fraction", 0.30, 0.90, float(st.session_state.get("panel_stability", 0.60)), 0.05, format="%.2f")
@@ -266,12 +264,12 @@ with tab_out:
     o1, o2 = st.columns(2, gap="medium")
     with o1:
         resolution_label = st.selectbox("Resolution", list(RESOLUTION_PRESETS.keys()), index=0)
-        fps_label = st.selectbox("Frame rate", ["Source (keep original)","60 fps","30 fps","25 fps","24 fps"], index=0)
+        fps_label = st.selectbox("Frame rate", ["Source - keep original","60 fps","30 fps","25 fps","24 fps"], index=0)
     with o2:
-        crf = st.slider("Quality (CRF)", 15, 35, 23, 1)
+        crf = st.slider("Quality CRF", 15, 35, 23, 1)
         st.caption("18 = near-lossless · 28 = compact")
         encoder_preset_label = st.selectbox("Speed", ["ultrafast","fast","medium","slow"], index=1)
-_fps_map = {"Source (keep original)":None,"60 fps":60.0,"30 fps":30.0,"25 fps":25.0,"24 fps":24.0}
+_fps_map = {"Source - keep original":None,"60 fps":60.0,"30 fps":30.0,"25 fps":25.0,"24 fps":24.0}
 output_fps = _fps_map[fps_label]
 
 with tab_trk:
