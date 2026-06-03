@@ -358,7 +358,19 @@ if app_mode == "autoClip" and tab_analytics is not None:
             vr = [r for r in st.session_state.clip_results if not r.get("error") and "analytics" in r]
             if vr:
                 ti = sum(r["analytics"]["input_size_mb"] for r in vr); to = sum(r["analytics"]["output_size_mb"] for r in vr)
-                st.markdown(f'<div class="rf-analytics"><div class="rf-an-title">📊 Batch Analytics</div><div class="rf-an-grid"><div class="rf-an-item"><div class="rf-an-label">Total Input</div><div class="rf-an-val">{ti:.1f} MB</div></div><div class="rf-an-item"><div class="rf-an-label">Total Output</div><div class="rf-an-val good">{to:.1f} MB</div></div></div></div>', unsafe_allow_html=True)
+                # Aggregate resource stats across clips
+                total_cpu_avg = sum(r["analytics"].get("cpu_avg_pct", 0) for r in vr) / len(vr) if vr else 0
+                total_cpu_max = max((r["analytics"].get("cpu_max_pct", 0) for r in vr), default=0)
+                total_ram_avg = sum(r["analytics"].get("ram_avg_mb", 0) for r in vr) / len(vr) if vr else 0
+                total_ram_max = max((r["analytics"].get("ram_max_mb", 0) for r in vr), default=0)
+                total_proc_time = sum(r["analytics"].get("processing_time_sec", 0) for r in vr)
+                has_batch_res = total_cpu_avg > 0 or total_ram_avg > 0
+
+                res_html = ""
+                if has_batch_res:
+                    res_html = f"""<div class="rf-an-item"><div class="rf-an-label">Avg CPU</div><div class="rf-an-val">{total_cpu_avg:.1f}% <span style="font-size:11px;color:var(--ink3)">(max {total_cpu_max:.1f}%)</span></div></div><div class="rf-an-item"><div class="rf-an-label">Avg RAM</div><div class="rf-an-val">{total_ram_avg:.1f} MB <span style="font-size:11px;color:var(--ink3)">(max {total_ram_max:.1f} MB)</span></div></div><div class="rf-an-item"><div class="rf-an-label">Total Time</div><div class="rf-an-val">{total_proc_time:.1f}s</div></div>"""
+
+                st.markdown(f'<div class="rf-analytics"><div class="rf-an-title">📊 Batch Analytics</div><div class="rf-an-grid"><div class="rf-an-item"><div class="rf-an-label">Total Input</div><div class="rf-an-val">{ti:.1f} MB</div></div><div class="rf-an-item"><div class="rf-an-label">Total Output</div><div class="rf-an-val good">{to:.1f} MB</div></div><div class="rf-an-item"><div class="rf-an-label">Clips</div><div class="rf-an-val">{len(vr)}</div></div>{res_html}</div></div>', unsafe_allow_html=True)
         else: st.markdown('<div class="rf-empty" style="min-height:120px;padding:20px;"><div class="rf-empty-s">Process clips to view analytics</div></div>', unsafe_allow_html=True)
 st.markdown("</div>", unsafe_allow_html=True)
 
@@ -454,7 +466,23 @@ with col_out:
                 a = st.session_state.analytics_data
                 if a.get("panel_mode"): st.markdown('<div class="rf-ok">🎛 Panel mode active</div>', unsafe_allow_html=True)
                 sp = a.get("smoothness_pct",0); sc_v = "var(--grn)" if sp>80 else ("var(--amb)" if sp>50 else "var(--acc)")
-                st.markdown(f'<div class="rf-analytics"><div class="rf-an-title">📊 Analytics</div><div class="rf-an-grid"><div class="rf-an-item"><div class="rf-an-label">Size Reduction</div><div class="rf-an-val">{a.get("file_size_reduction_pct",0):.1f}%</div><div class="rf-an-sub">{a.get("input_size_mb",0):.1f} → {a.get("output_size_mb",0):.1f} MB</div></div><div class="rf-an-item"><div class="rf-an-label">Smoothness</div><div class="rf-an-val" style="color:{sc_v}">{sp:.1f}%</div></div><div class="rf-an-item"><div class="rf-an-label">Resolution</div><div class="rf-an-val">{a.get("output_resolution","")}</div></div></div></div>', unsafe_allow_html=True)
+                # Build analytics grid with CPU/RAM metrics if available
+                cpu_avg = a.get("cpu_avg_pct", 0)
+                cpu_max = a.get("cpu_max_pct", 0)
+                ram_avg = a.get("ram_avg_mb", 0)
+                ram_max = a.get("ram_max_mb", 0)
+                proc_time = a.get("processing_time_sec", 0)
+                has_resource = cpu_avg > 0 or ram_avg > 0
+
+                # Determine resource color coding
+                cpu_color = "var(--grn)" if cpu_max < 50 else ("var(--amb)" if cpu_max < 80 else "var(--acc)")
+                ram_color = "var(--grn)" if ram_max < 512 else ("var(--amb)" if ram_max < 1024 else "var(--acc)")
+
+                resource_html = ""
+                if has_resource:
+                    resource_html = f"""<div class="rf-an-item"><div class="rf-an-label">CPU Usage</div><div class="rf-an-val" style="color:{cpu_color}">{cpu_avg:.1f}% <span style="font-size:11px;color:var(--ink3)">(max {cpu_max:.1f}%)</span></div></div><div class="rf-an-item"><div class="rf-an-label">RAM Usage</div><div class="rf-an-val" style="color:{ram_color}">{ram_avg:.1f} MB <span style="font-size:11px;color:var(--ink3)">(max {ram_max:.1f} MB)</span></div></div><div class="rf-an-item"><div class="rf-an-label">Processing Time</div><div class="rf-an-val">{proc_time:.1f}s</div></div>"""
+
+                st.markdown(f'<div class="rf-analytics"><div class="rf-an-title">📊 Analytics</div><div class="rf-an-grid"><div class="rf-an-item"><div class="rf-an-label">Size Reduction</div><div class="rf-an-val">{a.get("file_size_reduction_pct",0):.1f}%</div><div class="rf-an-sub">{a.get("input_size_mb",0):.1f} → {a.get("output_size_mb",0):.1f} MB</div></div><div class="rf-an-item"><div class="rf-an-label">Smoothness</div><div class="rf-an-val" style="color:{sc_v}">{sp:.1f}%</div></div><div class="rf-an-item"><div class="rf-an-label">Resolution</div><div class="rf-an-val">{a.get("output_resolution","")}</div></div>{resource_html}</div></div>', unsafe_allow_html=True)
             stem = os.path.splitext(st.session_state.uploaded_file_name or "video")[0]
             st.download_button("↓  Download vertical video", data=st.session_state.output_bytes, file_name=f"{stem}_vertical.mp4", mime="video/mp4", use_container_width=True)
             if st.session_state.srt_bytes: st.download_button("↓  Download subtitles (.srt)", data=st.session_state.srt_bytes, file_name=f"{stem}.srt", mime="text/plain", use_container_width=True)
