@@ -1,6 +1,19 @@
 """
-verticalize.py — AI Vertical Video Converter v7.3
+verticalize.py — AI Vertical Video Converter v7.4
 ═══════════════════════════════════════════════════════════════════
+v7.4 CHANGES vs v7.3
+• FIXED: resolve_target_size no longer clamps explicit presets to source dims,
+  allowing intentional upscaling (e.g. 480p source → 1080p output).
+• FIXED: calculate_crop_dims clarified with docstring — min() clamps are
+  correct safety nets; upscaling from crop→output is handled by cv2.resize.
+• FIXED: _open_ffmpeg_encoder now accepts source_fps and inserts an fps
+  video filter when output_fps differs from source_fps, preventing
+  duration/timing mismatches.
+• FIXED: _render_video passes source_fps=fps to the encoder so that
+  frame-rate conversion is handled correctly by FFmpeg.
+• FIXED: _tracking_pass now returns the expected 5-tuple
+  (centers, speeds, scene_cuts, persons_map, 0) to match caller unpacking.
+
 v7.3 CHANGES vs v7.2
 • FIXED: ResourceMonitor now tracks per-sample instantaneous CPU so cpu_max_pct
          is correctly distinct from cpu_avg_pct.
@@ -1261,16 +1274,22 @@ def _open_ffmpeg_encoder(output_path: str, width: int, height: int, fps: float,
                          audio_bitrate: str = "128k",
                          subtitle_path: Optional[str] = None,
                          subtitle_style: Optional[Dict[str, Any]] = None,
-                         extra_vf: Optional[List[str]] = None) -> subprocess.Popen:
+                         extra_vf: Optional[List[str]] = None,
+                         source_fps: Optional[float] = None) -> subprocess.Popen:
+    # FIXED: use source_fps for the raw input stream rate, fps for output
+    input_fps = source_fps if source_fps is not None else fps
     cmd = [
         "ffmpeg", "-y",
         "-f", "rawvideo", "-vcodec", "rawvideo", "-pix_fmt", "bgr24",
-        "-s", f"{width}x{height}", "-r", str(fps), "-i", "pipe:0",
+        "-s", f"{width}x{height}", "-r", str(input_fps), "-i", "pipe:0",
     ]
     has_aud = bool(audio_source and _has_audio(audio_source))
     if has_aud:
         cmd += ["-hwaccel", "none", "-i", audio_source]
     vf: List[str] = []
+    # FIXED: insert fps filter when source and output frame rates differ
+    if source_fps is not None and abs(source_fps - fps) > 0.01:
+        vf.append(f"fps={fps}")
     if subtitle_path and os.path.exists(subtitle_path):
         s    = subtitle_style or SUBTITLE_STYLES["Bold White (TikTok)"]
         sesc = subtitle_path.replace("\\", "/").replace(":", r"\:")
@@ -1364,20 +1383,39 @@ def extract_thumbnail(path: str, t: float = 1.0) -> Optional[bytes]:
     return buf.tobytes() if ok else None
 
 def resolve_target_size(label: str, orig_w: int, orig_h: int) -> Tuple[int, int]:
+    """
+    Resolve the target output size from a preset label.
+
+    'Match source' mode caps to source dims (no upscale).
+    Explicit presets (e.g. '1080p') honor the requested size even if
+    it exceeds source dims — upscaling is handled by cv2.resize at
+    the render step.
+    """
     tw, th = RESOLUTION_PRESETS.get(label, (0, 0))
     if tw == 0 and th == 0:
+        # "Match source" — derive 9:16 crop from source, never upscale
         cw = int(orig_h * 9 / 16)
         if cw > orig_w: cw = orig_w
         ch = int(cw * 16 / 9)
+        # Clamp to source dims for match-source only
+        if ch > orig_h:
+            scale = orig_h / ch; cw = int(cw * scale); ch = int(orig_h)
+        if cw > orig_w:
+            scale = orig_w / cw; cw = int(orig_w); ch = int(ch * scale)
     else:
+        # Explicit preset — honor the requested output size (upscale OK)
         cw, ch = tw, th
-    if ch > orig_h:
-        scale = orig_h / ch; cw = int(cw * scale); ch = int(orig_h)
-    if cw > orig_w:
-        scale = orig_w / cw; cw = int(orig_w); ch = int(ch * scale)
     return max(cw - (cw % 2), 2), max(ch - (ch % 2), 2)
 
 def calculate_crop_dims(orig_w: int, orig_h: int, tw: int, th: int) -> Tuple[int, int]:
+    """
+    Compute the crop rectangle dimensions from the source frame.
+
+    The min(..., orig_w/orig_h) clamps are intentional safety nets:
+    a crop region cannot exceed the source frame.  Upscaling from the
+    cropped region to the target output size is handled downstream by
+    cv2.resize in the render step.
+    """
     th    = max(th, 2)
     ratio = tw / th
     if (orig_w / orig_h) > ratio:
@@ -3094,7 +3132,8 @@ def _render_video(input_path: str, output_path: str,
     enc = _open_ffmpeg_encoder(
         output_path, out_w, out_h, eff_fps, audio_source=input_path,
         crf=crf, preset=encoder_preset, audio_bitrate=audio_bitrate,
-        subtitle_path=srt_path, subtitle_style=subtitle_style, extra_vf=extra_vf)
+        subtitle_path=srt_path, subtitle_style=subtitle_style, extra_vf=extra_vf,
+        source_fps=fps)  # FIXED: pass actual source frame rate
 
     dissolve       = DissolveBuffer(DISSOLVE_FRAMES)
     slot_smoother  = PanelSlotSmoother() if use_panel_mode else None
@@ -3299,7 +3338,7 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
         while len(centers) < total_frames:
             centers.append(centers[-1] if centers else (orig_w//2, orig_h//2))
             speeds.append(0.0)
-    return centers, speeds, scene_cuts, persons_map
+    return centers, speeds, scene_cuts, persons_map, 0  # FIXED: 5-tuple to match caller
 
 
 # ── Optimized sports tracking pass ───────────────────────────────────────────
