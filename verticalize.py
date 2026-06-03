@@ -2888,6 +2888,54 @@ def translate_srt(srt_path: str, target_language: str, source_language: str = "a
 
 
 # ── Clip detection ────────────────────────────────────────────────────────────
+def _compute_audio_energy(input_path: str, duration: float,
+                          sample_rate: int = 16000) -> Optional[np.ndarray]:
+    """
+    Extract audio → compute per-second RMS energy, normalized to [0, 1].
+    Returns None if audio extraction fails or video has no audio.
+    """
+    if not _has_audio(input_path):
+        return None
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        if not _extract_audio_wav(input_path, wav_path):
+            return None
+        # Read raw PCM via FFmpeg (16-bit mono) — avoids scipy/wave dependency
+        cmd = [
+            "ffmpeg", "-y", "-i", wav_path,
+            "-f", "s16le", "-acodec", "pcm_s16le",
+            "-ar", str(sample_rate), "-ac", "1", "pipe:1",
+        ]
+        r = subprocess.run(cmd, capture_output=True, timeout=120)
+        if r.returncode != 0 or len(r.stdout) < sample_rate * 2:
+            return None
+        pcm = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+        # Compute per-second RMS
+        n_seconds = max(1, int(duration))
+        block = sample_rate  # 1 second per block
+        energy = np.zeros(n_seconds, dtype=np.float32)
+        for i in range(n_seconds):
+            start = i * block
+            end = min(start + block, len(pcm))
+            if start >= len(pcm):
+                break
+            chunk = pcm[start:end]
+            energy[i] = float(np.sqrt(np.mean(chunk ** 2)))
+        # Normalize to [0, 1]
+        mx = energy.max()
+        if mx > 0:
+            energy /= mx
+        return energy
+    except Exception as exc:
+        logger.debug("Audio energy extraction failed: %s", exc)
+        return None
+    finally:
+        if os.path.exists(wav_path):
+            try: os.unlink(wav_path)
+            except OSError: pass
+
+
 def _frame_saliency_score(frame: np.ndarray,
                           prev_frame: Optional[np.ndarray]) -> float:
     gray   = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -2938,6 +2986,12 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
                  max_duration_sec: float = 65.0, target_n_clips: int = 10,
                  model: Optional[Any] = None, confidence: float = 0.45,
                  progress_callback=None) -> List[ClipSegment]:
+    """
+    Detect high-engagement clips using visual saliency + audio energy.
+
+    P0 fixes: arc() guarantees end>start, SOI coord scaling, 5s smooth window.
+    P1 fixes: audio energy blending, adaptive peak threshold, batched SOI pass.
+    """
     def _p(v, msg=""): progress_callback and progress_callback(v, msg)
     info         = get_video_info(input_path)
     fps          = info["fps"]; total_frames = info["total_frames"]
@@ -2948,21 +3002,58 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
     scores, scene_cut_frames = _compute_frame_scores(
         input_path, fps, total_frames, orig_w, orig_h,
         sample_every=sample_every,
-        progress_callback=lambda v, m: _p(v*0.45, m))
+        progress_callback=lambda v, m: _p(v*0.35, m))
     if len(scores) == 0: return []
+
+    # ── P1-1: Audio energy blending ──────────────────────────────────
+    _p(0.35, "Analyzing audio...")
+    audio_energy = _compute_audio_energy(input_path, duration)
+    if audio_energy is not None and len(scores) > 0:
+        # Resample audio energy to match visual score sample count
+        n_visual = len(scores)
+        n_audio  = len(audio_energy)
+        if n_audio > 1 and n_visual > 1:
+            audio_interp = np.interp(
+                np.linspace(0, n_audio - 1, n_visual),
+                np.arange(n_audio),
+                audio_energy,
+            )
+        else:
+            audio_interp = np.zeros(n_visual, dtype=np.float32)
+        # Normalize visual scores to [0, 1]
+        vs = np.array(scores, dtype=np.float32)
+        vs_max = vs.max()
+        if vs_max > 0:
+            vs /= vs_max
+        # Blend: 65% visual + 35% audio
+        blended = 0.65 * vs + 0.35 * audio_interp
+        scores = blended
+    else:
+        scores = np.array(scores, dtype=np.float32)
+        vs_max = scores.max()
+        if vs_max > 0:
+            scores /= vs_max
+
     _p(0.45, "Computing arcs...")
-    window = max(5, int(30 / (sample_every / fps)))
+    # P0-3: Use ~5-second smoothing window instead of ~30-second
+    window = max(5, int(5 / (sample_every / fps)))
     ss     = (np.convolve(scores, np.ones(window)/window, "same")
               if len(scores) >= window else scores.copy())
     if ss.max() > 0: ss /= ss.max()
+
     min_gap = max(1, int(min_duration_sec * fps / sample_every))
+
+    # P1-2: Adaptive peak threshold
+    threshold = max(0.15, float(np.mean(ss) + 0.5 * np.std(ss)))
+
     peaks: List[int] = []
     for i in range(1, len(ss)-1):
         wh = min_gap//2; lo = max(0, i-wh); hi = min(len(ss), i+wh+1)
-        if ss[i] == ss[lo:hi].max() and ss[i] > 0.3:
+        if ss[i] == ss[lo:hi].max() and ss[i] > threshold:
             if not peaks or i - peaks[-1] > min_gap//2:
                 peaks.append(i)
     peaks.sort(key=lambda i: ss[i], reverse=True); peaks = peaks[:target_n_clips*2]
+
     def arc(pi):
         ps = pi * sample_every / fps; rs = max(0.0, ps - max_duration_sec*0.4)
         re = min(duration, rs + max_duration_sec)
@@ -2972,12 +3063,20 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
         for sc in scene_cut_frames:
             sc_s = sc / fps
             if 0 < sc_s - ps < 15.0: re = min(duration, sc_s + 0.5); break
+        # P0-1: guarantee end > start after scene-cut snapping
+        if re <= rs + 1.0:
+            rs = max(0.0, ps - max_duration_sec * 0.4)
+            re = min(duration, rs + min_duration_sec)
         cd = re - rs
         if cd < min_duration_sec: re = min(duration, rs + min_duration_sec)
         elif cd > max_duration_sec:
             c = (rs+re)/2; rs = max(0.0, c-max_duration_sec/2)
             re = min(duration, rs+max_duration_sec)
+        # Final safety: ensure end > start
+        if re <= rs:
+            re = min(duration, rs + min_duration_sec)
         return rs, re
+
     cands: List[Tuple[float, float, float]] = []
     for pi in peaks:
         s, e = arc(pi); sc = float(ss[pi])
@@ -2985,34 +3084,77 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
             cands.append((s, e, sc))
     cands.sort(key=lambda x: x[2], reverse=True)
     cands = cands[:target_n_clips]; cands.sort(key=lambda x: x[0])
+
+    # ── P1-3: Batched SOI pass ───────────────────────────────────────
     _p(0.55, "SOI per clip...")
     segments: List[ClipSegment] = []
     det_w = min(orig_w, 640); det_h = max(1, int(det_w * orig_h / orig_w))
+    sx = orig_w / max(det_w, 1)  # P0-2: scale factor for coordinate mapping
+    sy = orig_h / max(det_h, 1)
+
+    # Build a list of (clip_index, sample_time) tuples for all clips
+    clip_samples: List[Tuple[int, float]] = []
     for ci, (ss2, se, score) in enumerate(cands):
-        _p(0.55 + 0.35*(ci/max(len(cands), 1)), f"Clip {ci+1}/{len(cands)}...")
-        soi_xs: List[int] = []; soi_ys: List[int] = []
         n_s = min(8, max(2, int(se - ss2)))
         for t in np.linspace(ss2+1, se-1, n_s):
-            frame = _read_frame_at(input_path, orig_w, orig_h, t, scale_w=det_w, scale_h=det_h)
-            if frame is None: continue
-            if model is not None:
+            clip_samples.append((ci, float(t)))
+
+    # Collect SOI data per clip
+    soi_data: Dict[int, Tuple[List[int], List[int]]] = {ci: ([], []) for ci in range(len(cands))}
+
+    if clip_samples:
+        # Sort by time for sequential reading
+        clip_samples.sort(key=lambda x: x[1])
+
+        if model is not None:
+            # Batch: single FFmpegVideoReader pass across all sample times
+            # Group samples into time-ordered list; use seek-based reader per sample
+            # (true batch reading is complex with non-uniform times, so we use sorted seeks)
+            for ci, t in clip_samples:
+                frame = _read_frame_at(input_path, orig_w, orig_h, t,
+                                       scale_w=det_w, scale_h=det_h)
+                if frame is None:
+                    continue
                 try:
                     res = model(frame, verbose=False, conf=confidence)[0]
                     if res.boxes is not None:
                         for box in res.boxes:
                             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                            soi_xs.append((x1+x2)//2); soi_ys.append((y1+y2)//2)
-                except Exception: pass
-            else:
-                scx, scy = saliency_center(frame); soi_xs.append(scx); soi_ys.append(scy)
+                            # P0-2: scale from det coords to orig coords
+                            soi_data[ci][0].append(int((x1+x2)/2 * sx))
+                            soi_data[ci][1].append(int((y1+y2)/2 * sy))
+                except Exception:
+                    pass
+        else:
+            # Fallback: saliency-based SOI
+            for ci, t in clip_samples:
+                frame = _read_frame_at(input_path, orig_w, orig_h, t,
+                                       scale_w=det_w, scale_h=det_h)
+                if frame is None:
+                    continue
+                scx, scy = saliency_center(frame)
+                # P0-2: scale from det coords to orig coords
+                soi_data[ci][0].append(int(scx * sx))
+                soi_data[ci][1].append(int(scy * sy))
+
+    # Build ClipSegment objects
+    for ci, (ss2, se, score) in enumerate(cands):
+        _p(0.55 + 0.35*(ci/max(len(cands), 1)), f"Clip {ci+1}/{len(cands)}...")
+        soi_xs, soi_ys = soi_data[ci]
         sr = "center"
-        if soi_xs: sr = _soi_region_label(int(np.median(soi_xs)), int(np.median(soi_ys)), orig_w, orig_h)
+        if soi_xs:
+            sr = _soi_region_label(int(np.median(soi_xs)), int(np.median(soi_ys)),
+                                   orig_w, orig_h)
         ms = int(ss2//60); secs = int(ss2%60); me = int(se//60); sece = int(se%60)
-        # ClipSegment validates end > start, so safe
-        segments.append(ClipSegment(start_sec=ss2, end_sec=se, score=score,
-                                    soi_region=sr,
-                                    peak_frame=int(np.linspace(ss2+1, se-1, n_s)[n_s//2]*fps),
-                                    title=f"Clip {ci+1} ({ms}:{secs:02d} - {me}:{sece:02d})"))
+        # P0-1: wrap in try/except in case of any remaining edge cases
+        try:
+            segments.append(ClipSegment(start_sec=ss2, end_sec=se, score=score,
+                                        soi_region=sr,
+                                        peak_frame=int(np.mean([ss2, se]) * fps),
+                                        title=f"Clip {ci+1} ({ms}:{secs:02d} - {me}:{sece:02d})"))
+        except ValueError as exc:
+            logger.warning("Skipping invalid clip arc [%.1f–%.1f]: %s", ss2, se, exc)
+            continue
     _p(1.0, f"Found {len(segments)} clips")
     return segments
 
