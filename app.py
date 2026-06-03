@@ -575,7 +575,10 @@ if uploaded_file is not None and st.session_state.input_path:
                             except OSError: pass
                         st.session_state.processing_done = True; status.success("✅ Done!"); st.rerun()
                     else: status.error("Output is empty — check FFmpeg.")
-                except Exception as exc: status.error(f"Error: {exc}")
+                except Exception as exc:
+                    import traceback
+                    traceback.print_exc()
+                    status.error(f"Error: {exc}")
         else:
             r1, _, r2 = st.columns([2,5,2])
             with r1:
@@ -636,7 +639,10 @@ if uploaded_file is not None and st.session_state.input_path:
                         prog.progress(1.0); st.session_state.clip_results=results
                         nk = sum(1 for r in results if not r.get("error"))
                         status.success(f"✅ {nk}/{len(results)} clips converted!"); st.rerun()
-                    except Exception as exc: status.error(f"Error: {exc}")
+                    except Exception as exc:
+                        import traceback
+                        traceback.print_exc()
+                        status.error(f"Error: {exc}")
             else:
                 results = st.session_state.clip_results; nk = sum(1 for r in results if not r.get("error"))
                 if clips: st.markdown(f'<div class="rf-ok">✓ {nk} clip{"s" if nk!=1 else ""} ready — download from cards above</div>', unsafe_allow_html=True)
