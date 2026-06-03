@@ -216,16 +216,18 @@ if tracking_mode == "subject":
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     with st.expander("🎛 Panel Mode Settings", expanded=False):
         st.caption("For news panels, podcasts, interviews with 2+ people")
+        _panel_mode_labels = {"auto":"🤖 Auto-detect (recommended)","force_on":"✅ Force ON","force_off":"❌ Force OFF"}
         panel_mode_override = st.radio("Panel mode", ["auto","force_on","force_off"],
-            format_func=lambda x: {"auto":"🤖 Auto-detect (recommended)","force_on":"✅ Force ON","force_off":"❌ Force OFF"}[x],
+            format_func=lambda x: _panel_mode_labels.get(x, x),
             index=["auto","force_on","force_off"].index(st.session_state.get("panel_mode_override","auto")),
             help="Auto = detect panel layout automatically.")
         st.session_state.panel_mode_override = panel_mode_override
         if panel_mode_override != "force_off":
             st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
             st.markdown('<div class="rf-sec">Layout & Features</div>', unsafe_allow_html=True)
+            _layout_labels = {"equal":"➖ Equal Split","speaker_focus":"🔊 Speaker Focus 60-40","solo_spotlight":"💡 Solo Spotlight","auto":"🤖 Auto switches by audio"}
             layout_mode = st.radio("Layout mode", ["equal","speaker_focus","solo_spotlight","auto"],
-                format_func=lambda x: {"equal":"➖ Equal Split","speaker_focus":"🔊 Speaker Focus (60/40)","solo_spotlight":"💡 Solo Spotlight","auto":"🤖 Auto (switches by audio)"}[x],
+                format_func=lambda x: _layout_labels.get(x, x),
                 index=["equal","speaker_focus","solo_spotlight","auto"].index(st.session_state.get("panel_layout_mode","equal")),
                 help="How to distribute screen space among detected persons.")
             st.session_state.panel_layout_mode = layout_mode
