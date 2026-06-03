@@ -187,7 +187,7 @@ tm1, tm2 = st.columns(2, gap="small")
 with tm1:
     if st.button("🎯  Subject Tracking", type="secondary", use_container_width=True):
         st.session_state.tracking_mode = "subject"
-with mc2:
+with tm2:
     if st.button("👤  Talking Head  ✦", type="secondary", use_container_width=True):
         st.session_state.tracking_mode = "talking_head"
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
