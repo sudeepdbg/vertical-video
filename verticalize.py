@@ -525,7 +525,7 @@ class BallKalmanFilter:
         self.x = self.F @ self.x
         self.x[3, 0] += self.gravity * self.dt
         # FIXED: clamp vertical velocity to prevent gravity runaway
-        terminal_vy = 800.0 * (self.frame_h / 1080.0)
+        terminal_vy = 1600.0 * (self.frame_h / 1080.0)
         self.x[3, 0] = float(np.clip(self.x[3, 0], -terminal_vy, terminal_vy))
         self.P = self.F @ self.P @ self.F.T + self.Q
         self._stale_frames += 1
@@ -1810,6 +1810,10 @@ class AdaptiveVelocityAwareSmoother:
         if self.prev_smooth_cx is not None:
             self._raw_diffs.append(math.hypot(cx - self.prev_smooth_cx,
                                               cy - self.prev_smooth_cy))
+        # Temporal confidence smoothing
+        if self._count > 0:
+            prev_conf = float(self._conf[(self._head - 1) % self._cap])
+            confidence = 0.8 * prev_conf + 0.2 * confidence
         self._push(cx, cy, confidence)
         n = self._count
 
@@ -2485,17 +2489,14 @@ def _detect_panel_mode(input_path: str, model: Any, fps: float, total_frames: in
 
     # Collect all probe frames in one reader pass
     probe_frames: Dict[int, np.ndarray] = {}
-    target_secs = set(probe_ts.tolist())
+    target_frame_ids = set(int(t * fps) for t in probe_ts)
     try:
         with FFmpegVideoReader(input_path, orig_w, orig_h, scale_w=det_w, scale_h=det_h) as rdr:
             for fi, frame in enumerate(rdr):
-                t = fi / fps
-                # Accept frames within 0.5s of any probe timestamp
-                for pt in list(target_secs):
-                    if abs(t - pt) < (0.5 / fps + 0.5):
-                        probe_frames[fi] = frame
-                        target_secs.discard(pt)
-                        break
+                nearest = min(target_frame_ids, key=lambda x: abs(x - fi)) if target_frame_ids else None
+                if nearest is not None and abs(nearest - fi) <= max(1, int(fps * 0.25)):
+                    probe_frames[fi] = frame.copy()
+                    target_frame_ids.discard(nearest)
                 if fi >= int(probe_ts[-1] * fps) + int(fps):
                     break
     except Exception:
@@ -2731,7 +2732,7 @@ class LayoutTransitionManager:
 
     def __init__(self, stability_frames: int = 15,
                  transition_frames: int = 6,
-                 holdover_frames: int = 30) -> None:
+                 holdover_frames: int = 8) -> None:
         self.stability_frames = stability_frames
         self.transition_frames = transition_frames
         self.holdover_frames = holdover_frames
@@ -3738,6 +3739,7 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
     det_scale = min(1.0, 960/orig_w)
     det_w = max(1, int(orig_w*det_scale)); det_h = max(1, int(orig_h*det_scale))
     fi = 0
+    yolo_failures = 0
     try:
         with FFmpegVideoReader(input_path, orig_w, orig_h, scale_w=det_w, scale_h=det_h) as reader:
             for det_frame in reader:
