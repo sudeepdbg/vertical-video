@@ -82,7 +82,15 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 from enum import Enum, auto
 
 import cv2
+import json
 import numpy as np
+
+# ── GPU device management ─────────────────────────────────────────────────────
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
 
 try:
     from scipy.signal import savgol_filter
@@ -107,6 +115,33 @@ try:
     _PSUTIL_AVAILABLE = True
 except ImportError:
     _PSUTIL_AVAILABLE = False
+
+# --- PyAV decode backend (optional) ------------------------------------------------
+try:
+    import av
+    PYAV_AVAILABLE = True
+except ImportError:
+    PYAV_AVAILABLE = False
+
+class PyAVVideoReader:
+    '''PyAV-based video reader - faster than FFmpeg pipe for some codecs.'''
+    def __init__(self, path: str):
+        self.container = av.open(path)
+        self.stream = self.container.streams.video[0]
+
+    def __iter__(self):
+        for frame in self.container.decode(self.stream):
+            yield frame.to_ndarray(format="bgr24")
+
+    def close(self):
+        self.container.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 logger = logging.getLogger("verticalize")
@@ -726,7 +761,7 @@ class BallROITracker:
             elif hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create"):
                 return cv2.legacy.TrackerCSRT_create()
             return None
-        except Exception:
+        except (cv2.error, AttributeError, ValueError):
             self._has_cv_tracker = False
             return None
 
@@ -738,7 +773,7 @@ class BallROITracker:
         if self._tracker is not None:
             try:
                 self._tracker.init(det_frame, (x1, y1, bw, bh))
-            except Exception:
+            except (cv2.error, ValueError):
                 self._tracker = None; self._has_cv_tracker = False
         self._bbox_det      = bbox_det
         self._lost          = False
@@ -759,7 +794,7 @@ class BallROITracker:
                 self._last_conf    *= BALL_ROI_CONF_DECAY
                 self._bbox_det      = (int(x), int(y), int(x + bw), int(y + bh))
                 return self._bbox_det
-            except Exception:
+            except (cv2.error, ValueError):
                 self._tracker = None; self._has_cv_tracker = False
 
         # Fallback: shift by last known velocity
@@ -1231,10 +1266,10 @@ class FFmpegVideoReader:
                     self._leftover = test
                     return
                 try: proc.stdout.close()
-                except Exception: pass
+                except (OSError, subprocess.SubprocessError): pass
                 try: proc.wait(timeout=2)
-                except Exception: proc.kill()
-            except Exception as exc:
+                except (OSError, subprocess.SubprocessError): proc.kill()
+            except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
                 last_err = exc  # FIXED: preserve last error instead of silently swallowing
 
         raise ProcessingError(
@@ -1245,9 +1280,9 @@ class FFmpegVideoReader:
     def close(self) -> None:
         if self._proc:
             try: self._proc.stdout.close()
-            except Exception: pass
+            except (OSError, subprocess.SubprocessError): pass
             try: self._proc.wait(timeout=5)
-            except Exception: self._proc.kill()
+            except (OSError, subprocess.SubprocessError): self._proc.kill()
             self._proc = None
 
     def __enter__(self) -> "FFmpegVideoReader":
@@ -1292,15 +1327,18 @@ def _check_ffmpeg() -> None:
         except (subprocess.CalledProcessError, FileNotFoundError):
             raise ProcessingError(f"{tool} not found. Install FFmpeg.")
 
+_AUDIO_CACHE: Dict[str, bool] = {}
+
 def _has_audio(path: str) -> bool:
+    if path in _AUDIO_CACHE:
+        return _AUDIO_CACHE[path]
     try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "a",
-             "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
-            capture_output=True, text=True, timeout=15)
-        return "audio" in r.stdout
+        info = get_video_info(path)
+        result = bool(info.get("has_audio", False))
     except Exception:
-        return False
+        result = False
+    _AUDIO_CACHE[path] = result
+    return result
 
 def _extract_audio_wav(vpath: str, wpath: str) -> bool:
     r = subprocess.run(
@@ -1370,7 +1408,7 @@ def _open_ffmpeg_encoder(output_path: str, width: int, height: int, fps: float,
 
 def _close_ffmpeg_encoder(proc: subprocess.Popen, output_path: str) -> None:
     try: proc.stdin.close()
-    except Exception: pass
+    except (OSError, subprocess.SubprocessError): pass
     stderr_buf: List[bytes] = []
     def _drain():
         try:
@@ -1378,11 +1416,11 @@ def _close_ffmpeg_encoder(proc: subprocess.Popen, output_path: str) -> None:
                 chunk = proc.stderr.read(4096)
                 if not chunk: break
                 stderr_buf.append(chunk)
-        except Exception: pass
+        except (OSError, ValueError): pass
     t = threading.Thread(target=_drain, daemon=True)
     t.start()
     try: proc.wait(timeout=180)
-    except Exception: proc.kill(); proc.wait()
+    except (OSError, subprocess.SubprocessError): proc.kill(); proc.wait()
     t.join(timeout=5)
     if proc.returncode != 0:
         err = b"".join(stderr_buf).decode(errors="replace")
@@ -1391,38 +1429,51 @@ def _close_ffmpeg_encoder(proc: subprocess.Popen, output_path: str) -> None:
         raise ProcessingError("FFmpeg encoder produced empty output.")
 
 def get_video_info(path: str) -> Dict[str, Any]:
+    """JSON-based ffprobe parsing — robust against locale/format changes."""
     cmd = [
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1", path,
+        "ffprobe",
+        "-v", "error",
+        "-show_streams",
+        "-show_format",
+        "-of", "json",
+        path,
     ]
-    r  = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    kv: Dict[str, str] = {}
-    for line in r.stdout.splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            kv[k.strip()] = v.strip()
-    w = int(kv.get("width",   "0") or 0)
-    h = int(kv.get("height",  "0") or 0)
-    try:
-        num, den = kv.get("r_frame_rate", "30/1").split("/")
-        fps = float(num) / float(den)
-    except Exception:
-        fps = 30.0
-    dur = float(kv.get("duration", "0.0") or 0.0)
-    if dur <= 0:
-        nb  = int(kv.get("nb_frames", "0") or 0)
-        dur = nb / fps if fps > 0 and nb > 0 else 0.0
+    r = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=30
+    )
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip())
+    data = json.loads(r.stdout)
+    video_stream = next(
+        s for s in data["streams"]
+        if s.get("codec_type") == "video"
+    )
+    w = int(video_stream["width"])
+    h = int(video_stream["height"])
+    fps_raw = video_stream.get("r_frame_rate", "30/1")
+    num, den = fps_raw.split("/")
+    fps = float(num) / max(float(den), 1.0)
+    duration = float(
+        video_stream.get("duration", 0)
+        or data["format"].get("duration", 0)
+    )
+    has_audio = any(
+        s.get("codec_type") == "audio"
+        for s in data["streams"]
+    )
     if w == 0 or h == 0:
         raise ProcessingError(f"Cannot read dimensions: {path}")
     return {
         "fps":              fps,
-        "total_frames":     min(int(dur * fps), MAX_FRAMES_GUARD),
+        "total_frames":     min(int(duration * fps), MAX_FRAMES_GUARD),
         "width":            w,
         "height":           h,
-        "duration_seconds": dur,
-        "is_landscape":     w > h,
+        "duration_seconds": duration,
+        "is_landscape":     w >= h,
+        "has_audio":        has_audio,
     }
 
 def extract_thumbnail(path: str, t: float = 1.0) -> Optional[bytes]:
@@ -1490,7 +1541,7 @@ def _get_model(weights: str = "yolov8n.pt") -> Optional[Any]:
                 _model_cache[weights] = m
                 logger.info("Loaded model %s", w)
                 return m
-            except Exception:
+            except (OSError, ValueError, RuntimeError):
                 continue
         logger.warning("YOLO unavailable")
         return None
@@ -1506,7 +1557,7 @@ def _get_yunet() -> Optional[Any]:
                 net = cv2.dnn.readNet(p)
                 _yunet_detector = net
                 return net
-            except Exception:
+            except (cv2.error, OSError, ValueError):
                 pass
     return None
 
@@ -1531,7 +1582,7 @@ def detect_faces(frame: np.ndarray,
             if faces:
                 faces.sort(key=lambda f: (f[2]-f[0])*(f[3]-f[1]), reverse=True)
                 return faces
-        except Exception:
+        except (cv2.error, ValueError):
             pass
     haar_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     if os.path.exists(haar_path):
@@ -1846,7 +1897,7 @@ class AdaptiveVelocityAwareSmoother:
                 wts      /= wts.sum()
                 smooth_cx = float(np.sum(wx * wts))
                 smooth_cy = float(np.sum(wy * wts))
-        except Exception:
+        except (ValueError, ZeroDivisionError, RuntimeError):
             alpha     = 0.15
             smooth_cx = alpha*cx + (1-alpha)*(self.prev_smooth_cx or cx)
             smooth_cy = alpha*cy + (1-alpha)*(self.prev_smooth_cy or cy)
@@ -2181,7 +2232,7 @@ def sports_optical_flow_center(prev: np.ndarray, curr: np.ndarray, w: int, h: in
         if t == 0: return None
         ys, xs = np.mgrid[0:h, 0:w]
         return int((xs * mag).sum() / t), int((ys * mag).sum() / t)
-    except Exception:
+    except (cv2.error, ValueError, ZeroDivisionError):
         return None
 
 def temporal_saliency_center(frame: np.ndarray,
@@ -2398,7 +2449,7 @@ def detect_persons_all(frame: np.ndarray, model: Any,
     if model is None: return []
     try:
         results = model(frame, verbose=False, conf=confidence)[0]
-    except Exception:
+    except (RuntimeError, ValueError, OSError):
         return []
     if results.boxes is None or len(results.boxes) == 0: return []
     return sorted(
@@ -3140,7 +3191,7 @@ def _apply_sports_post_smooth(dense_cx: np.ndarray, dense_cy: np.ndarray,
                 k  = np.exp(-0.5*(np.arange(-h2, h2+1)/sigma)**2); k /= k.sum()
                 seg_cx = np.convolve(np.pad(damp_cx[s:e], h2, "edge"), k, "valid")[:sl]
                 seg_cy = np.convolve(np.pad(damp_cy[s:e], h2, "edge"), k, "valid")[:sl]
-        except Exception:
+        except (ValueError, ImportError, RuntimeError):
             seg_cx = damp_cx[s:e]; seg_cy = damp_cy[s:e]
         local_vel      = (np.mean(np.sqrt(np.diff(seg_cx)**2 + np.diff(seg_cy)**2))
                          if len(seg_cx) > 1 else 0)
@@ -3453,7 +3504,7 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
                         for box in res.boxes:
                             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                             soi_xs.append((x1+x2)//2); soi_ys.append((y1+y2)//2)
-                except Exception: pass
+                except (RuntimeError, ValueError, OSError): pass
             else:
                 scx, scy = saliency_center(frame); soi_xs.append(scx); soi_ys.append(scy)
         sr = "center"
@@ -3481,7 +3532,7 @@ def _build_analytics(input_path: str, output_path: str, orig_w: int, orig_h: int
                                 "default=noprint_wrappers=1:nokey=1", p],
                                capture_output=True, text=True, timeout=10)
             return int(r.stdout.strip()) // 1000
-        except Exception: return 0
+        except (OSError, subprocess.SubprocessError, ValueError): return 0
     in_sz  = _sz(input_path); out_sz = _sz(output_path)
     jitter_raw = jitter_smooth = smoothness_pct = 0.0
     if smooth_metrics:
@@ -3511,6 +3562,20 @@ def _build_analytics(input_path: str, output_path: str, orig_w: int, orig_h: int
 
 
 # ── Shared pipeline setup helper (DRY) ───────────────────────────────────────
+def _get_device(device="auto"):
+    '''Return compute device string for torch operations.'''
+    if device == "auto":
+        if _TORCH_AVAILABLE and torch.cuda.is_available():
+            return "cuda"
+        return "cpu"
+    return device
+
+
+def seconds_to_frame(ts: float, fps: float) -> int:
+    '''Convert timestamp (seconds) to frame index with rounding.'''
+    return int(round(ts * fps))
+
+
 def _common_pipeline_setup(input_path: str, target_preset_label: str,
                             yolo_weights: str,
                             load_model: bool = True,
@@ -3700,8 +3765,37 @@ def _render_video(input_path: str, output_path: str,
                 # Save output-res frame for next scene-cut dissolve
                 _prev_out_frame = out_frame
 
+                # Frame validation before encoder writes
+                if (
+                    out_frame is None
+                    or out_frame.size == 0
+                    or len(out_frame.shape) != 3
+                ):
+                    raise RuntimeError(
+                        f"Invalid frame at {fi}"
+                    )
+                h, w = out_frame.shape[:2]
+                if h != out_h or w != out_w:
+                    raise RuntimeError(
+                        f"Frame mismatch at {fi}: {w}x{h}"
+                    )
+
                 try: enc.stdin.write(out_frame.tobytes())
-                except BrokenPipeError: break
+                except BrokenPipeError as e:
+                    stderr_output = ""
+                    try:
+                        if enc.stderr:
+                            stderr_output = enc.stderr.read().decode(errors="ignore")[-4000:]
+                    except Exception:
+                        pass
+                    logger.error(
+                        "FFmpeg encoder failed at frame %d\n%s",
+                        fi,
+                        stderr_output
+                    )
+                    raise RuntimeError(
+                        f"FFmpeg pipe broke at frame {fi}"
+                    )
                 fi += 1
                 if fi % max(1, total_frames//50) == 0:
                     _p(0.15 + (fi/total_frames)*0.80, f"Rendering {fi}/{total_frames}...")
@@ -4420,3 +4514,16 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
                 except OSError: pass
     _p(1.0, f"Batch done: {sum(1 for r in results if not r.get('error'))}/{n} clips")
     return results
+
+# --- Processor architecture ---------------------------------------------------------
+class VerticalProcessor:
+    '''High-level API wrapper for batch/queued processing.'''
+    def __init__(self):
+        self.audio_cache = {}
+        self.model_cache = {}
+
+    def process_video(self, *args, **kwargs):
+        return process_video(*args, **kwargs)
+
+    def process_sports_video(self, *args, **kwargs):
+        return process_sports_video(*args, **kwargs)
