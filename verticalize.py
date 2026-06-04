@@ -1,6 +1,26 @@
 """
-verticalize.py — AI Vertical Video Converter v7.4
+verticalize.py — AI Vertical Video Converter v7.5
 ═══════════════════════════════════════════════════════════════════
+v7.5 CHANGES vs v7.4
+• FIXED: process_sports_video NameError — captured _render_video return value.
+• FIXED: Ball Kalman predict() now unconditional per frame after new_frame(),
+  removed redundant manual predict() calls in color/Kalman fallback branches.
+• FIXED: smooth_centers Kalman first-frame double-predict — skip _predict_step()
+  on j==s (first frame of each segment).
+• FIXED: BallKalmanFilter.predict() gravity runaway — clamped vertical velocity
+  to heuristic terminal velocity.
+• FIXED: Ball trail drift with moving crop window — trail points now stored in
+  output-relative coordinates at detection time.
+• FIXED: DynamicPanelSlotSmoother.update() 2-slot return inconsistency — now
+  always returns List[List]; caller in _render_panel_frame simplified.
+• FIXED: LayoutTransitionManager unbounded slot IDs — reuse smallest free
+  non-negative integer instead of monotonic increment.
+• FIXED: Stale MOT person detections in non-YOLO frames — pass empty lists to
+  mot_tracker.update() during skipped frames so tracks predict forward.
+• FIXED: Removed unused person_boxes_map parameter from _render_video signature
+  and process_sports_video call site.
+• FIXED: Removed unused det_scale parameter from _validate_ball_detection.
+
 v7.4 CHANGES vs v7.3
 • FIXED: resolve_target_size no longer clamps explicit presets to source dims,
   allowing intentional upscaling (e.g. 480p source → 1080p output).
@@ -504,6 +524,9 @@ class BallKalmanFilter:
             return float(self.x[0, 0]), float(self.x[1, 0])
         self.x = self.F @ self.x
         self.x[3, 0] += self.gravity * self.dt
+        # FIXED: clamp vertical velocity to prevent gravity runaway
+        terminal_vy = 800.0 * (self.frame_h / 1080.0)
+        self.x[3, 0] = float(np.clip(self.x[3, 0], -terminal_vy, terminal_vy))
         self.P = self.F @ self.P @ self.F.T + self.Q
         self._stale_frames += 1
         self._predicted_this_frame = True
@@ -2386,7 +2409,6 @@ def _validate_ball_detection(
     det_frame: np.ndarray,
     ball_kalman: BallKalmanFilter,
     color_model: BallColorModel,
-    det_scale: float = 1.0,
 ) -> bool:
     """All coordinates in DetCoord space."""
     x1, y1, x2, y2 = bbox
@@ -2624,8 +2646,7 @@ class DynamicPanelSlotSmoother:
                 result[i] = [tuple(int(v) for v in smooth)]
             elif self._slots[i] is not None:
                 result[i] = [tuple(int(v) for v in self._slots[i])]
-        if len(group_list) == 2:
-            return result[0], result[1]
+        # FIXED: Always return List[List] regardless of input count
         return result
 
     @property
@@ -2799,7 +2820,11 @@ class LayoutTransitionManager:
                 self._frames_since_last_seen[best_id] = 0
                 matched.add(best_id)
             else:
-                new_id = max(self._person_slots.keys(), default=-1) + 1
+                # FIXED: Reuse smallest free non-negative integer instead of monotonic increment
+                existing_ids = set(self._person_slots.keys())
+                new_id = 0
+                while new_id in existing_ids:
+                    new_id += 1
                 self._person_slots[new_id] = p
                 self._frames_since_last_seen[new_id] = 0
 
@@ -2925,13 +2950,9 @@ def _render_panel_frame(frame: np.ndarray, persons: List[Tuple], out_w: int, out
 
     # Smooth slot positions
     if slot_smoother is not None and len(groups) >= 2:
-        if len(groups) == 2:
-            groups[0], groups[1] = slot_smoother.update(
-                groups[0], groups[1], strip_w=float(out_w))
-        else:
-            sm = slot_smoother.update(*groups, strip_w=float(out_w))
-            if isinstance(sm, (list, tuple)):
-                groups = list(sm)
+        # FIXED: update() now always returns List[List]
+        sm = slot_smoother.update(*groups, strip_w=float(out_w))
+        groups = [sm[i] for i in range(min(len(sm), len(groups)))]
 
     n_active = len([g for g in groups if g])
     canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
@@ -3156,8 +3177,9 @@ def smooth_centers(centers: List[Tuple[int, int]], speeds: List[float],
             if e - s < 2: continue
             kalman.init(xs[s], ys[s])
             for j in range(s, e):
-                # FIXED: advance the prior before updating
-                kalman._predict_step()
+                # FIXED: skip predict on first frame to avoid double-predict
+                if j > s:
+                    kalman._predict_step()
                 kx, ky = kalman.update(xs[j], ys[j])
                 speed  = spd[j] if j < len(spd) else 0.0
                 if speed > 60.0 and not kalman.is_stale:
@@ -3530,7 +3552,6 @@ def _render_video(input_path: str, output_path: str,
                   panel_config: Optional[PanelModeConfig] = None,
                   panel_persons_map: Optional[Dict[int, List]] = None,
                   ball_records: Optional[Dict[int, BallFrameRecord]] = None,
-                  person_boxes_map: Optional[Dict[int, List[Tuple[int,int,int,int]]]] = None,
                   draw_tracking_boxes: bool = False,
                   overlay_config: Optional[OverlayConfig] = None,
                   ) -> Dict[str, Any]:
@@ -3648,14 +3669,18 @@ def _render_video(input_path: str, output_path: str,
                                         confidence=br.confidence,
                                         source=br.source,
                                     )
-                                    # Store trail in original coordinates
-                                    ball_trail_buf.append(((bx1+bx2)//2, (by1+by2)//2))
+                                    # FIXED: Store trail in output-relative coordinates at detection time
+                        # to avoid drift when the crop window moves
+                        obx = (bx1 + bx2) // 2
+                        oby = (by1 + by2) // 2
+                        out_tx = int((obx - x1) * sx)
+                        out_ty = int((oby - y1) * sy)
+                        ball_trail_buf.append((out_tx, out_ty))
 
-                        # Transform trail from orig coords to current output coords
+                        # Trail already in output coordinates, just clip to bounds
                         output_trail: List[Tuple[int, int]] = [
-                            (int((tx-x1)*sx), int((ty-y1)*sy))
-                            for tx, ty in ball_trail_buf
-                            if 0 <= tx-x1 < crop_w and 0 <= ty-y1 < crop_h
+                            (tx, ty) for tx, ty in ball_trail_buf
+                            if 0 <= tx < out_w and 0 <= ty < out_h
                         ]
 
                         if ball_rec_out is not None:
@@ -3905,7 +3930,7 @@ def _sports_tracking_pass_optimized(
                                 cand_bbox_det = (bb[0], bb[1], bb[2], bb[3])
                                 if not _validate_ball_detection(
                                     cand_bbox_det, det_frame, ball_kalman,
-                                    ball_color_model, det_scale=det_scale):
+                                    ball_color_model):
                                     continue
                                 ball_conf_yolo = bb[6]
                                 ball_box_orig  = (int(bb[0]/det_scale), int(bb[1]/det_scale),
@@ -3950,6 +3975,9 @@ def _sports_tracking_pass_optimized(
                         logger.warning("[yolo] frame %d: %s", fi, e)
 
                 else:
+                    # FIXED: Unconditional predict once per frame (after new_frame)
+                    ball_kalman.predict()
+
                     resolved = False
                     if use_ball_tracking and ball_tracker.is_active:
                         tracked_bb_det = ball_tracker.update(det_frame)
@@ -3982,7 +4010,6 @@ def _sports_tracking_pass_optimized(
                             tracker_lost_ball = True; det_cache.ball_box = None
 
                     if not resolved and use_ball_tracking and ball_found_ever:
-                        ball_kalman.predict()  # Advance Kalman state before reading position
                         pred_center = ball_kalman.position if ball_kalman.initialized else None
                         color_bbox  = ball_color_det.detect(
                             det_frame, pred_center,
@@ -4001,7 +4028,7 @@ def _sports_tracking_pass_optimized(
 
                     if not resolved:
                         if ball_kalman.initialized and ball_found_ever:
-                            kpx, kpy = ball_kalman.predict()  # Advance state + get predicted position
+                            kpx, kpy = ball_kalman.position
                             avg_w = avg_h = 40
                             if ball_size_history:
                                 avg_w = int(np.mean([s[0] for s in ball_size_history]))
@@ -4017,8 +4044,14 @@ def _sports_tracking_pass_optimized(
                                 bbox=None, confidence=0.0, source="none")
                             det_cache.ball_box = None
 
-                    mot_tracker.update(det_cache.persons, det_cache.ball_box,
-                                       det_frame, det_cache.confidences)
+                    # FIXED: Pass empty lists on non-YOLO frames so tracker predicts
+                    # tracks forward via internal velocity instead of snapping to stale positions
+                    if run_yolo:
+                        mot_tracker.update(det_cache.persons, det_cache.ball_box,
+                                           det_frame, det_cache.confidences)
+                    else:
+                        mot_tracker.update([], det_cache.ball_box,
+                                           det_frame, [])
 
                 ball_records[fi]     = this_ball_rec
                 person_boxes_map[fi] = list(det_cache.persons)
@@ -4281,7 +4314,7 @@ def process_sports_video(input_path: str, output_path: str,
                                             else OverlayConfig() if draw_tracking_boxes
                                             else None)
     _p(0.55, "Rendering sports video...")
-    _render_video(
+    render_meta = _render_video(
         input_path=input_path, output_path=output_path,
         out_w=out_w, out_h=out_h, crop_w=crop_w, crop_h=crop_h,
         orig_w=orig_w, orig_h=orig_h, fps=fps, total_frames=total_frames,
@@ -4294,7 +4327,6 @@ def process_sports_video(input_path: str, output_path: str,
         vignette_strength=vignette_strength, sharpen_strength=sharpen_strength,
         ffmpeg_sharpen=ffmpeg_sharpen, scene_cuts=scene_cuts,
         use_panel_mode=False, ball_records=ball_records,
-        person_boxes_map=person_boxes_map,
         overlay_config=eff_overlay,
         progress_callback=lambda v, m: _p(0.55+v*0.43, m),
     )
