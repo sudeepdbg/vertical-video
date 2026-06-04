@@ -3735,13 +3735,13 @@ def _render_video(input_path: str, output_path: str,
                                         confidence=br.confidence,
                                         source=br.source,
                                     )
-                                    # FIXED: Store trail in output-relative coordinates at detection time
-                        # to avoid drift when the crop window moves
-                        obx = (bx1 + bx2) // 2
-                        oby = (by1 + by2) // 2
-                        out_tx = int((obx - x1) * sx)
-                        out_ty = int((oby - y1) * sy)
-                        ball_trail_buf.append((out_tx, out_ty))
+                                    # Store trail in output-relative coordinates at detection time
+                                    # to avoid drift when the crop window moves
+                                    obx = (bx1 + bx2) // 2
+                                    oby = (by1 + by2) // 2
+                                    out_tx = int((obx - x1) * sx)
+                                    out_ty = int((oby - y1) * sy)
+                                    ball_trail_buf.append((out_tx, out_ty))
 
                         # Trail already in output coordinates, just clip to bounds
                         output_trail: List[Tuple[int, int]] = [
@@ -3766,19 +3766,24 @@ def _render_video(input_path: str, output_path: str,
                 _prev_out_frame = out_frame
 
                 # Frame validation before encoder writes
-                if (
-                    out_frame is None
-                    or out_frame.size == 0
-                    or len(out_frame.shape) != 3
-                ):
-                    raise RuntimeError(
-                        f"Invalid frame at {fi}"
-                    )
+                if out_frame is None or out_frame.size == 0:
+                    logger.warning("Skipping invalid frame at %d (None or empty)", fi)
+                    fi += 1
+                    continue
+                if len(out_frame.shape) != 3:
+                    logger.warning("Bad frame shape at %d: %s (expected 3D)", fi, out_frame.shape)
+                    fi += 1
+                    continue
                 h, w = out_frame.shape[:2]
                 if h != out_h or w != out_w:
-                    raise RuntimeError(
-                        f"Frame mismatch at {fi}: {w}x{h}"
-                    )
+                    logger.warning("Resizing frame at %d from %dx%d to %dx%d", fi, w, h, out_w, out_h)
+                    out_frame = cv2.resize(out_frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
+                # Debug: log first few frames to verify pipeline is working
+                if fi < 3:
+                    logger.debug("Frame %d: shape=%s, dtype=%s, range=[%d,%d]",
+                                 fi, out_frame.shape, out_frame.dtype,
+                                 out_frame.min(), out_frame.max())
 
                 try: enc.stdin.write(out_frame.tobytes())
                 except BrokenPipeError as e:
@@ -3801,11 +3806,21 @@ def _render_video(input_path: str, output_path: str,
                     _p(0.15 + (fi/total_frames)*0.80, f"Rendering {fi}/{total_frames}...")
     finally:
         # FIXED: subtitle tempfile cleaned up even if encoder raises
+        # Also: don't mask the original exception with a generic "empty output" error
         _enc_error: Optional[Exception] = None
         try:
             _close_ffmpeg_encoder(enc, output_path)
         except ProcessingError as _e:
-            _enc_error = _e
+            # Only raise "empty output" if we actually wrote zero frames AND
+            # no other exception is active. Otherwise preserve the original error.
+            import sys
+            _active_exc = sys.exc_info()[1]
+            if _active_exc is not None:
+                # An exception is already active (e.g., RuntimeError from BrokenPipeError)
+                # Log the encoder error but don't mask the original
+                logger.error("Encoder also failed: %s", _e)
+            else:
+                _enc_error = _e
         if srt_path and os.path.exists(srt_path):
             try: os.unlink(srt_path)
             except OSError: pass
