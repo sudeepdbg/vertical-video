@@ -1,14 +1,13 @@
 FROM python:3.11-slim
 
-# Install system dependencies
-# FIX: Changed libgl1-mesa-glx to libgl1 (required for Debian Bookworm/Python 3.11)
-# Added libsm6 and libxext6 which are often required by OpenCV
+# Install FFmpeg and OpenCV system dependencies
+# FIX: libgl1-mesa-glx replaced with libgl1 for Debian Bookworm+
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     libgl1 \
+    libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
