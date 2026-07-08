@@ -343,6 +343,16 @@ PANEL_SLOT_MAX_JUMP  = 0.08
 KEN_BURNS_MAX_ZOOM   = 1.04
 KEN_BURNS_PERIOD     = 8.0
 DISSOLVE_FRAMES      = 3
+# ── Two-pass encoding (NEW) ───────────────────────────────────────────────────
+# When enabled, encoder pipes frames to a lossless MKV intermediate first,
+# then runs a proper 2-pass libx264 encode (analysis + rate-controlled emit)
+# for optimal bitrate distribution. Trade-off: uses more disk during
+# processing, ~30–60% higher total encode time, but produces measurably
+# smaller / higher-quality files at the same target bitrate vs. CRF-only.
+TWO_PASS_ENCODING_ENABLED: bool = False
+TWO_PASS_TARGET_BITRATE:   Optional[str] = None    # e.g. "6M"; None → auto
+TWO_PASS_QUALITY_LEVEL:    str  = "high"           # low|medium|high|ultra
+TWO_PASS_INTERMEDIATE_CRF: int  = 12               # near-lossless intermediate
 PANEL_DIVIDER_PX     = 3
 PANEL_DIVIDER_COLOR  = (15, 15, 15)
 PANEL_CROP_EXPAND    = 1.15
@@ -529,6 +539,18 @@ class BallKalmanFilter:
         self.initialized             = False
         self._stale_frames           = 0
         self._predicted_this_frame   = False
+        # FIXED (bug 5): ground-contact / possession flags so gravity
+        # is only integrated during true free-flight. Without these,
+        # the filter kept adding +g every predict step during dribble,
+        # rest, or possession — drifting the estimate through the floor.
+        self._possession   = False
+        self._on_ground    = False
+        self._ground_frames = 0
+        # FIXED (H1): separate 'advanced this frame' flag — set true whenever
+        # predict/update/init actually advances state, so callers can safely
+        # ask "did this filter step at all this frame?" without racing the
+        # existing _predicted_this_frame cache flag (which update() resets).
+        self._advanced_this_frame = False
 
     def _reset_state(self) -> None:
         """Internal: reset matrices without touching fps/frame_h."""
@@ -537,6 +559,12 @@ class BallKalmanFilter:
         self.initialized           = False
         self._stale_frames         = 0
         self._predicted_this_frame = False
+        # FIXED (bug 5): reset ground/possession state too.
+        self._possession    = False
+        self._on_ground     = False
+        self._ground_frames = 0
+        # FIXED (H1): reset advance flag on state reset.
+        self._advanced_this_frame = False
 
     def init(self, cx: float, cy: float, vx: float = 0.0, vy: float = 0.0) -> None:
         self.x = np.array([[cx], [cy], [vx], [vy]], dtype=np.float64)
@@ -544,6 +572,8 @@ class BallKalmanFilter:
         self.initialized           = True
         self._stale_frames         = 0
         self._predicted_this_frame = False
+        # FIXED (H1): initialising counts as an advance this frame.
+        self._advanced_this_frame = True
 
     def reset(self) -> None:
         """Reset to uninitialised state, preserving fps and frame_h."""
@@ -551,6 +581,8 @@ class BallKalmanFilter:
 
     def new_frame(self) -> None:
         self._predicted_this_frame = False
+        # FIXED (H1): reset per-frame advance flag.
+        self._advanced_this_frame = False
 
     def predict(self) -> Tuple[float, float]:
         if not self.initialized:
@@ -558,13 +590,18 @@ class BallKalmanFilter:
         if self._predicted_this_frame:
             return float(self.x[0, 0]), float(self.x[1, 0])
         self.x = self.F @ self.x
-        self.x[3, 0] += self.gravity * self.dt
+        # FIXED (bug 5): only integrate gravity in true free-flight.
+        # Skip during possession or when the ball is at rest on the ground.
+        if not (self._possession or self._on_ground):
+            self.x[3, 0] += self.gravity * self.dt
         # FIXED: clamp vertical velocity to prevent gravity runaway
         terminal_vy = 1600.0 * (self.frame_h / 1080.0)
         self.x[3, 0] = float(np.clip(self.x[3, 0], -terminal_vy, terminal_vy))
         self.P = self.F @ self.P @ self.F.T + self.Q
         self._stale_frames += 1
         self._predicted_this_frame = True
+        # FIXED (H1): mark that filter advanced this frame.
+        self._advanced_this_frame = True
         return float(self.x[0, 0]), float(self.x[1, 0])
 
     def update(self, cx: float, cy: float) -> Tuple[float, float]:
@@ -582,7 +619,62 @@ class BallKalmanFilter:
         self.P = (np.eye(4, dtype=np.float64) - K @ self.H) @ self.P
         self._stale_frames         = 0
         self._predicted_this_frame = False
+        # FIXED (bug 5): heuristically detect ground contact after each
+        # measurement so future predict() steps stop integrating gravity.
+        self._auto_ground_check(float(self.x[1, 0]))
+        # FIXED (H1): mark filter as advanced this frame.
+        self._advanced_this_frame = True
         return float(self.x[0, 0]), float(self.x[1, 0])
+
+    def set_possession(self, in_possession: bool) -> None:
+        """
+        FIXED (bug 5): external hook — call with True when a player has
+        clear ball possession (dribble / hold). Zeroes vy to prevent
+        drift and disables gravity integration until cleared.
+        """
+        self._possession = bool(in_possession)
+        if in_possession:
+            self.x[3, 0] = 0.0
+            self._ground_frames = 0
+            self._on_ground = False
+
+    def set_on_ground(self, on_ground: bool) -> None:
+        """External hook — force ground-contact state (e.g., from court calibration)."""
+        self._on_ground = bool(on_ground)
+        if on_ground:
+            self.x[3, 0] = 0.0
+
+    def _auto_ground_check(self, cy: float) -> None:
+        """
+        FIXED (bug 5): heuristic ground detection.
+        Ball is considered on the ground when it sits in the bottom
+        ~8% of the frame with a small |vy| for N consecutive frames.
+        """
+        ground_y      = self.frame_h * 0.92
+        low_vy_thresh = 30.0 * (self.frame_h / 1080.0)  # px / sec
+        vy            = float(self.x[3, 0])
+        if cy >= ground_y and abs(vy) < low_vy_thresh:
+            self._ground_frames = min(self._ground_frames + 1, 60)
+        else:
+            self._ground_frames = max(0, self._ground_frames - 2)
+        self._on_ground = (self._ground_frames >= 3)
+
+    def advance_if_needed(self) -> None:
+        """
+        FIXED (H1): guarantee at most one prediction step per frame,
+        and at least one on frames where neither predict() nor update()
+        was called (e.g., YOLO ran but no ball was found). Callers should
+        invoke this once toward the end of each frame's ball-tracking
+        block after new_frame() has been called at the top.
+        """
+        if not self.initialized:
+            return
+        if self._advanced_this_frame:
+            return
+        # Reset cache flag and run the standard predict step so state
+        # advances by exactly one dt with proper gravity / ground gating.
+        self._predicted_this_frame = False
+        self.predict()
 
     def gate_distance(self, cx: float, cy: float) -> float:
         if not self.initialized:
@@ -607,7 +699,10 @@ class BallColorModel:
     """HSV histogram appearance model for the ball."""
 
     def __init__(self, n_build: int = BALL_COLOR_MODEL_BUILD_FRAMES) -> None:
-        self._n_build  = max(1, min(n_build, 3))
+        # FIXED (bug 1): '3' was mistakenly used as an UPPER cap, silently clamping
+        # the default 8 → 3 and starving the histogram model of samples.
+        # It should be a LOWER floor. Ceiling raised to a safe upper bound.
+        self._n_build  = max(3, min(int(n_build), 32))
         self._samples: List[np.ndarray] = []
         self._model:   Optional[np.ndarray] = None
         self._bins     = [8, 8, 4]
@@ -619,6 +714,17 @@ class BallColorModel:
         hist = cv2.calcHist([hsv], [0, 1, 2], None, self._bins,
                             [0, 180, 0, 256, 0, 256])
         return cv2.normalize(hist, hist).flatten().astype(np.float32)
+
+    def reset(self) -> None:
+        """
+        FIXED (H4): clear samples + model so a scene-cut re-init works.
+        Previously `_sports_tracking_pass_optimized` called
+        `ball_color_model.reset()` on scene cuts, but no such method existed
+        → AttributeError was swallowed by the outer try/except, leaving
+        stale scene-1 color state to gate scene-2 detections.
+        """
+        self._samples = []
+        self._model = None
 
     def add_sample(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> None:
         if self._model is not None:
@@ -1358,13 +1464,92 @@ def _trim_video(inp: str, out: str, start: float, end: float,
         capture_output=True)
     return r.returncode == 0 and os.path.exists(out)
 
+def _compute_target_bitrate(width: int, height: int, fps: float,
+                            quality: str = "high") -> str:
+    """
+    Two-pass helper: derive a reasonable H.264 target bitrate from
+    resolution × frame rate × bits-per-pixel heuristic.
+    """
+    bpp = {"low": 0.06, "medium": 0.09, "high": 0.13, "ultra": 0.19}.get(
+        quality.lower(), 0.13)
+    kbps = int(width * height * max(1.0, fps) * bpp / 1000.0)
+    kbps = max(500, min(kbps, 60000))  # sane floor/ceiling
+    return f"{kbps}k"
+
+
+def _run_two_pass_finalize(ctx: Dict[str, Any]) -> None:
+    """
+    Two-pass finalize. Called from `_close_ffmpeg_encoder` when the encoder
+    was opened with `two_pass=True`. Reads the lossless intermediate that
+    the caller has just finished writing, runs pass-1 + pass-2 libx264,
+    then emits the final MP4 to `ctx['final_output']`. Best-effort cleanup
+    of intermediate + pass logs regardless of outcome.
+    """
+    stats_dir     = ctx["stats_dir"]
+    log_prefix    = ctx["log_prefix"]
+    intermediate  = ctx["intermediate"]
+    output        = ctx["final_output"]
+    bv            = ctx["target_bitrate"]
+    preset        = ctx["preset"]
+    audio_bitrate = ctx.get("audio_bitrate", "128k")
+    null_out      = "NUL" if os.name == "nt" else "/dev/null"
+
+    def _run(cmd: List[str], label: str) -> None:
+        r = subprocess.run(cmd, capture_output=True)
+        if r.returncode != 0:
+            err = (r.stderr or b"").decode(errors="replace")[-1500:]
+            raise ProcessingError(f"Two-pass {label} failed (rc={r.returncode}):\n{err}")
+
+    try:
+        # Pass 1 — analysis only, discard video output, no audio.
+        pass1 = [
+            "ffmpeg", "-y", "-hwaccel", "none", "-i", intermediate,
+            "-c:v", "libx264", "-preset", preset, "-b:v", bv,
+            "-pass", "1", "-passlogfile", log_prefix,
+            "-an", "-f", "null", null_out,
+        ]
+        _run(pass1, "pass 1")
+
+        # Pass 2 — rate-controlled emit + audio + faststart.
+        pass2 = [
+            "ffmpeg", "-y", "-hwaccel", "none", "-i", intermediate,
+            "-c:v", "libx264", "-preset", preset, "-b:v", bv,
+            "-pass", "2", "-passlogfile", log_prefix,
+            "-c:a", "aac", "-b:a", audio_bitrate, "-ac", "2",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            output,
+        ]
+        _run(pass2, "pass 2")
+
+        if not os.path.exists(output) or os.path.getsize(output) < 1000:
+            raise ProcessingError("Two-pass produced empty output.")
+    finally:
+        # Best-effort cleanup: pass logs + intermediate file.
+        try:
+            for fn in os.listdir(stats_dir):
+                try: os.remove(os.path.join(stats_dir, fn))
+                except OSError: pass
+            os.rmdir(stats_dir)
+        except OSError:
+            pass
+        try: os.remove(intermediate)
+        except OSError: pass
+
+
 def _open_ffmpeg_encoder(output_path: str, width: int, height: int, fps: float,
                          audio_source: Optional[str], crf: int = 23, preset: str = "fast",
                          audio_bitrate: str = "128k",
                          subtitle_path: Optional[str] = None,
                          subtitle_style: Optional[Dict[str, Any]] = None,
                          extra_vf: Optional[List[str]] = None,
-                         source_fps: Optional[float] = None) -> subprocess.Popen:
+                         source_fps: Optional[float] = None,
+                         two_pass: Optional[bool] = None,
+                         target_bitrate: Optional[str] = None) -> subprocess.Popen:
+    # Two-pass: if caller didn't pass explicit flag, honour module toggle.
+    if two_pass is None:
+        two_pass = TWO_PASS_ENCODING_ENABLED
+    if target_bitrate is None:
+        target_bitrate = TWO_PASS_TARGET_BITRATE
     # FIXED: use source_fps for the raw input stream rate, fps for output
     input_fps = source_fps if source_fps is not None else fps
     cmd = [
@@ -1401,6 +1586,41 @@ def _open_ffmpeg_encoder(output_path: str, width: int, height: int, fps: float,
         cmd += ["-an"]
     if vf:
         cmd += ["-vf", ", ".join(vf)]
+    if two_pass:
+        # ── Two-pass path ──
+        # Encode stdin frames to a lossless MKV intermediate now; the final
+        # 2-pass libx264 emit runs later inside `_close_ffmpeg_encoder`.
+        stats_dir  = tempfile.mkdtemp(prefix="vv_2pass_")
+        log_prefix = os.path.join(stats_dir, "ffmpeg2pass")
+        _tmp = tempfile.NamedTemporaryFile(prefix="vv_2pass_int_",
+                                           suffix=".mkv", delete=False)
+        _tmp.close()
+        intermediate = _tmp.name
+
+        # Keep any earlier vf/audio flags — they need to be baked into the
+        # intermediate so pass-2 doesn't need to re-run them.
+        cmd += ["-c:v", "libx264", "-preset", "ultrafast",
+                "-crf", str(TWO_PASS_INTERMEDIATE_CRF),
+                "-pix_fmt", "yuv420p", intermediate]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, bufsize=0)
+        # Auto-compute bitrate if not provided.
+        bv = target_bitrate or _compute_target_bitrate(
+            width, height, fps, quality=TWO_PASS_QUALITY_LEVEL)
+        # Attach context so `_close_ffmpeg_encoder` runs pass-1 + pass-2.
+        proc._two_pass_ctx = {          # type: ignore[attr-defined]
+            "stats_dir":      stats_dir,
+            "log_prefix":     log_prefix,
+            "intermediate":   intermediate,
+            "final_output":   output_path,
+            "target_bitrate": bv,
+            "preset":         preset,
+            "audio_bitrate":  audio_bitrate,
+        }
+        return proc
+
+    # ── Single-pass path (original) ──
     cmd += ["-c:v", "libx264", "-preset", preset, "-crf", str(crf),
             "-pix_fmt", "yuv420p", "-movflags", "+faststart", output_path]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE,
@@ -1425,6 +1645,13 @@ def _close_ffmpeg_encoder(proc: subprocess.Popen, output_path: str) -> None:
     if proc.returncode != 0:
         err = b"".join(stderr_buf).decode(errors="replace")
         raise ProcessingError(f"FFmpeg encoder failed (rc={proc.returncode}):\n{err}")
+
+    # Two-pass finalize: intermediate MKV is complete → run pass-1 + pass-2
+    # to produce the actual `output_path`. Only reached when two_pass=True.
+    ctx = getattr(proc, "_two_pass_ctx", None)
+    if ctx is not None:
+        _run_two_pass_finalize(ctx)
+
     if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
         raise ProcessingError("FFmpeg encoder produced empty output.")
 
@@ -1626,13 +1853,28 @@ class MultiObjectSportsTracker:
         union  = area_a + area_b - inter
         return inter / union if union > 0 else 0.0
 
+    def _project_box_to_det(self, det_frame: np.ndarray,
+                            box: Tuple) -> Tuple[int, int, int, int]:
+        """
+        FIXED (bug 3): callers pass boxes in ORIG-frame coordinates but
+        `det_frame` is the downscaled detection image. Project the box
+        into det-frame coordinates before slicing, otherwise the ROI is
+        drawn from the wrong region (or empty) → identity switches.
+        """
+        H, W = det_frame.shape[:2]
+        sx = W / max(1, self.frame_w)
+        sy = H / max(1, self.frame_h)
+        x1 = int(round(box[0] * sx)); y1 = int(round(box[1] * sy))
+        x2 = int(round(box[2] * sx)); y2 = int(round(box[3] * sy))
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(W, x2), min(H, y2)
+        return x1, y1, x2, y2
+
     def _compute_appearance_sim(self, track_id: int, det_frame: np.ndarray,
                                 det_box: Tuple) -> float:
         if track_id not in self.appearance_gallery:
             return 0.5
-        x1, y1, x2, y2 = det_box
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(det_frame.shape[1], x2), min(det_frame.shape[0], y2)
+        x1, y1, x2, y2 = self._project_box_to_det(det_frame, det_box)
         if x2 <= x1 or y2 <= y1:
             return 0.0
         roi  = det_frame[y1:y2, x1:x2]
@@ -1644,9 +1886,9 @@ class MultiObjectSportsTracker:
 
     def _update_appearance(self, track_id: int, det_frame: np.ndarray,
                            det_box: Tuple) -> None:
-        x1, y1, x2, y2 = det_box
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(det_frame.shape[1], x2), min(det_frame.shape[0], y2)
+        # FIXED (bug 3): project ORIG-frame coords into det-frame space
+        # before slicing the appearance ROI (see _project_box_to_det).
+        x1, y1, x2, y2 = self._project_box_to_det(det_frame, det_box)
         if x2 <= x1 or y2 <= y1:
             return
         roi  = det_frame[y1:y2, x1:x2]
@@ -2561,7 +2803,11 @@ def _detect_panel_mode(input_path: str, model: Any, fps: float, total_frames: in
     aspect_vals: List[float] = []; count_vals: List[int] = []
     prev_centres: Optional[List[Tuple]] = None; prev_split: Optional[Dict] = None
 
-    for frame in probe_frames.values():
+    # FIXED (bug 6): iterate probes in ASCENDING frame-index order to make
+    # motion-stability (a temporal delta) explicitly ordered rather than
+    # relying on dict-insertion-order = timestamp-order coincidence.
+    for _fi_key in sorted(probe_frames.keys()):
+        frame = probe_frames[_fi_key]
         persons = detect_persons_all(frame, model, confidence)
         count_vals.append(len(persons))
         curr_cx = [((p[0]+p[2])/2/det_w, (p[1]+p[3])/2/det_h) for p in persons]
@@ -3083,10 +3329,14 @@ def _render_panel_frame(frame: np.ndarray, persons: List[Tuple], out_w: int, out
         canvas[:, vd1:vd2] = div_color
 
     # Cross-dissolve during transitions
+    # FIXED (bug 2): store the CLEAN pre-blend canvas — never the blended output.
+    # Storing the blended frame caused each subsequent transition to compound
+    # cross-dissolve ghosting/blur (each new blend fed a half-blended 'old').
     if layout_manager is not None:
+        clean_canvas = canvas  # snapshot pre-blend
         if is_transitioning and blend_alpha < 1.0:
             canvas = layout_manager.blend_transition(canvas, blend_alpha)
-        layout_manager.store_old_frame(canvas)
+        layout_manager.store_old_frame(clean_canvas)
 
     return canvas, [list(g) for g in groups[:max(n_active, 1)]]
 
@@ -3430,7 +3680,7 @@ def _compute_frame_scores(input_path: str, fps: float, total_frames: int,
                     scores.append(_frame_saliency_score(frame, prev_frame))
                     prev_gray = cg; prev_frame = frame.copy()
                 if fi % max(1, total_frames//20) == 0:
-                    _p(fi/total_frames, f"Scanning {fi}/{total_frames}...")
+                    _p((fi/total_frames) if total_frames > 0 else 0.0, f"Scanning {fi}/{total_frames}...")
                 fi += 1
     except Exception as e:
         logger.error("[scan] Error: %s", e)
@@ -3803,7 +4053,7 @@ def _render_video(input_path: str, output_path: str,
                     )
                 fi += 1
                 if fi % max(1, total_frames//50) == 0:
-                    _p(0.15 + (fi/total_frames)*0.80, f"Rendering {fi}/{total_frames}...")
+                    _p(0.15 + ((fi/total_frames) if total_frames > 0 else 0.0)*0.80, f"Rendering {fi}/{total_frames}...")
     finally:
         # FIXED: subtitle tempfile cleaned up even if encoder raises
         # Also: don't mask the original exception with a generic "empty output" error
@@ -3909,7 +4159,7 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
                 # FIXED: store a copy to prevent aliasing with FFmpegVideoReader buffer
                 prev_frame = det_frame.copy()
                 if fi % max(1, total_frames//50) == 0:
-                    _p(fi/total_frames, f"Tracking {fi}/{total_frames}...")
+                    _p((fi/total_frames) if total_frames > 0 else 0.0, f"Tracking {fi}/{total_frames}...")
                 fi += 1
     except Exception as e:
         logger.error("[tracking_pass] Error at frame %d: %s", fi, e)
@@ -3939,12 +4189,13 @@ def _sports_tracking_pass_optimized(
     Dict[int, List[Tuple[int,int,int,int]]],
 ]:
     def _p(v, msg=""): progress_callback and progress_callback(v, msg)
-    # Ensure minimum 640px width for vertical inputs
-    det_scale = min(1.0, 960 / orig_w)
-    if orig_w < 640:
-        det_scale = 640 / orig_w
-    det_w = max(1, int(orig_w * det_scale))
-    det_h = max(1, int(orig_h * det_scale))
+    # FIXED (bug 4): NEVER upscale. Previously, when orig_w < 640 we forced
+    # det_scale = 640/orig_w (>1.0), which upscaled small/vertical-mobile
+    # sources — wasting compute, softening features, and distorting aspect
+    # ratio. Cap at 1.0 so small sources run at native resolution.
+    det_scale = min(1.0, 960.0 / float(orig_w))
+    det_w = max(1, int(round(orig_w * det_scale)))
+    det_h = max(1, int(round(orig_h * det_scale)))
     hw, hh = crop_w//2, crop_h//2
 
     raw_centers:     List[Tuple[int,int]]                          = []
@@ -4084,6 +4335,10 @@ def _sports_tracking_pass_optimized(
                         mot_tracker.update(persons_orig, ball_box_orig, det_frame, p_confs)
                     except Exception as e:
                         logger.warning("[yolo] frame %d: %s", fi, e)
+                    # FIXED (H1): guarantee Kalman state advances even when YOLO
+                    # ran but produced no valid ball detection (idempotent no-op
+                    # if init/update already fired this frame).
+                    ball_kalman.advance_if_needed()
 
                 else:
                     # FIXED: Unconditional predict once per frame (after new_frame)
@@ -4140,7 +4395,11 @@ def _sports_tracking_pass_optimized(
                     if not resolved:
                         if ball_kalman.initialized and ball_found_ever:
                             kpx, kpy = ball_kalman.position
-                            avg_w = avg_h = 40
+                            # FIXED (H3): scale fallback ball size with detection
+                            # resolution instead of a hardcoded 40 px, which
+                            # misframes 4K (ball ~ 90px) and sub-720p (ball ~ 15px).
+                            _fallback_px = max(12, int(round(30.0 * det_h / 720.0)))
+                            avg_w = avg_h = _fallback_px
                             if ball_size_history:
                                 avg_w = int(np.mean([s[0] for s in ball_size_history]))
                                 avg_h = int(np.mean([s[1] for s in ball_size_history]))
@@ -4248,7 +4507,7 @@ def _sports_tracking_pass_optimized(
                     ball_src = this_ball_rec.source
                     focus    = ("carrier" if primary_track and mot_tracker.ball_state.is_possessed
                                 else "ball" if ball_center is not None else "person/flow")
-                    _p(fi/total_frames,
+                    _p((fi/total_frames) if total_frames > 0 else 0.0,
                        f"Sports tracking {fi}/{total_frames} "
                        f"(skip={yolo_skip}, phase={current_phase.name}, "
                        f"ball={ball_src}, focus={focus})...")
