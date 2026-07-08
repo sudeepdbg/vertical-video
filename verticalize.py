@@ -4538,6 +4538,423 @@ def _sports_tracking_pass_optimized(
     return raw_centers, speeds, scene_cuts, ball_records, person_boxes_map
 
 
+# ── Cinematic Mode ─────────────────────────────────────────────────────────────
+@dataclass
+class CinematicConfig:
+    """
+    Actor/dialogue-first vertical reframing for movies, episodic content,
+    dramas, trailers, interviews and other non-sports content.
+
+    Cinematic mode intentionally does NOT use ball tracking, sports phase
+    detection, field/court masking, MOT ball-carrier logic, or sports overlays.
+    """
+    enabled: bool = True
+    face_priority: float = 0.55
+    person_priority: float = 0.25
+    saliency_priority: float = 0.20
+    rule_of_thirds_weight: float = 0.18
+    headroom_bias: float = 0.18
+    two_shot_max_gap_frac: float = 0.42
+    motion_compensation: bool = True
+    max_camera_motion_px: float = 30.0
+    scene_cut_threshold: float = 0.32
+    min_shot_hold_frames: int = 12
+    smoothing_window_sec: float = 1.15
+    smoothing_alpha: float = 0.045
+    max_center_jump_frac: float = 0.10
+    prefer_warm_grade: bool = True
+    default_vignette_strength: float = 0.32
+    default_sharpen_strength: float = 0.15
+
+
+def _estimate_camera_motion(prev_gray: Optional[np.ndarray], curr_gray: np.ndarray) -> Tuple[float, float, float]:
+    """
+    Estimate global camera motion between two downscaled grayscale frames.
+
+    Returns (dx, dy, confidence), where dx/dy are median global pan/tilt in
+    detection-frame pixels. Conservative by design: on weak/unstable feature
+    tracks it returns zero motion so framing cannot drift unexpectedly.
+    """
+    if prev_gray is None or curr_gray is None or prev_gray.shape != curr_gray.shape:
+        return 0.0, 0.0, 0.0
+    try:
+        pts0 = cv2.goodFeaturesToTrack(
+            prev_gray,
+            maxCorners=160,
+            qualityLevel=0.01,
+            minDistance=12,
+            blockSize=5,
+        )
+        if pts0 is None or len(pts0) < 12:
+            return 0.0, 0.0, 0.0
+        pts1, status, _ = cv2.calcOpticalFlowPyrLK(
+            prev_gray, curr_gray, pts0, None,
+            winSize=(21, 21), maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
+        )
+        if pts1 is None or status is None:
+            return 0.0, 0.0, 0.0
+        valid = status.reshape(-1) == 1
+        if int(valid.sum()) < 12:
+            return 0.0, 0.0, 0.0
+        p0 = pts0.reshape(-1, 2)[valid]
+        p1 = pts1.reshape(-1, 2)[valid]
+        flow = p1 - p0
+        med = np.median(flow, axis=0)
+        residual = np.linalg.norm(flow - med, axis=1)
+        stable = residual < max(2.5, np.percentile(residual, 65))
+        conf = float(np.clip(stable.mean(), 0.0, 1.0))
+        if conf < 0.35:
+            return 0.0, 0.0, conf
+        dx, dy = float(med[0]), float(med[1])
+        return dx, dy, conf
+    except (cv2.error, ValueError, RuntimeError):
+        return 0.0, 0.0, 0.0
+
+
+def _box_center(box: Tuple[int, int, int, int]) -> Tuple[float, float]:
+    return (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+
+
+def _box_area(box: Tuple[int, int, int, int]) -> float:
+    return float(max(0, box[2] - box[0]) * max(0, box[3] - box[1]))
+
+
+def _face_to_cinematic_center(
+    face: Tuple[int, int, int, int],
+    orig_w: int,
+    orig_h: int,
+    crop_w: int,
+    crop_h: int,
+    cfg: CinematicConfig,
+) -> Tuple[int, int]:
+    """Translate a face box into a crop center with cinematic headroom."""
+    fx1, fy1, fx2, fy2 = face
+    fcx, fcy = _box_center(face)
+    fh = max(1, fy2 - fy1)
+    # Place eyes/forehead slightly above vertical center; this preserves headroom
+    # and keeps lower face/shoulders in frame for dialogue scenes.
+    cy = fcy + crop_h * cfg.headroom_bias - fh * 0.15
+    cx = fcx
+    hw, hh = crop_w // 2, crop_h // 2
+    cx = int(np.clip(cx, hw, max(hw, orig_w - hw)))
+    cy = int(np.clip(cy, hh, max(hh, orig_h - hh)))
+    cy = _apply_lower_third_guard(cy, crop_h, int(fcy), orig_h)
+    return cx, int(np.clip(cy, hh, max(hh, orig_h - hh)))
+
+
+def _select_cinematic_target(
+    faces: List[Tuple[int, int, int, int]],
+    persons: List[Tuple[int, int, int, int]],
+    saliency: Tuple[int, int],
+    prev_center: Optional[Tuple[float, float]],
+    orig_w: int,
+    orig_h: int,
+    crop_w: int,
+    crop_h: int,
+    cfg: CinematicConfig,
+) -> Tuple[int, int, str]:
+    """
+    Select the cinematic crop target.
+
+    Priority order:
+    1. Dialogue/two-shot when two strong faces are close enough to fit.
+    2. Dominant face close-up / medium shot.
+    3. Person/body union.
+    4. Temporal saliency fallback.
+    """
+    hw, hh = crop_w // 2, crop_h // 2
+    if faces:
+        faces_sorted = sorted(faces, key=_box_area, reverse=True)
+        # Two-shot: if two significant faces are horizontally close enough,
+        # frame their union rather than cutting between actors too rapidly.
+        if len(faces_sorted) >= 2:
+            f1, f2 = faces_sorted[0], faces_sorted[1]
+            a1, a2 = _box_area(f1), _box_area(f2)
+            c1, c2 = _box_center(f1), _box_center(f2)
+            gap_frac = abs(c1[0] - c2[0]) / max(orig_w, 1)
+            size_ratio = min(a1, a2) / max(a1, a2, 1.0)
+            if size_ratio >= 0.35 and gap_frac <= cfg.two_shot_max_gap_frac:
+                ux1 = min(f1[0], f2[0]); uy1 = min(f1[1], f2[1])
+                ux2 = max(f1[2], f2[2]); uy2 = max(f1[3], f2[3])
+                cx, cy = frame_for_union(ux1, uy1, ux2, uy2, orig_w, orig_h, crop_w, crop_h)
+                return cx, cy, "cinematic_two_shot"
+        return (*_face_to_cinematic_center(faces_sorted[0], orig_w, orig_h, crop_w, crop_h, cfg), "cinematic_face")
+
+    if persons:
+        # Use a compact actor/body union; avoids overreacting to background extras.
+        persons_sorted = sorted(persons, key=_box_area, reverse=True)[:3]
+        ux1, uy1, ux2, uy2 = _group_union(persons_sorted)
+        cx, cy = frame_for_union(ux1, uy1, ux2, uy2, orig_w, orig_h, crop_w, crop_h)
+        return cx, cy, "cinematic_actor"
+
+    scx, scy = saliency
+    return int(np.clip(scx, hw, max(hw, orig_w - hw))), int(np.clip(scy, hh, max(hh, orig_h - hh))), "cinematic_saliency"
+
+
+def _cinematic_smooth_path(
+    centers: List[Tuple[int, int]],
+    fps: float,
+    scene_cuts: List[int],
+    cfg: CinematicConfig,
+) -> Tuple[List[Tuple[int, int]], Dict[str, float]]:
+    """Long-lens style smoothing, segmented at scene cuts."""
+    if len(centers) < 3:
+        return centers, {"jitter_raw": 0.0, "jitter_smooth": 0.0, "smoothness_pct": 0.0}
+    xs = np.array([c[0] for c in centers], dtype=float)
+    ys = np.array([c[1] for c in centers], dtype=float)
+    raw = np.sqrt(np.diff(xs) ** 2 + np.diff(ys) ** 2)
+    jitter_raw = float(np.mean(raw)) if len(raw) else 0.0
+    cuts = sorted({c for c in scene_cuts if 0 < c < len(centers)})
+    bounds = [0] + cuts + [len(centers)]
+    sx, sy = xs.copy(), ys.copy()
+    win = max(5, int(round(fps * cfg.smoothing_window_sec)))
+    if win % 2 == 0:
+        win += 1
+    for s, e in zip(bounds[:-1], bounds[1:]):
+        n = e - s
+        if n < 3:
+            continue
+        local_win = min(win, n if n % 2 == 1 else n - 1)
+        if local_win >= 5:
+            try:
+                if _SCIPY_AVAILABLE:
+                    po = min(3, local_win - 1)
+                    sx[s:e] = savgol_filter(xs[s:e], local_win, po)
+                    sy[s:e] = savgol_filter(ys[s:e], local_win, po)
+                else:
+                    sx[s:e], sy[s:e] = _gauss_seg(xs[s:e], ys[s:e], local_win)
+            except (ValueError, RuntimeError):
+                pass
+        sx[s:e], sy[s:e] = _bidir_ema(sx[s:e], sy[s:e], alpha=cfg.smoothing_alpha)
+    sm = np.sqrt(np.diff(sx) ** 2 + np.diff(sy) ** 2)
+    jitter_smooth = float(np.mean(sm)) if len(sm) else 0.0
+    pct = max(0.0, min(100.0, (jitter_raw - jitter_smooth) / jitter_raw * 100.0 if jitter_raw > 0 else 0.0))
+    return [(int(round(x)), int(round(y))) for x, y in zip(sx, sy)], {
+        "jitter_raw": round(jitter_raw, 2),
+        "jitter_smooth": round(jitter_smooth, 2),
+        "smoothness_pct": round(pct, 1),
+    }
+
+
+def _cinematic_tracking_pass(
+    input_path: str,
+    orig_w: int,
+    orig_h: int,
+    crop_w: int,
+    crop_h: int,
+    fps: float,
+    total_frames: int,
+    model: Any,
+    confidence: float,
+    cfg: CinematicConfig,
+    progress_callback=None,
+) -> Tuple[List[Tuple[int, int]], List[float], List[int], Dict[str, int]]:
+    def _p(v, msg=""):
+        progress_callback and progress_callback(v, msg)
+
+    det_scale = min(1.0, 960.0 / float(orig_w))
+    det_w = max(1, int(round(orig_w * det_scale)))
+    det_h = max(1, int(round(orig_h * det_scale)))
+    inv = 1.0 / max(det_scale, 1e-6)
+    hw, hh = crop_w // 2, crop_h // 2
+    centers: List[Tuple[int, int]] = []
+    speeds: List[float] = []
+    scene_cuts: List[int] = []
+    mode_counts: Dict[str, int] = {}
+    prev_frame: Optional[np.ndarray] = None
+    prev_gray: Optional[np.ndarray] = None
+    prev_hist: Optional[np.ndarray] = None
+    prev_center: Optional[Tuple[float, float]] = None
+    prev_output_center: Optional[Tuple[int, int]] = None
+    prev_mode: str = "cinematic_init"
+    last_cut_frame = -100
+    hold_counter = 0
+    prev_saliency: Optional[np.ndarray] = None
+
+    try:
+        with FFmpegVideoReader(input_path, orig_w, orig_h, scale_w=det_w, scale_h=det_h) as reader:
+            for fi, det_frame in enumerate(reader):
+                if fi >= total_frames:
+                    break
+                gray = cv2.cvtColor(det_frame, cv2.COLOR_BGR2GRAY)
+                is_cut, prev_hist, last_cut_frame = is_scene_change(
+                    prev_frame, det_frame,
+                    threshold=cfg.scene_cut_threshold,
+                    prev_hist=prev_hist,
+                    frame_count=fi,
+                    last_cut_frame=last_cut_frame,
+                    mode="default",
+                )
+                if is_cut:
+                    scene_cuts.append(fi)
+                    prev_center = None
+                    prev_output_center = None
+                    hold_counter = 0
+
+                faces_det = detect_faces(det_frame, confidence_thresh=max(0.45, confidence * 0.85))
+                faces = [
+                    (int(f[0] * inv), int(f[1] * inv), int(f[2] * inv), int(f[3] * inv))
+                    for f in faces_det
+                ]
+
+                persons: List[Tuple[int, int, int, int]] = []
+                if model is not None:
+                    try:
+                        persons_det = detect_persons_all(det_frame, model, confidence=confidence)
+                        persons = [
+                            (int(p[0] * inv), int(p[1] * inv), int(p[2] * inv), int(p[3] * inv))
+                            for p in persons_det
+                        ]
+                    except Exception as exc:
+                        logger.debug("cinematic person detection failed at %d: %s", fi, exc)
+
+                sal_x_det, sal_y_det, prev_saliency = temporal_saliency_center(det_frame, prev_saliency)
+                saliency = (int(sal_x_det * inv), int(sal_y_det * inv))
+                cx, cy, mode = _select_cinematic_target(
+                    faces, persons, saliency, prev_center,
+                    orig_w, orig_h, crop_w, crop_h, cfg,
+                )
+
+                if cfg.motion_compensation and prev_gray is not None:
+                    mdx, mdy, mconf = _estimate_camera_motion(prev_gray, gray)
+                    if mconf >= 0.35:
+                        mdx = float(np.clip(mdx * inv, -cfg.max_camera_motion_px, cfg.max_camera_motion_px))
+                        mdy = float(np.clip(mdy * inv, -cfg.max_camera_motion_px, cfg.max_camera_motion_px))
+                        # Compensate only partially; full compensation can feel locked-off.
+                        cx = int(round(cx + mdx * 0.35))
+                        cy = int(round(cy + mdy * 0.25))
+
+                # Hold target briefly to avoid rapid actor toggles within a dialogue shot.
+                if prev_output_center is not None and not is_cut and mode != prev_mode and hold_counter < cfg.min_shot_hold_frames:
+                    cx, cy = prev_output_center
+                    hold_counter += 1
+                    mode = prev_mode
+                else:
+                    hold_counter = 0 if mode == prev_mode else 1
+
+                cx = int(np.clip(cx, hw, max(hw, orig_w - hw)))
+                cy = int(np.clip(cy, hh, max(hh, orig_h - hh)))
+                cy = int(_apply_lower_third_guard(cy, crop_h, cy, orig_h))
+                cy = int(np.clip(cy, hh, max(hh, orig_h - hh)))
+                speed = math.hypot(cx - prev_output_center[0], cy - prev_output_center[1]) if prev_output_center else 0.0
+                centers.append((cx, cy))
+                speeds.append(speed)
+                mode_counts[mode] = mode_counts.get(mode, 0) + 1
+                prev_center = (float(cx), float(cy))
+                prev_output_center = (cx, cy)
+                prev_mode = mode
+                prev_gray = gray.copy()
+                prev_frame = det_frame.copy()
+                if fi % max(1, total_frames // 50) == 0:
+                    _p((fi / total_frames) if total_frames > 0 else 0.0, f"Cinematic analysis {fi}/{total_frames} ({mode})...")
+    except Exception as e:
+        logger.error("[cinematic_tracking] Error: %s", e)
+        while len(centers) < total_frames:
+            centers.append(centers[-1] if centers else (orig_w // 2, orig_h // 2))
+            speeds.append(0.0)
+
+    if len(centers) < total_frames:
+        last = centers[-1] if centers else (orig_w // 2, orig_h // 2)
+        for _ in range(len(centers), total_frames):
+            centers.append(last)
+            speeds.append(0.0)
+    elif len(centers) > total_frames:
+        centers = centers[:total_frames]
+        speeds = speeds[:total_frames]
+    return centers, speeds, scene_cuts, mode_counts
+
+
+def process_cinematic_video(
+    input_path: str,
+    output_path: str,
+    target_preset_label: str = "720p   (720x1280  - HD)",
+    confidence: float = 0.45,
+    output_fps: Optional[float] = None,
+    crf: int = 21,
+    encoder_preset: str = "fast",
+    audio_bitrate: str = "128k",
+    yolo_weights: str = "yolov8n.pt",
+    burn_subtitles: bool = False,
+    whisper_model: str = "base",
+    whisper_language: Optional[str] = None,
+    subtitle_style_name: str = "Bold White (TikTok)",
+    subtitle_max_chars: int = 42,
+    subtitle_translate_to: Optional[str] = None,
+    color_grade: str = "warm",
+    vignette_strength: Optional[float] = None,
+    sharpen_strength: Optional[float] = None,
+    ffmpeg_sharpen: bool = False,
+    cinematic_config: Optional[CinematicConfig] = None,
+    progress_callback=None,
+) -> Dict[str, Any]:
+    """
+    Public Cinematic Mode API.
+
+    Sports mode is deliberately disabled here: no ball tracking, no sports phase
+    detector, no field/court detection, no sports overlays, and no sports render
+    path. This is safe to call from UI as a separate option.
+    """
+    def _p(v, msg=""):
+        progress_callback and progress_callback(v, msg)
+
+    cfg = cinematic_config or CinematicConfig()
+    (info, orig_w, orig_h, out_w, out_h, fps, total_frames,
+     model, res_mon) = _common_pipeline_setup(input_path, target_preset_label, yolo_weights, load_model=True)
+    crop_w, crop_h = calculate_crop_dims(orig_w, orig_h, out_w, out_h)
+    if vignette_strength is None:
+        vignette_strength = cfg.default_vignette_strength
+    if sharpen_strength is None:
+        sharpen_strength = cfg.default_sharpen_strength
+    if cfg.prefer_warm_grade and (not color_grade or color_grade == "none"):
+        color_grade = "warm"
+
+    _p(0.05, "Cinematic mode: actor/shot analysis...")
+    raw_centers, speeds, scene_cuts, mode_counts = _cinematic_tracking_pass(
+        input_path=input_path, orig_w=orig_w, orig_h=orig_h,
+        crop_w=crop_w, crop_h=crop_h, fps=fps, total_frames=total_frames,
+        model=model, confidence=confidence, cfg=cfg,
+        progress_callback=lambda v, m: _p(0.05 + v * 0.45, m),
+    )
+    _p(0.50, "Cinematic smoothing...")
+    smoothed, smooth_metrics = _cinematic_smooth_path(raw_centers, fps, scene_cuts, cfg)
+    _p(0.55, "Rendering cinematic video...")
+    render_meta = _render_video(
+        input_path=input_path, output_path=output_path,
+        out_w=out_w, out_h=out_h, crop_w=crop_w, crop_h=crop_h,
+        orig_w=orig_w, orig_h=orig_h, fps=fps, total_frames=total_frames,
+        smoothed_centers=smoothed, tracking_mode="cinematic",
+        crf=crf, encoder_preset=encoder_preset, audio_bitrate=audio_bitrate,
+        burn_subtitles=burn_subtitles, whisper_model=whisper_model,
+        whisper_language=whisper_language, subtitle_style_name=subtitle_style_name,
+        subtitle_max_chars=subtitle_max_chars, subtitle_translate_to=subtitle_translate_to,
+        output_fps=output_fps, color_grade=color_grade,
+        vignette_strength=float(vignette_strength), sharpen_strength=float(sharpen_strength),
+        ffmpeg_sharpen=ffmpeg_sharpen, scene_cuts=scene_cuts,
+        use_panel_mode=False,
+        ball_records=None,
+        draw_tracking_boxes=False,
+        overlay_config=None,
+        progress_callback=lambda v, m: _p(0.55 + v * 0.43, m),
+    )
+    res_mon.stop()
+    _p(1.0, "Done!")
+    analytics = _build_analytics(
+        input_path, output_path, orig_w=orig_w, orig_h=orig_h,
+        out_w=out_w, out_h=out_h, smooth_metrics=smooth_metrics,
+        panel_mode=False, resource_stats=res_mon.get_stats(),
+    )
+    analytics.update({
+        "cinematic_mode": True,
+        "sports_mode_disabled": True,
+        "scene_cuts": len(scene_cuts),
+        "cinematic_face_frames": int(mode_counts.get("cinematic_face", 0)),
+        "cinematic_two_shot_frames": int(mode_counts.get("cinematic_two_shot", 0)),
+        "cinematic_actor_frames": int(mode_counts.get("cinematic_actor", 0)),
+        "cinematic_saliency_frames": int(mode_counts.get("cinematic_saliency", 0)),
+    })
+    return {"analytics": analytics, "subtitle_path": render_meta.get("subtitle_path")}
+
 # ── process_video — main public API ──────────────────────────────────────────
 def process_video(input_path: str, output_path: str,
                   target_preset_label: str = "720p   (720x1280  - HD)",
@@ -4557,6 +4974,29 @@ def process_video(input_path: str, output_path: str,
                   panel_config: Optional[PanelModeConfig] = None,
                   progress_callback=None) -> Dict[str, Any]:
     def _p(v, msg=""): progress_callback and progress_callback(v, msg)
+    if tracking_mode in ("cinematic", "cinematic_mode"):
+        return process_cinematic_video(
+            input_path=input_path,
+            output_path=output_path,
+            target_preset_label=target_preset_label,
+            confidence=confidence,
+            output_fps=output_fps,
+            crf=crf,
+            encoder_preset=encoder_preset,
+            audio_bitrate=audio_bitrate,
+            yolo_weights=yolo_weights,
+            burn_subtitles=burn_subtitles,
+            whisper_model=whisper_model,
+            whisper_language=whisper_language,
+            subtitle_style_name=subtitle_style_name,
+            subtitle_max_chars=subtitle_max_chars,
+            subtitle_translate_to=subtitle_translate_to,
+            color_grade=(color_grade if color_grade != "none" else "warm"),
+            vignette_strength=(vignette_strength if vignette_strength > 0 else None),
+            sharpen_strength=(sharpen_strength if sharpen_strength > 0 else None),
+            ffmpeg_sharpen=ffmpeg_sharpen,
+            progress_callback=progress_callback,
+        )
 
     (info, orig_w, orig_h, out_w, out_h, fps, total_frames,
      model, res_mon) = _common_pipeline_setup(
@@ -4801,3 +5241,6 @@ class VerticalProcessor:
 
     def process_sports_video(self, *args, **kwargs):
         return process_sports_video(*args, **kwargs)
+
+    def process_cinematic_video(self, *args, **kwargs):
+        return process_cinematic_video(*args, **kwargs)
