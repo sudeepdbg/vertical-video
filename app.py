@@ -2,6 +2,7 @@
 app.py — Reframe · AI Vertical Video Studio
 Mobile-first · Light theme · Single Clip + Auto-Clip modes
 
+v5.1: Added Cinematic Mode for actor/dialogue-first reframing.
 v5.0: Enhanced panel mode with N-person support, speaker focus,
 head normalization, lower-third awareness, and portrait extraction.
 """
@@ -10,7 +11,7 @@ import tempfile
 import os
 import shutil
 from verticalize import (
-    process_video, process_sports_video, get_video_info, detect_clips, process_clips_batch,
+    process_video, process_sports_video, process_cinematic_video, get_video_info, detect_clips, process_clips_batch,
     RESOLUTION_PRESETS, SUBTITLE_STYLES, TRANSLATION_LANGUAGES,
     resolve_target_size, whisper_available, translation_available,
     PanelModeConfig,
@@ -183,13 +184,16 @@ st.markdown("</div>", unsafe_allow_html=True)
 st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
 st.markdown("<div style='padding:0 20px'>", unsafe_allow_html=True)
 st.markdown('<div class="rf-sec">Tracking Mode</div>', unsafe_allow_html=True)
-tm1, tm2 = st.columns(2, gap="small")
+tm1, tm2, tm3 = st.columns(3, gap="small")
 with tm1:
-    if st.button("🎯  Subject Tracking", type="secondary", use_container_width=True):
+    if st.button("🎯  Subject", type="secondary", use_container_width=True):
         st.session_state.tracking_mode = "subject"
 with tm2:
-    if st.button("👤  Talking Head  ✦", type="secondary", use_container_width=True):
+    if st.button("👤  Talking Head", type="secondary", use_container_width=True):
         st.session_state.tracking_mode = "talking_head"
+with tm3:
+    if st.button("🎬  Cinematic ✦", type="secondary", use_container_width=True):
+        st.session_state.tracking_mode = "cinematic"
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 if st.button("🏀  Sports Action  ✦  Ball-aware · Kalman", type="secondary", use_container_width=True):
     st.session_state.tracking_mode = "sports_action"
@@ -209,6 +213,8 @@ if tracking_mode == "sports_action":
     st.markdown(f'<div style="display:flex;align-items:center;gap:8px;margin-top:6px;margin-bottom:4px;"><span style="background:var(--acc);color:#fff;font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:3px 10px;border-radius:99px;">🏀 Sports Action · {sd}</span><span style="font-size:11px;color:var(--ink3);">Ball-aware · Kalman tracking</span></div>', unsafe_allow_html=True)
 elif tracking_mode == "talking_head":
     st.markdown('<div style="margin-top:6px;margin-bottom:4px;"><span style="background:var(--pur);color:#fff;font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:3px 10px;border-radius:99px;">👤 Talking Head</span></div>', unsafe_allow_html=True)
+elif tracking_mode == "cinematic":
+    st.markdown('<div style="display:flex;align-items:center;gap:8px;margin-top:6px;margin-bottom:4px;"><span style="background:var(--amb);color:#fff;font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:3px 10px;border-radius:99px;">🎬 Cinematic Mode</span><span style="font-size:11px;color:var(--ink3);">Actor/dialogue-first · sports disabled</span></div>', unsafe_allow_html=True)
 else:
     st.markdown('<div style="margin-top:6px;margin-bottom:4px;"><span style="background:var(--ink);color:#fff;font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:3px 10px;border-radius:99px;">🎯 Subject Tracking</span></div>', unsafe_allow_html=True)
 
@@ -286,6 +292,21 @@ with tab_trk:
             rule_of_thirds = st.toggle("Horizontal rule-of-thirds", value=True)
             confidence = 0.5; scene_cut_threshold = 0.35
         use_ball_tracking = False; use_kalman = False
+    elif tracking_mode == "cinematic":
+        st.markdown('<div class="rf-info" style="margin-bottom:12px;">🎬 <b>Cinematic Mode Active</b> — actor/dialogue-first framing. Sports mode, ball tracking and overlays are disabled.</div>', unsafe_allow_html=True)
+        t1, t2 = st.columns(2, gap="medium")
+        with t1:
+            confidence = st.slider("Actor / face detection confidence", 0.10, 0.95, 0.45, 0.05)
+            smooth_window = st.slider("Cinematic smoothness hint", 7, 41, 27, 2, help="Backend uses long-lens cinematic smoothing; this value is retained for settings compatibility.")
+        with t2:
+            scene_cut_threshold = st.slider("Shot-cut sensitivity", 0.10, 0.60, 0.32, 0.05)
+            st.caption("Cinematic mode uses shot-aware smoothing and composition analysis.")
+        adaptive_smoothing = True
+        use_optical_flow = True
+        rule_of_thirds = True
+        talking_head_bias = 0.30
+        use_ball_tracking = False
+        use_kalman = False
     elif tracking_mode == "sports_action":
         st.markdown('<div class="rf-info" style="margin-bottom:12px;">🏀 <b>Sports Mode Active</b> — Ball-aware tracking with Kalman smoothing.</div>', unsafe_allow_html=True)
         t1, t2 = st.columns(2, gap="medium")
@@ -337,7 +358,7 @@ with tab_adv:
     a1, a2 = st.columns(2, gap="medium")
     with a1: audio_bitrate_label = st.selectbox("Audio bitrate", ["64k","96k","128k","192k"], index=2)
     with a2:
-        yolo_weights = st.selectbox("YOLO model", ["yolov8n.pt","yolov8s.pt","yolov8m.pt"], index=0) if tracking_mode == "subject" else "yolov8n.pt"
+        yolo_weights = st.selectbox("YOLO model", ["yolov8n.pt","yolov8s.pt","yolov8m.pt"], index=0) if tracking_mode in ("subject", "cinematic") else "yolov8n.pt"
         st.markdown('<div class="rf-purp">Talking Head uses OpenCV face detector — YOLO not needed.</div>', unsafe_allow_html=True)
     st.markdown('<div class="rf-safe">✓ Lower-third guard — subjects kept above bottom 20% of frame</div>', unsafe_allow_html=True)
 
@@ -465,6 +486,7 @@ with col_out:
             if st.session_state.analytics_data:
                 a = st.session_state.analytics_data
                 if a.get("panel_mode"): st.markdown('<div class="rf-ok">🎛 Panel mode active</div>', unsafe_allow_html=True)
+                if a.get("cinematic_mode"): st.markdown(f'<div class="rf-ok">🎬 Cinematic mode active · {int(a.get("scene_cuts", 0))} shot cut(s) · Sports disabled</div>', unsafe_allow_html=True)
                 sp = a.get("smoothness_pct",0); sc_v = "var(--grn)" if sp>80 else ("var(--amb)" if sp>50 else "var(--acc)")
                 # Build analytics grid with CPU/RAM metrics if available
                 cpu_avg = a.get("cpu_avg_pct", 0)
@@ -553,7 +575,7 @@ if uploaded_file is not None and st.session_state.input_path:
             with a2:
                 if info:
                     eff_w, eff_h = resolve_target_size(resolution_label, info["width"], info["height"])
-                    mt = "Talking Head" if tracking_mode=="talking_head" else ("Sports" if tracking_mode=="sports_action" else "Subject")
+                    mt = "Talking Head" if tracking_mode=="talking_head" else ("Sports" if tracking_mode=="sports_action" else ("Cinematic" if tracking_mode=="cinematic" else "Subject"))
                     st.markdown(f"<p style='color:var(--ink3);font-size:11px;margin-top:12px;'>{mt} · {eff_w}×{eff_h} · CRF {crf}</p>", unsafe_allow_html=True)
             with a3:
                 if st.button("Clear", type="secondary", use_container_width=True): _cleanup(); st.session_state.uploaded_file_name=None; st.rerun()
@@ -565,7 +587,17 @@ if uploaded_file is not None and st.session_state.input_path:
                         prog.progress(min(v, 1.0))
                         if msg:
                             status.info(msg)
-                    if tracking_mode == "sports_action":
+                    if tracking_mode == "cinematic":
+                        meta = process_cinematic_video(st.session_state.input_path, st.session_state.output_path,
+                            target_preset_label=resolution_label, confidence=confidence,
+                            output_fps=output_fps, crf=crf, encoder_preset=encoder_preset_label,
+                            audio_bitrate=audio_bitrate_label, yolo_weights=yolo_weights,
+                            burn_subtitles=burn_subtitles, whisper_model=whisper_model,
+                            whisper_language=whisper_language,
+                            subtitle_style_name=subtitle_style_name, subtitle_max_chars=subtitle_max_chars,
+                            subtitle_translate_to=subtitle_translate_to,
+                            color_grade="warm", progress_callback=_cb)
+                    elif tracking_mode == "sports_action":
                         meta = process_sports_video(st.session_state.input_path, st.session_state.output_path,
                             sport_type=st.session_state.get("sport_type","auto"),
                             target_preset_label=resolution_label, confidence=confidence,
