@@ -65,6 +65,34 @@ v7.3 CHANGES vs v7.2
          lookup via np.searchsorted.
 • IMPROVED: ClipSegment validates that end_sec > start_sec on construction.
 • IMPROVED: Added coordinate-type docstrings to key public functions.
+
+v7.6 CHANGES vs v7.5 (this revision)
+• FIXED: BallColorModel.reset() was defined twice; the second (stub) definition
+  silently shadowed the first. Removed the duplicate.
+• FIXED: _render_video leaked the subtitle temp file when the encoder pipe
+  broke (BrokenPipeError). Subtitle cleanup now runs in its own unconditional
+  finally block, independent of encoder-close error handling.
+• FIXED: _tracking_pass now explicitly detects a det-frame shape change vs.
+  the previous frame and forces a scene-cut reset instead of silently
+  skipping cut detection (which is what happened when is_scene_change's
+  internal shape guard fired).
+• FIXED: process_clips_batch now forwards whisper_language to both
+  process_video and process_sports_video (previously silently dropped,
+  forcing auto-detect regardless of the user's selection).
+• FIXED: _detect_panel_mode now logs a warning when no probe frames could be
+  collected (e.g. very short source videos) instead of silently returning
+  False, which made "panel mode never triggers" hard to debug.
+• FIXED: ResourceMonitor._sample now also catches psutil.ZombieProcess,
+  which can be raised for zombie child ffmpeg/whisper processes on Linux.
+• IMPROVED: detect_clips now uses the stateful temporal_saliency_center
+  (same as the main tracking passes) instead of the single-frame
+  saliency_center, for consistent SOI estimation.
+• NEW: Thumbnail generation for every vertical clip — generate_thumbnails()
+  extracts N evenly-spaced frames (default/minimum 3) from a rendered clip
+  and encodes them as JPEG bytes; save_clip_thumbnails() persists them to
+  disk. Wired into process_clips_batch (auto-clip mode) and into
+  process_video / process_sports_video / process_cinematic_video metadata
+  for single-clip mode.
 """
 from __future__ import annotations
 
@@ -367,6 +395,11 @@ PANEL_LAYOUT_SWITCH_COOLDOWN = 30
 
 # Cache size limits to prevent unbounded memory growth
 _CACHE_MAX_ENTRIES = 32
+
+# Thumbnail generation defaults (see generate_thumbnails / save_clip_thumbnails)
+THUMBNAIL_MIN_COUNT   = 3
+THUMBNAIL_JPEG_QUALITY = 85
+THUMBNAIL_WIDTH        = 360
 
 
 # ── Data Classes ──────────────────────────────────────────────────────────────
@@ -722,6 +755,12 @@ class BallColorModel:
         `ball_color_model.reset()` on scene cuts, but no such method existed
         → AttributeError was swallowed by the outer try/except, leaving
         stale scene-1 color state to gate scene-2 detections.
+
+        FIXED (v7.6, issue 1): this method used to be defined a second time
+        further down in the class body as an identical stub. Python simply
+        used whichever definition came last, so the duplicate was harmless
+        in practice but confusing and fragile (a future edit to only one
+        copy would silently diverge). There is now exactly one definition.
         """
         self._samples = []
         self._model = None
@@ -751,10 +790,6 @@ class BallColorModel:
         h     = self._extract_hist(patch)
         score = float(cv2.compareHist(self._model, h, cv2.HISTCMP_CORREL))
         return max(0.0, score)
-
-    def reset(self) -> None:
-        self._samples = []
-        self._model   = None
 
     @property
     def is_ready(self) -> bool:
@@ -999,6 +1034,12 @@ class ResourceMonitor:
         ram_mb  = 0.0
         if self._parent_proc is None:
             return (wall, cpu_sec, ram_mb)
+        # FIXED (issue 6): also catch psutil.ZombieProcess, which can be raised
+        # on Linux for zombie child processes (e.g. an ffmpeg/whisper child
+        # that exited but hasn't been reaped yet). Previously only
+        # NoSuchProcess/AccessDenied were caught, so a zombie child could
+        # crash the monitoring thread.
+        proc_exceptions = (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess)
         try:
             seen_pids = {self._parent_proc.pid}
             with self._parent_proc.oneshot():
@@ -1014,9 +1055,9 @@ class ResourceMonitor:
                         ct      = child.cpu_times()
                         cpu_sec += ct.user + ct.system
                         ram_mb  += child.memory_info().rss / (1024 * 1024)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                except proc_exceptions:
                     pass
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+        except proc_exceptions:
             pass
         return (wall, cpu_sec, ram_mb)
 
@@ -1710,6 +1751,86 @@ def extract_thumbnail(path: str, t: float = 1.0) -> Optional[bytes]:
         return None
     ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return buf.tobytes() if ok else None
+
+
+# ── Thumbnail generation (NEW) ────────────────────────────────────────────────
+def generate_thumbnails(path: str, n: int = THUMBNAIL_MIN_COUNT,
+                        width: int = THUMBNAIL_WIDTH,
+                        quality: int = THUMBNAIL_JPEG_QUALITY) -> List[bytes]:
+    """
+    Extract `n` (minimum 3) evenly-spaced JPEG thumbnails from a video file.
+
+    Timestamps are spread across the [5%, 95%] range of the clip's duration
+    so that thumbnails avoid black frames / fades right at the very start
+    or end. Falls back gracefully (returns fewer than `n` frames, never
+    raises) if some timestamps can't be decoded — e.g. a truncated or
+    zero-duration render.
+    """
+    n = max(THUMBNAIL_MIN_COUNT, int(n))
+    try:
+        info = get_video_info(path)
+    except Exception as exc:
+        logger.warning("generate_thumbnails: could not read video info for %s: %s", path, exc)
+        return []
+
+    duration = info.get("duration_seconds", 0.0)
+    orig_w, orig_h = info["width"], info["height"]
+    if duration <= 0 or orig_w <= 0 or orig_h <= 0:
+        logger.warning("generate_thumbnails: invalid duration/dims for %s", path)
+        return []
+
+    out_w = min(width, orig_w)
+    out_h = max(2, int(round(out_w * orig_h / orig_w)))
+    out_w = out_w - (out_w % 2) or 2
+    out_h = out_h - (out_h % 2) or 2
+
+    if duration <= 1.0:
+        # Very short clip — spread thumbnails across whatever we have,
+        # including the very first frame if necessary.
+        ts_list = list(np.linspace(0.0, max(duration - 0.05, 0.0), n))
+    else:
+        lo = duration * 0.05
+        hi = duration * 0.95
+        ts_list = list(np.linspace(lo, hi, n))
+
+    thumbs: List[bytes] = []
+    for t in ts_list:
+        frame = _read_frame_at(path, orig_w, orig_h, float(t), scale_w=out_w, scale_h=out_h)
+        if frame is None:
+            continue
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if ok:
+            thumbs.append(buf.tobytes())
+
+    if len(thumbs) < n:
+        logger.warning("generate_thumbnails: only extracted %d/%d thumbnails for %s",
+                       len(thumbs), n, path)
+    return thumbs
+
+
+def save_clip_thumbnails(video_path: str, output_dir: str, prefix: str,
+                         n: int = THUMBNAIL_MIN_COUNT,
+                         width: int = THUMBNAIL_WIDTH,
+                         quality: int = THUMBNAIL_JPEG_QUALITY) -> List[str]:
+    """
+    Generate thumbnails for `video_path` and persist them to `output_dir`
+    as `{prefix}_thumb_{i}.jpg`. Returns the list of written file paths
+    (may be shorter than `n` if some frames couldn't be decoded — see
+    generate_thumbnails).
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    thumbs = generate_thumbnails(video_path, n=n, width=width, quality=quality)
+    paths: List[str] = []
+    for i, data in enumerate(thumbs):
+        p = os.path.join(output_dir, f"{prefix}_thumb_{i+1}.jpg")
+        try:
+            with open(p, "wb") as f:
+                f.write(data)
+            paths.append(p)
+        except OSError as exc:
+            logger.warning("save_clip_thumbnails: failed to write %s: %s", p, exc)
+    return paths
+
 
 def resolve_target_size(label: str, orig_w: int, orig_h: int) -> Tuple[int, int]:
     """
@@ -2792,10 +2913,21 @@ def _detect_panel_mode(input_path: str, model: Any, fps: float, total_frames: in
                     target_frame_ids.discard(nearest)
                 if fi >= int(probe_ts[-1] * fps) + int(fps):
                     break
-    except Exception:
+    except Exception as exc:
+        # FIXED (issue 5): log the underlying reason instead of silently
+        # returning False, which made "panel mode never triggers" opaque.
+        logger.warning("panel_detect: probe frame reader failed for %s: %s", input_path, exc)
         return False
 
     if not probe_frames:
+        # FIXED (issue 5): explicit warning when the source is too short
+        # (or otherwise yields no usable probe frames) rather than a bare
+        # `return False` that looks identical to "video is not a panel".
+        logger.warning(
+            "panel_detect: collected 0 probe frames for %s "
+            "(duration=%.2fs, fps=%.2f, requested %d probes) — "
+            "video may be too short; treating as non-panel.",
+            input_path, duration, fps, n_probe)
         return False
 
     multi_hits = 0; stable_split_hits = 0
@@ -3740,6 +3872,12 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
     _p(0.55, "SOI per clip...")
     segments: List[ClipSegment] = []
     det_w = min(orig_w, 640); det_h = max(1, int(det_w * orig_h / orig_w))
+    # FIXED (issue 7): maintain temporal saliency state across probe frames
+    # (same stateful estimator used by the main tracking passes) instead of
+    # the single-frame `saliency_center`, so repeated SOI probes within a
+    # clip build on the previous frame's saliency map rather than starting
+    # from scratch each time.
+    _prev_saliency_map: Optional[np.ndarray] = None
     for ci, (ss2, se, score) in enumerate(cands):
         _p(0.55 + 0.35*(ci/max(len(cands), 1)), f"Clip {ci+1}/{len(cands)}...")
         soi_xs: List[int] = []; soi_ys: List[int] = []
@@ -3756,7 +3894,8 @@ def detect_clips(input_path: str, min_duration_sec: float = 25.0,
                             soi_xs.append((x1+x2)//2); soi_ys.append((y1+y2)//2)
                 except (RuntimeError, ValueError, OSError): pass
             else:
-                scx, scy = saliency_center(frame); soi_xs.append(scx); soi_ys.append(scy)
+                scx, scy, _prev_saliency_map = temporal_saliency_center(frame, _prev_saliency_map)
+                soi_xs.append(scx); soi_ys.append(scy)
         sr = "center"
         if soi_xs: sr = _soi_region_label(int(np.median(soi_xs)), int(np.median(soi_ys)), orig_w, orig_h)
         ms = int(ss2//60); secs = int(ss2%60); me = int(se//60); sece = int(se%60)
@@ -3912,6 +4051,15 @@ def _render_video(input_path: str, output_path: str,
 
     fi = 0
     _prev_out_frame: Optional[np.ndarray] = None   # last rendered output frame (output-res)
+    # FIXED (issue 2): track whether the render loop raised, so the subtitle
+    # cleanup below can run unconditionally regardless of what happens while
+    # closing the encoder. Previously the srt cleanup lived inside the same
+    # try/except that handled `_close_ffmpeg_encoder`'s ProcessingError, so a
+    # BrokenPipeError -> RuntimeError from the render loop (which is raised
+    # *before* that try/except even starts, from within this same `finally`)
+    # could still leave the temp .srt file on disk in some exception orderings.
+    # Splitting subtitle cleanup into its own unconditional finally block
+    # guarantees it always runs exactly once, independent of encoder errors.
     try:
         with FFmpegVideoReader(input_path, orig_w, orig_h) as reader:
             for frame in reader:
@@ -4055,8 +4203,12 @@ def _render_video(input_path: str, output_path: str,
                 if fi % max(1, total_frames//50) == 0:
                     _p(0.15 + ((fi/total_frames) if total_frames > 0 else 0.0)*0.80, f"Rendering {fi}/{total_frames}...")
     finally:
-        # FIXED: subtitle tempfile cleaned up even if encoder raises
-        # Also: don't mask the original exception with a generic "empty output" error
+        # FIXED (issue 2): encoder-close error handling is isolated from
+        # subtitle-file cleanup below. We no longer clean up srt_path inside
+        # this try/except — that happens in a separate, unconditional
+        # finally block immediately after, so it always runs exactly once
+        # regardless of whether _close_ffmpeg_encoder raises, whether a
+        # RuntimeError from a broken pipe is already propagating, or both.
         _enc_error: Optional[Exception] = None
         try:
             _close_ffmpeg_encoder(enc, output_path)
@@ -4071,12 +4223,19 @@ def _render_video(input_path: str, output_path: str,
                 logger.error("Encoder also failed: %s", _e)
             else:
                 _enc_error = _e
-        if srt_path and os.path.exists(srt_path):
-            try: os.unlink(srt_path)
-            except OSError: pass
-            srt_path = None   # don't return stale path
         if _enc_error:
             raise _enc_error
+
+    # FIXED (issue 2): unconditional subtitle temp-file cleanup, split out of
+    # the encoder try/except above so it always executes — including when
+    # the render loop raised (BrokenPipeError -> RuntimeError) *and* the
+    # encoder close also raised. Without this separation, a broken pipe
+    # could leave the .srt tempfile behind indefinitely.
+    if srt_path and os.path.exists(srt_path):
+        try:
+            os.unlink(srt_path)
+        except OSError:
+            pass
 
     return {}
 
@@ -4104,11 +4263,28 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
             for det_frame in reader:
                 if fi >= total_frames: break
                 gray = cv2.cvtColor(det_frame, cv2.COLOR_BGR2GRAY)
-                is_cut, prev_hist, last_cut_frame = is_scene_change(
-                    prev_frame, det_frame, threshold=scene_cut_threshold,
-                    prev_hist=prev_hist, frame_count=fi, last_cut_frame=last_cut_frame,
-                    mode="sports" if tracking_mode == "sports_action" else "default")
-                if is_cut: scene_cuts.append(fi); prev_gray = prev_cx = prev_cy = None
+                # FIXED (issue 3): explicitly detect a det-frame shape change
+                # vs. the previous frame (possible with variable-resolution
+                # streams) and force a scene-cut reset. Previously this case
+                # only reached is_scene_change's internal shape guard, which
+                # returns is_cut=False on mismatch — i.e. cut detection was
+                # silently skipped for that frame instead of being treated
+                # as the safe default (a cut), so tracking state could carry
+                # over incorrectly across a resolution change.
+                if prev_frame is not None and prev_frame.shape != det_frame.shape:
+                    is_cut = True
+                    prev_hist = None
+                    logger.debug(
+                        "_tracking_pass: det-frame shape changed at %d (%s -> %s); "
+                        "forcing scene-cut reset", fi, prev_frame.shape, det_frame.shape)
+                else:
+                    is_cut, prev_hist, last_cut_frame = is_scene_change(
+                        prev_frame, det_frame, threshold=scene_cut_threshold,
+                        prev_hist=prev_hist, frame_count=fi, last_cut_frame=last_cut_frame,
+                        mode="sports" if tracking_mode == "sports_action" else "default")
+                if is_cut:
+                    last_cut_frame = fi
+                    scene_cuts.append(fi); prev_gray = prev_cx = prev_cy = None
                 cx = cy = None
                 if tracking_mode == "talking_head":
                     faces = detect_faces(det_frame)
@@ -4886,6 +5062,8 @@ def process_cinematic_video(
     sharpen_strength: Optional[float] = None,
     ffmpeg_sharpen: bool = False,
     cinematic_config: Optional[CinematicConfig] = None,
+    generate_thumbs: bool = True,
+    thumbnail_count: int = THUMBNAIL_MIN_COUNT,
     progress_callback=None,
 ) -> Dict[str, Any]:
     """
@@ -4938,6 +5116,10 @@ def process_cinematic_video(
         progress_callback=lambda v, m: _p(0.55 + v * 0.43, m),
     )
     res_mon.stop()
+    _p(0.98, "Generating thumbnails...")
+    thumbnail_jpegs: List[bytes] = []
+    if generate_thumbs:
+        thumbnail_jpegs = generate_thumbnails(output_path, n=thumbnail_count)
     _p(1.0, "Done!")
     analytics = _build_analytics(
         input_path, output_path, orig_w=orig_w, orig_h=orig_h,
@@ -4953,7 +5135,8 @@ def process_cinematic_video(
         "cinematic_actor_frames": int(mode_counts.get("cinematic_actor", 0)),
         "cinematic_saliency_frames": int(mode_counts.get("cinematic_saliency", 0)),
     })
-    return {"analytics": analytics, "subtitle_path": render_meta.get("subtitle_path")}
+    return {"analytics": analytics, "subtitle_path": render_meta.get("subtitle_path"),
+            "thumbnails": thumbnail_jpegs}
 
 # ── process_video — main public API ──────────────────────────────────────────
 def process_video(input_path: str, output_path: str,
@@ -4972,6 +5155,8 @@ def process_video(input_path: str, output_path: str,
                   sharpen_strength: float = 0.0, ffmpeg_sharpen: bool = False,
                   ken_burns: bool = False, use_kalman: bool = False,
                   panel_config: Optional[PanelModeConfig] = None,
+                  generate_thumbs: bool = True,
+                  thumbnail_count: int = THUMBNAIL_MIN_COUNT,
                   progress_callback=None) -> Dict[str, Any]:
     def _p(v, msg=""): progress_callback and progress_callback(v, msg)
     if tracking_mode in ("cinematic", "cinematic_mode"):
@@ -4995,6 +5180,8 @@ def process_video(input_path: str, output_path: str,
             vignette_strength=(vignette_strength if vignette_strength > 0 else None),
             sharpen_strength=(sharpen_strength if sharpen_strength > 0 else None),
             ffmpeg_sharpen=ffmpeg_sharpen,
+            generate_thumbs=generate_thumbs,
+            thumbnail_count=thumbnail_count,
             progress_callback=progress_callback,
         )
 
@@ -5048,13 +5235,18 @@ def process_video(input_path: str, output_path: str,
         panel_persons_map=persons_map,
         progress_callback=lambda v, m: _p(0.55+v*0.43, m))
     res_mon.stop()
+    _p(0.98, "Generating thumbnails...")
+    thumbnail_jpegs: List[bytes] = []
+    if generate_thumbs:
+        thumbnail_jpegs = generate_thumbnails(output_path, n=thumbnail_count)
     _p(1.0, "Done!")
     analytics = _build_analytics(
         input_path, output_path, orig_w=orig_w, orig_h=orig_h, out_w=out_w, out_h=out_h,
         smooth_metrics=smooth_metrics, panel_mode=use_panel_mode,
         kalman_predictions=smooth_metrics.get("kalman_prediction_frames", 0),
         resource_stats=res_mon.get_stats())
-    return {"analytics": analytics, "subtitle_path": render_meta.get("subtitle_path")}
+    return {"analytics": analytics, "subtitle_path": render_meta.get("subtitle_path"),
+            "thumbnails": thumbnail_jpegs}
 
 
 # ── process_sports_video — optimized sports pipeline ─────────────────────────
@@ -5078,6 +5270,8 @@ def process_sports_video(input_path: str, output_path: str,
                          draw_tracking_boxes: bool = True,
                          overlay_config: Optional[OverlayConfig] = None,
                          min_ball_confidence: float = SPORTS_BALL_CONFIDENCE,
+                         generate_thumbs: bool = True,
+                         thumbnail_count: int = THUMBNAIL_MIN_COUNT,
                          progress_callback=None) -> Dict[str, Any]:
     def _p(v, msg=""): progress_callback and progress_callback(v, msg)
 
@@ -5141,12 +5335,17 @@ def process_sports_video(input_path: str, output_path: str,
         progress_callback=lambda v, m: _p(0.55+v*0.43, m),
     )
     res_mon.stop()
+    _p(0.98, "Generating thumbnails...")
+    thumbnail_jpegs: List[bytes] = []
+    if generate_thumbs:
+        thumbnail_jpegs = generate_thumbnails(output_path, n=thumbnail_count)
     _p(1.0, "Done!")
     analytics = _build_analytics(
         input_path, output_path, orig_w=orig_w, orig_h=orig_h,
         out_w=out_w, out_h=out_h, smooth_metrics=final_smooth_metrics,
         panel_mode=False, resource_stats=res_mon.get_stats())
-    return {"analytics": analytics, "subtitle_path": render_meta.get("subtitle_path")}
+    return {"analytics": analytics, "subtitle_path": render_meta.get("subtitle_path"),
+            "thumbnails": thumbnail_jpegs}
 
 
 # ── process_clips_batch ───────────────────────────────────────────────────────
@@ -5171,6 +5370,8 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
                         draw_tracking_boxes: bool = True,
                         overlay_config: Optional[OverlayConfig] = None,
                         min_ball_confidence: float = SPORTS_BALL_CONFIDENCE,
+                        generate_thumbs: bool = True,
+                        thumbnail_count: int = THUMBNAIL_MIN_COUNT,
                         progress_callback=None) -> List[Dict[str, Any]]:
     def _p(v, msg=""): progress_callback and progress_callback(v, msg)
     os.makedirs(output_dir, exist_ok=True)
@@ -5184,7 +5385,7 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
                          crf=crf, preset=encoder_preset)
         if not ok:
             results.append({"clip": clip, "output_path": None,
-                            "error": "Trim failed", "analytics": {}})
+                            "error": "Trim failed", "analytics": {}, "thumbnail_paths": []})
             if os.path.exists(trim_path):
                 try: os.unlink(trim_path)
                 except OSError: pass
@@ -5198,11 +5399,18 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
                     output_fps=output_fps, crf=crf, encoder_preset=encoder_preset,
                     audio_bitrate=audio_bitrate, yolo_weights=yolo_weights,
                     burn_subtitles=burn_subtitles, whisper_model=whisper_model,
+                    # FIXED (issue 4): forward whisper_language here too — it was
+                    # already accepted as a process_clips_batch parameter but never
+                    # passed through to process_sports_video, so per-clip subtitle
+                    # transcription always fell back to auto-detect regardless of
+                    # the user's selection.
+                    whisper_language=whisper_language,
                     subtitle_style_name=subtitle_style_name,
                     subtitle_max_chars=subtitle_max_chars,
                     draw_tracking_boxes=draw_tracking_boxes, overlay_config=overlay_config,
                     min_ball_confidence=min_ball_confidence,
-                    progress_callback=lambda v, m: _cp(0.05+v*0.90, m))
+                    generate_thumbs=False,  # thumbnails generated once below for both branches
+                    progress_callback=lambda v, m: _cp(0.05+v*0.85, m))
             else:
                 meta = process_video(
                     trim_path, out_path, target_preset_label=target_preset_label,
@@ -5213,15 +5421,31 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
                     output_fps=output_fps, crf=crf, encoder_preset=encoder_preset,
                     audio_bitrate=audio_bitrate, yolo_weights=yolo_weights,
                     burn_subtitles=burn_subtitles, whisper_model=whisper_model,
+                    # FIXED (issue 4): whisper_language was accepted by this
+                    # function's signature but silently dropped here — the
+                    # non-sports branch always called process_video without it,
+                    # forcing Whisper's language auto-detection even when the
+                    # user had explicitly picked a language in the UI.
+                    whisper_language=whisper_language,
                     subtitle_style_name=subtitle_style_name,
                     subtitle_max_chars=subtitle_max_chars, panel_config=panel_config,
-                    progress_callback=lambda v, m: _cp(0.05+v*0.90, m))
+                    generate_thumbs=False,  # thumbnails generated once below for both branches
+                    progress_callback=lambda v, m: _cp(0.05+v*0.85, m))
+            # NEW: thumbnail generation for every vertical clip (minimum 3 each),
+            # generated once here (rather than inside process_video/
+            # process_sports_video) so batch mode doesn't do redundant work and
+            # so thumbnails are always based on the final on-disk clip file.
+            _cp(0.92, f"Clip {i+1}/{n}: generating thumbnails...")
+            thumb_paths = save_clip_thumbnails(
+                out_path, output_dir, prefix=f"clip_{i+1:03d}",
+                n=max(THUMBNAIL_MIN_COUNT, thumbnail_count)) if generate_thumbs else []
             results.append({"clip": clip, "output_path": out_path,
-                            "analytics": meta.get("analytics", {})})
+                            "analytics": meta.get("analytics", {}),
+                            "thumbnail_paths": thumb_paths})
         except Exception as e:
             logger.error("[batch] Clip %d error: %s", i+1, e)
             results.append({"clip": clip, "output_path": None,
-                            "error": str(e), "analytics": {}})
+                            "error": str(e), "analytics": {}, "thumbnail_paths": []})
         finally:
             if os.path.exists(trim_path):
                 try: os.unlink(trim_path)
