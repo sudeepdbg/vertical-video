@@ -1753,20 +1753,71 @@ def extract_thumbnail(path: str, t: float = 1.0) -> Optional[bytes]:
     return buf.tobytes() if ok else None
 
 
-# ── Thumbnail generation (NEW) ────────────────────────────────────────────────
+# ── Thumbnail generation ───────────────────────────────────────────────────────
+THUMBNAIL_CANDIDATES_PER_SLOT = 4     # frames sampled per time-segment before picking the best
+THUMBNAIL_MIN_BRIGHTNESS      = 12.0  # mean gray below this ≈ near-black frame
+THUMBNAIL_MAX_BRIGHTNESS      = 244.0 # mean gray above this ≈ blown-out/white frame
+
+def _thumbnail_frame_score(frame: np.ndarray) -> float:
+    """
+    Cheap single-frame quality score used to pick the best candidate within
+    a time segment (see generate_thumbnails). Higher is better.
+
+    Combines:
+      - sharpness: Laplacian variance (penalizes motion blur / whip-pans /
+        cross-dissolve frames, which look "smeared")
+      - exposure sanity: heavily penalizes near-black or blown-out frames
+        (scene-cut boundaries, fades, flash frames)
+      - saturation: mildly rewards more colorful/lively frames over flat,
+        washed-out ones — same signal _frame_saliency_score uses elsewhere
+    This intentionally does NOT run face/person detection — thumbnailing
+    should stay lightweight (no YOLO/Haar dependency) since it can run on
+    every clip in a batch.
+    """
+    if frame is None or frame.size == 0:
+        return -1e9
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    brightness = float(gray.mean())
+    if brightness < THUMBNAIL_MIN_BRIGHTNESS or brightness > THUMBNAIL_MAX_BRIGHTNESS:
+        # Near-black or blown-out frame (scene-cut boundary, fade, flash) —
+        # essentially disqualify it rather than let it "win" a segment just
+        # because nothing else was sampled there.
+        return -1e6
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    sharpness_score = min(sharpness / 300.0, 1.0)
+    sat = float(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:, :, 1].mean())
+    sat_score = min(sat / 140.0, 1.0)
+    # Mild penalty for being close to the brightness clamps, even if inside
+    # them — a slightly-dark frame is still preferable to a near-black one.
+    mid = (THUMBNAIL_MIN_BRIGHTNESS + THUMBNAIL_MAX_BRIGHTNESS) / 2.0
+    span = (THUMBNAIL_MAX_BRIGHTNESS - THUMBNAIL_MIN_BRIGHTNESS) / 2.0
+    exposure_score = 1.0 - min(abs(brightness - mid) / span, 1.0) * 0.3
+    return sharpness_score * 0.55 + sat_score * 0.20 + exposure_score * 0.25
+
+
 def generate_thumbnails(path: str, n: int = THUMBNAIL_MIN_COUNT,
                         width: int = THUMBNAIL_WIDTH,
-                        quality: int = THUMBNAIL_JPEG_QUALITY) -> List[bytes]:
+                        quality: int = THUMBNAIL_JPEG_QUALITY,
+                        candidates_per_slot: int = THUMBNAIL_CANDIDATES_PER_SLOT) -> List[bytes]:
     """
-    Extract `n` (minimum 3) evenly-spaced JPEG thumbnails from a video file.
+    Extract `n` (minimum 3) JPEG thumbnails from a video file, chosen for
+    visual quality rather than pure time-uniformity.
 
-    Timestamps are spread across the [5%, 95%] range of the clip's duration
-    so that thumbnails avoid black frames / fades right at the very start
-    or end. Falls back gracefully (returns fewer than `n` frames, never
-    raises) if some timestamps can't be decoded — e.g. a truncated or
+    Approach: divide the [5%, 95%] duration range into `n` equal time
+    segments (this guarantees the thumbnails stay spread across the whole
+    clip — no clustering), then within each segment sample
+    `candidates_per_slot` frames and keep whichever scores best on
+    _thumbnail_frame_score (sharpness + exposure sanity + saturation).
+    This avoids landing on blurry whip-pans, cross-dissolve frames, or
+    near-black scene-cut frames, which is what pure `np.linspace` timestamp
+    sampling was prone to.
+
+    Falls back gracefully (returns fewer than `n` frames, never raises) if
+    some segments can't be decoded at all — e.g. a truncated or
     zero-duration render.
     """
     n = max(THUMBNAIL_MIN_COUNT, int(n))
+    candidates_per_slot = max(1, int(candidates_per_slot))
     try:
         info = get_video_info(path)
     except Exception as exc:
@@ -1785,22 +1836,40 @@ def generate_thumbnails(path: str, n: int = THUMBNAIL_MIN_COUNT,
     out_h = out_h - (out_h % 2) or 2
 
     if duration <= 1.0:
-        # Very short clip — spread thumbnails across whatever we have,
-        # including the very first frame if necessary.
-        ts_list = list(np.linspace(0.0, max(duration - 0.05, 0.0), n))
+        # Very short clip — not enough range to meaningfully segment;
+        # fall back to simple uniform sampling of whatever we have.
+        seg_bounds = list(np.linspace(0.0, max(duration - 0.05, 0.0), n + 1))
     else:
         lo = duration * 0.05
         hi = duration * 0.95
-        ts_list = list(np.linspace(lo, hi, n))
+        seg_bounds = list(np.linspace(lo, hi, n + 1))
 
     thumbs: List[bytes] = []
-    for t in ts_list:
-        frame = _read_frame_at(path, orig_w, orig_h, float(t), scale_w=out_w, scale_h=out_h)
-        if frame is None:
-            continue
-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        if ok:
-            thumbs.append(buf.tobytes())
+    for i in range(n):
+        seg_lo, seg_hi = seg_bounds[i], seg_bounds[i + 1]
+        if seg_hi <= seg_lo:
+            candidate_ts = [seg_lo]
+        else:
+            # Sample candidates_per_slot points inside this segment, nudged
+            # in from the very edges so we don't repeatedly hit a shared
+            # boundary frame between adjacent segments.
+            pad = (seg_hi - seg_lo) * 0.1
+            candidate_ts = list(np.linspace(seg_lo + pad, seg_hi - pad, candidates_per_slot))
+
+        best_buf: Optional[bytes] = None
+        best_score = -1e18
+        for t in candidate_ts:
+            frame = _read_frame_at(path, orig_w, orig_h, float(t), scale_w=out_w, scale_h=out_h)
+            if frame is None:
+                continue
+            score = _thumbnail_frame_score(frame)
+            if score > best_score:
+                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                if ok:
+                    best_score = score
+                    best_buf = buf.tobytes()
+        if best_buf is not None:
+            thumbs.append(best_buf)
 
     if len(thumbs) < n:
         logger.warning("generate_thumbnails: only extracted %d/%d thumbnails for %s",
@@ -1811,7 +1880,8 @@ def generate_thumbnails(path: str, n: int = THUMBNAIL_MIN_COUNT,
 def save_clip_thumbnails(video_path: str, output_dir: str, prefix: str,
                          n: int = THUMBNAIL_MIN_COUNT,
                          width: int = THUMBNAIL_WIDTH,
-                         quality: int = THUMBNAIL_JPEG_QUALITY) -> List[str]:
+                         quality: int = THUMBNAIL_JPEG_QUALITY,
+                         candidates_per_slot: int = THUMBNAIL_CANDIDATES_PER_SLOT) -> List[str]:
     """
     Generate thumbnails for `video_path` and persist them to `output_dir`
     as `{prefix}_thumb_{i}.jpg`. Returns the list of written file paths
@@ -1819,7 +1889,8 @@ def save_clip_thumbnails(video_path: str, output_dir: str, prefix: str,
     generate_thumbnails).
     """
     os.makedirs(output_dir, exist_ok=True)
-    thumbs = generate_thumbnails(video_path, n=n, width=width, quality=quality)
+    thumbs = generate_thumbnails(video_path, n=n, width=width, quality=quality,
+                                 candidates_per_slot=candidates_per_slot)
     paths: List[str] = []
     for i, data in enumerate(thumbs):
         p = os.path.join(output_dir, f"{prefix}_thumb_{i+1}.jpg")
@@ -3160,7 +3231,11 @@ class LayoutTransitionManager:
     """
 
     def __init__(self, stability_frames: int = 15,
-                 transition_frames: int = 6,
+                 # FIXED: reference the module-level PANEL_TRANSITION_FRAMES
+                 # constant instead of a separately-hardcoded literal, so
+                 # tuning that constant actually changes behavior here
+                 # instead of silently doing nothing.
+                 transition_frames: int = PANEL_TRANSITION_FRAMES,
                  holdover_frames: int = 8) -> None:
         self.stability_frames = stability_frames
         self.transition_frames = transition_frames
@@ -3337,10 +3412,18 @@ def _render_panel_frame(frame: np.ndarray, persons: List[Tuple], out_w: int, out
     """
     Render panel frame with intelligent grid layouts and smooth transitions.
     - 1 person:  full frame solo
-    - 2 people:  top/bottom 50-50 split
-    - 3 people:  top 40% + bottom 60% split (1 top, 2 bottom)
-    - 4 people:  2x2 grid
+    - 2 people:  top/bottom 50-50 split (or left/right when
+                 panel_config.split_orientation == "vertical")
+    - 3 people:  1 person + 2 side-by-side in the remaining 60% (or the
+                 90°-rotated equivalent when split_orientation == "vertical")
+    - 4 people:  2x2 grid (orientation-independent — already split on both axes)
     Transitions smoothly between layouts using LayoutTransitionManager.
+
+    FIXED: split_orientation="vertical" used to be accepted and validated by
+    PanelModeConfig but silently ignored here — every layout was hardcoded
+    top/bottom regardless of the config. It's now respected for the 2- and
+    3-person layouts (the only ones where "horizontal" vs "vertical" split
+    is a meaningful choice).
     """
     cfg = panel_config or PanelModeConfig()
     persons = sorted(persons, key=lambda b: (b[0]+b[2])//2)
@@ -3402,6 +3485,18 @@ def _render_panel_frame(frame: np.ndarray, persons: List[Tuple], out_w: int, out
 
     # Use layout_count (from transition manager) not n_active for grid selection
     effective_count = layout_count if layout_manager else n_active
+    # FIXED: PanelModeConfig.n_splits was validated/clamped in __post_init__
+    # but never actually consumed by any renderer — a dead config field.
+    # When panel mode is explicitly forced on, honor n_splits as the number
+    # of slots to render regardless of how many persons detection found this
+    # frame (e.g. force a steady 2-way split even on frames where detection
+    # only picked up 1 or 3 people). In "auto" mode we keep deriving the
+    # count from actual detections, since that's the whole point of auto.
+    if cfg.split_mode == "force_on" and cfg.n_splits:
+        effective_count = max(1, min(int(cfg.n_splits), cfg.max_slots))
+
+    # FIXED: split_orientation is now actually read (see docstring above).
+    vertical = (cfg.split_orientation == "vertical")
 
     if effective_count <= 1:
         # Solo: full frame
@@ -3409,36 +3504,65 @@ def _render_panel_frame(frame: np.ndarray, persons: List[Tuple], out_w: int, out
         canvas[:, :] = _crop_person(g, out_w, out_h, face_idx=0)
 
     elif effective_count == 2:
-        # 2 people: top/bottom 50-50 split
-        h_top = out_h // 2
-        h_bot = out_h - h_top
         g0 = groups[0] if len(groups) > 0 and groups[0] else []
         g1 = groups[1] if len(groups) > 1 and groups[1] else g0
-        canvas[0:h_top, :] = _crop_person(g0, out_w, h_top, face_idx=0)
-        canvas[h_top:out_h, :] = _crop_person(g1, out_w, h_bot, face_idx=1)
-        d1 = max(0, h_top - div // 2)
-        d2 = min(out_h, h_top + (div + 1) // 2)
-        canvas[d1:d2, :] = div_color
+        if vertical:
+            # 2 people: left/right 50-50 split
+            w_left = out_w // 2
+            w_right = out_w - w_left
+            canvas[:, 0:w_left] = _crop_person(g0, w_left, out_h, face_idx=0)
+            canvas[:, w_left:out_w] = _crop_person(g1, w_right, out_h, face_idx=1)
+            d1 = max(0, w_left - div // 2)
+            d2 = min(out_w, w_left + (div + 1) // 2)
+            canvas[:, d1:d2] = div_color
+        else:
+            # 2 people: top/bottom 50-50 split
+            h_top = out_h // 2
+            h_bot = out_h - h_top
+            canvas[0:h_top, :] = _crop_person(g0, out_w, h_top, face_idx=0)
+            canvas[h_top:out_h, :] = _crop_person(g1, out_w, h_bot, face_idx=1)
+            d1 = max(0, h_top - div // 2)
+            d2 = min(out_h, h_top + (div + 1) // 2)
+            canvas[d1:d2, :] = div_color
 
     elif effective_count == 3:
-        # 3 people: top = 1 person (40%), bottom = 2 side-by-side (60%)
-        h_top = int(out_h * 0.40)
-        h_bot = out_h - h_top
-        w_half = out_w // 2
         g0 = groups[0] if len(groups) > 0 and groups[0] else []
         g1 = groups[1] if len(groups) > 1 and groups[1] else g0
         g2 = groups[2] if len(groups) > 2 and groups[2] else g1
-        canvas[0:h_top, :] = _crop_person(g0, out_w, h_top, face_idx=0)
-        canvas[h_top:out_h, 0:w_half] = _crop_person(g1, w_half, h_bot, face_idx=1)
-        canvas[h_top:out_h, w_half:out_w] = _crop_person(g2, out_w - w_half, h_bot, face_idx=2)
-        # Horizontal divider
-        d1 = max(0, h_top - div // 2)
-        d2 = min(out_h, h_top + (div + 1) // 2)
-        canvas[d1:d2, :] = div_color
-        # Vertical divider in bottom half
-        vd1 = max(0, w_half - div // 2)
-        vd2 = min(out_w, w_half + (div + 1) // 2)
-        canvas[h_top:out_h, vd1:vd2] = div_color
+        if vertical:
+            # 3 people: left = 1 person (40% width), right = 2 stacked
+            # top/bottom (60% width) — the 90°-rotated equivalent of the
+            # horizontal layout below.
+            w_left = int(out_w * 0.40)
+            w_right = out_w - w_left
+            h_half = out_h // 2
+            canvas[:, 0:w_left] = _crop_person(g0, w_left, out_h, face_idx=0)
+            canvas[0:h_half, w_left:out_w] = _crop_person(g1, w_right, h_half, face_idx=1)
+            canvas[h_half:out_h, w_left:out_w] = _crop_person(g2, w_right, out_h - h_half, face_idx=2)
+            # Vertical divider between left solo and right stack
+            d1 = max(0, w_left - div // 2)
+            d2 = min(out_w, w_left + (div + 1) // 2)
+            canvas[:, d1:d2] = div_color
+            # Horizontal divider within the right stack
+            hd1 = max(0, h_half - div // 2)
+            hd2 = min(out_h, h_half + (div + 1) // 2)
+            canvas[hd1:hd2, w_left:out_w] = div_color
+        else:
+            # 3 people: top = 1 person (40%), bottom = 2 side-by-side (60%)
+            h_top = int(out_h * 0.40)
+            h_bot = out_h - h_top
+            w_half = out_w // 2
+            canvas[0:h_top, :] = _crop_person(g0, out_w, h_top, face_idx=0)
+            canvas[h_top:out_h, 0:w_half] = _crop_person(g1, w_half, h_bot, face_idx=1)
+            canvas[h_top:out_h, w_half:out_w] = _crop_person(g2, out_w - w_half, h_bot, face_idx=2)
+            # Horizontal divider
+            d1 = max(0, h_top - div // 2)
+            d2 = min(out_h, h_top + (div + 1) // 2)
+            canvas[d1:d2, :] = div_color
+            # Vertical divider in bottom half
+            vd1 = max(0, w_half - div // 2)
+            vd2 = min(out_w, w_half + (div + 1) // 2)
+            canvas[h_top:out_h, vd1:vd2] = div_color
 
     else:
         # 4+ people: 2x2 grid
@@ -3661,6 +3785,25 @@ def _compute_final_smoothness(raw_centers: List[Tuple],
 
 
 # ── Whisper / translate ───────────────────────────────────────────────────────
+# FIXED: Whisper models were being reloaded from disk on every single call to
+# transcribe_to_srt (`_w.load_model(whisper_model)`), unlike YOLO which is
+# cached module-wide in `_model_cache`. In process_clips_batch, a batch of N
+# subtitled clips reloaded the Whisper model N times — a real, avoidable cost
+# (Whisper's "base"/"small"/"medium" checkpoints are tens to hundreds of MB).
+# Cache loaded models by name, same pattern as `_get_model` for YOLO.
+_whisper_model_cache: Dict[str, Any] = {}
+
+def _get_whisper_model(model_name: str) -> Any:
+    """Load (and cache) a Whisper model by name so repeated calls — e.g.
+    across every clip in a batch — reuse the same in-memory model instead
+    of reloading it from disk each time."""
+    if model_name not in _whisper_model_cache:
+        import whisper as _w
+        logger.info("Loading Whisper model '%s' (will be cached for reuse)", model_name)
+        _whisper_model_cache[model_name] = _w.load_model(model_name)
+    return _whisper_model_cache[model_name]
+
+
 def _seconds_to_srt_time(s: float) -> str:
     h  = int(s // 3600); m = int((s % 3600) // 60)
     sc = int(s % 60);    ms = int((s - int(s)) * 1000)
@@ -3671,13 +3814,15 @@ def transcribe_to_srt(video_path: str, srt_path: str, whisper_model: str = "base
                       progress_callback=None) -> bool:
     def _p(v, msg=""): progress_callback and progress_callback(v, msg)
     if not whisper_available(): return False
-    import whisper as _w
     _p(0.0, "Extracting audio...")
     fd, wav_path = tempfile.mkstemp(suffix=".wav"); os.close(fd)
     try:
         if not _extract_audio_wav(video_path, wav_path): return False
         _p(0.2, f"Transcribing ({whisper_model})...")
-        mdl    = _w.load_model(whisper_model)
+        # FIXED: use the cached loader instead of _w.load_model(...) directly
+        # so repeated calls (e.g. one per clip in a batch) reuse the same
+        # in-memory model rather than reloading it from disk every time.
+        mdl    = _get_whisper_model(whisper_model)
         opts: Dict[str, Any] = {"word_timestamps": True, "verbose": False}
         if language: opts["language"] = language
         result = mdl.transcribe(wav_path, **opts)
@@ -4257,7 +4402,6 @@ def _tracking_pass(input_path: str, orig_w: int, orig_h: int, crop_w: int, crop_
     det_scale = min(1.0, 960/orig_w)
     det_w = max(1, int(orig_w*det_scale)); det_h = max(1, int(orig_h*det_scale))
     fi = 0
-    yolo_failures = 0
     try:
         with FFmpegVideoReader(input_path, orig_w, orig_h, scale_w=det_w, scale_h=det_h) as reader:
             for det_frame in reader:
