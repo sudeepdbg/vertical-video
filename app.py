@@ -2,6 +2,8 @@
 app.py — Reframe · AI Vertical Video Studio
 Mobile-first · Light theme · Single Clip + Auto-Clip modes
 
+v5.2: Added thumbnail generation/display for every vertical clip
+      (single-clip mode and Auto-Clip mode), minimum 3 thumbnails per clip.
 v5.1: Added Cinematic Mode for actor/dialogue-first reframing.
 v5.0: Enhanced panel mode with N-person support, speaker focus,
 head normalization, lower-third awareness, and portrait extraction.
@@ -14,7 +16,7 @@ from verticalize import (
     process_video, process_sports_video, process_cinematic_video, get_video_info, detect_clips, process_clips_batch,
     RESOLUTION_PRESETS, SUBTITLE_STYLES, TRANSLATION_LANGUAGES,
     resolve_target_size, whisper_available, translation_available,
-    PanelModeConfig,
+    PanelModeConfig, THUMBNAIL_MIN_COUNT,
 )
 
 st.set_page_config(page_title="Reframe", page_icon="📱", layout="wide",
@@ -93,6 +95,9 @@ html,body,[class*="css"]{font-family:'DM Sans',sans-serif!important;background:v
 [data-testid="stRadio"] label{font-size:12px!important;color:var(--ink2)!important}[data-testid="stRadio"] [data-testid="stMarkdownContainer"] p{font-size:12px!important}[data-testid="stRadio"] > div{gap:6px!important}
 .rf-vplayer{width:202px;flex-shrink:0}.rf-vplayer [data-testid="stVideo"]{border-radius:10px!important;overflow:hidden!important;height:360px!important}
 .rf-vplayer video{width:202px!important;height:360px!important;object-fit:cover!important;border-radius:10px!important;display:block!important}
+.rf-thumb-strip{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+.rf-thumb-strip img{border-radius:6px;border:1px solid var(--bdr);width:72px;height:auto;object-fit:cover}
+.rf-thumb-label{font-size:9px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--ink3);margin-top:10px;margin-bottom:4px}
 </style>
 """, unsafe_allow_html=True)
 
@@ -110,6 +115,7 @@ _DEFAULTS = dict(
     panel_layout_mode="equal", panel_speaker_focus_ratio=0.60,
     panel_head_normalize=False, panel_lower_third_aware=False,
     panel_portrait_mode=False, panel_max_slots=4,
+    output_thumbnails=None,
 )
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -130,7 +136,7 @@ def _cleanup():
         srt_bytes=None, video_info=None, processing_done=False,
         detected_clips=None, selected_clip_indices=None,
         clip_results=None, scan_done=False, clip_out_dir=None,
-        playing_clip_idx=-1, analytics_data=None)
+        playing_clip_idx=-1, analytics_data=None, output_thumbnails=None)
 
 def _new_out():
     fd, p = tempfile.mkstemp(suffix=".mp4"); os.close(fd); os.unlink(p)
@@ -142,6 +148,7 @@ def _invalidate_if_changed(cur):
         st.session_state.output_bytes = None
         st.session_state.srt_bytes = None
         st.session_state.analytics_data = None
+        st.session_state.output_thumbnails = None
 
 _whisper_ok = whisper_available()
 _translate_ok = translation_available()
@@ -483,6 +490,12 @@ with col_out:
             out_mb = len(st.session_state.output_bytes)/(1024**2)
             st.markdown(f'<div class="rf-ok">✓ Done — {out_mb:.1f} MB</div>', unsafe_allow_html=True)
             st.video(st.session_state.output_bytes, format="video/mp4")
+            if st.session_state.get("output_thumbnails"):
+                st.markdown('<div class="rf-thumb-label">Thumbnails</div>', unsafe_allow_html=True)
+                thumb_cols = st.columns(len(st.session_state.output_thumbnails))
+                for tcol, tdata in zip(thumb_cols, st.session_state.output_thumbnails):
+                    with tcol:
+                        st.image(tdata, use_container_width=True)
             if st.session_state.analytics_data:
                 a = st.session_state.analytics_data
                 if a.get("panel_mode"): st.markdown('<div class="rf-ok">🎛 Panel mode active</div>', unsafe_allow_html=True)
@@ -535,6 +548,14 @@ with col_out:
                 dt = "<div style='margin-top:5px;font-size:10px;color:var(--grn);font-weight:700;'>✓ Converted</div>" if is_d else ""
                 st.markdown(f'<div class="{cc}"><span class="rf-cscore {sc2}">{sp2}%</span><div class="rf-ctitle">Clip {ci+1}</div><div class="rf-cmeta">{ts}</div><span class="rf-cdur">{clip.duration:.0f}s</span><span class="rf-csoi">SOI: {clip.soi_region}</span>{dt}</div>', unsafe_allow_html=True)
                 if is_d:
+                    # Show thumbnail strip (min 3) for this converted clip, if available
+                    thumb_paths = rfc.get("thumbnail_paths") or []
+                    existing_thumbs = [p for p in thumb_paths if p and os.path.exists(p)]
+                    if existing_thumbs:
+                        tcols = st.columns(len(existing_thumbs))
+                        for tcol, tpath in zip(tcols, existing_thumbs):
+                            with tcol:
+                                st.image(tpath, use_container_width=True)
                     bc, dc = st.columns([1,1])
                     with bc:
                         if st.button("⏹ Close" if is_p else "▶ Play 9:16", key=f"play_{ci}", type="secondary", use_container_width=True):
@@ -631,6 +652,10 @@ if uploaded_file is not None and st.session_state.input_path:
                     if os.path.exists(out_p) and os.path.getsize(out_p) > 0:
                         with open(out_p,"rb") as f: st.session_state.output_bytes = f.read()
                         if "analytics" in meta: st.session_state.analytics_data = meta["analytics"]
+                        # Thumbnails: process_video/process_sports_video/process_cinematic_video
+                        # all now return a "thumbnails" list of JPEG bytes (min 3) generated
+                        # from the finished output clip.
+                        st.session_state.output_thumbnails = meta.get("thumbnails") or None
                         srt_p = meta.get("subtitle_path")
                         if srt_p and os.path.exists(srt_p):
                             with open(srt_p,"rb") as f: st.session_state.srt_bytes = f.read()
@@ -701,7 +726,8 @@ if uploaded_file is not None and st.session_state.input_path:
                             subtitle_style_name=subtitle_style_name, subtitle_max_chars=subtitle_max_chars,
                             subtitle_translate_to=subtitle_translate_to,
                             sport_type=st.session_state.get("sport_type","auto"),
-                            panel_config=_build_panel_config(), progress_callback=_bcb)
+                            panel_config=_build_panel_config(),
+                            thumbnail_count=THUMBNAIL_MIN_COUNT, progress_callback=_bcb)
                         prog.progress(1.0); st.session_state.clip_results=results
                         nk = sum(1 for r in results if not r.get("error"))
                         status.success(f"✅ {nk}/{len(results)} clips converted!"); st.rerun()
