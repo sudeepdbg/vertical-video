@@ -2679,14 +2679,38 @@ def temporal_saliency_center(frame: np.ndarray,
     lap  = cv2.GaussianBlur(np.abs(cv2.Laplacian(gray, cv2.CV_64F)).astype(np.float32), (31, 31), 0)
     sat  = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:,:,1].astype(np.float32), (31, 31), 0)
     sal  = lap / (lap.max() + 1e-6) + sat / (sat.max() + 1e-6)
-    if prev_saliency is not None and prev_saliency.shape == sal.shape:
-        sal = sal * (1.0 + np.abs(sal - prev_saliency * decay)**2.0)
+    # FIXED: this temporal feedback term was unbounded — every frame
+    # multiplied `sal` by (1 + diff**2) with no ceiling and fed the result
+    # back in as `prev_saliency` for the next frame. Across a long clip
+    # this compounds frame-over-frame until float32 overflows to inf
+    # ("overflow encountered in power/multiply"), and once inf appears,
+    # inf-inf / inf*0 produces NaN. That NaN then survived the `t < 1e-6`
+    # guard below (NaN < anything is always False in Python/NumPy — the
+    # guard silently failed to catch it) and blew up at `int(.../t)` with
+    # "cannot convert float NaN to integer". Clip the amplification input
+    # to a sane ceiling so it can still boost genuinely-changing regions
+    # without runaway growth, and refuse to propagate a non-finite map
+    # forward as feedback in the first place.
+    if (prev_saliency is not None and prev_saliency.shape == sal.shape
+            and np.all(np.isfinite(prev_saliency))):
+        diff_term = np.clip(np.abs(sal - prev_saliency * decay), 0.0, 10.0)
+        sal = sal * (1.0 + diff_term ** 2.0)
+    # Defensive: sanitize regardless of cause, so the int() casts below can
+    # never see NaN/inf even if something upstream still slips through.
+    sal = np.nan_to_num(sal, nan=0.0, posinf=0.0, neginf=0.0)
     b = max(1, int(w * 0.05))
     sal[:, :b] = sal[:, w-b:] = sal[:b, :] = sal[h-b:, :] = 0
     t = sal.sum()
-    if t < 1e-6: return w//2, h//2, sal
+    # FIXED: `t < 1e-6` alone does not catch NaN (NaN comparisons are always
+    # False) — explicitly check finiteness first.
+    if not np.isfinite(t) or t < 1e-6:
+        return w//2, h//2, sal
     ys, xs = np.mgrid[0:h, 0:w]
-    return int((xs * sal).sum() / t), int((ys * sal).sum() / t), sal
+    cx = (xs * sal).sum() / t
+    cy = (ys * sal).sum() / t
+    if not np.isfinite(cx) or not np.isfinite(cy):
+        return w//2, h//2, sal
+    return int(cx), int(cy), sal
 
 
 # ── Scene change detection ────────────────────────────────────────────────────
