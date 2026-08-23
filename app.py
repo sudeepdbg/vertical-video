@@ -11,7 +11,9 @@ head normalization, lower-third awareness, and portrait extraction.
 import streamlit as st
 import tempfile
 import os
+import io
 import shutil
+import zipfile
 from verticalize import (
     process_video, process_sports_video, process_cinematic_video, get_video_info, detect_clips, process_clips_batch,
     RESOLUTION_PRESETS, SUBTITLE_STYLES, TRANSLATION_LANGUAGES,
@@ -121,6 +123,17 @@ for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
+def _zip_bytes(items):
+    """Bundle a list of (filename, bytes) pairs into an in-memory ZIP.
+    Used to give a single "download all thumbnails" button alongside the
+    individual per-thumbnail download buttons."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fname, data in items:
+            zf.writestr(fname, data)
+    buf.seek(0)
+    return buf.getvalue()
+
 def _cleanup():
     for key in ("input_path", "output_path"):
         p = st.session_state.get(key)
@@ -167,10 +180,10 @@ st.markdown("<div style='padding:0 20px'>", unsafe_allow_html=True)
 st.markdown('<div class="rf-sec">Mode</div>', unsafe_allow_html=True)
 mc1, mc2 = st.columns(2, gap="small")
 with mc1:
-    if st.button("📱  Single Clip", type="secondary", use_container_width=True):
+    if st.button("📱  Single Clip", type="secondary", width="stretch"):
         st.session_state.app_mode = "single"
 with mc2:
-    if st.button("🎬  Auto-Clip  ✦", type="secondary", use_container_width=True):
+    if st.button("🎬  Auto-Clip  ✦", type="secondary", width="stretch"):
         st.session_state.app_mode = "autoClip"
 app_mode = st.session_state.app_mode
 if app_mode == "single":
@@ -193,16 +206,16 @@ st.markdown("<div style='padding:0 20px'>", unsafe_allow_html=True)
 st.markdown('<div class="rf-sec">Tracking Mode</div>', unsafe_allow_html=True)
 tm1, tm2, tm3 = st.columns(3, gap="small")
 with tm1:
-    if st.button("🎯  Subject", type="secondary", use_container_width=True):
+    if st.button("🎯  Subject", type="secondary", width="stretch"):
         st.session_state.tracking_mode = "subject"
 with tm2:
-    if st.button("👤  Talking Head", type="secondary", use_container_width=True):
+    if st.button("👤  Talking Head", type="secondary", width="stretch"):
         st.session_state.tracking_mode = "talking_head"
 with tm3:
-    if st.button("🎬  Cinematic ✦", type="secondary", use_container_width=True):
+    if st.button("🎬  Cinematic ✦", type="secondary", width="stretch"):
         st.session_state.tracking_mode = "cinematic"
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-if st.button("🏀  Sports Action  ✦  Ball-aware · Kalman", type="secondary", use_container_width=True):
+if st.button("🏀  Sports Action  ✦  Ball-aware · Kalman", type="secondary", width="stretch"):
     st.session_state.tracking_mode = "sports_action"
 
 tracking_mode = st.session_state.tracking_mode
@@ -488,14 +501,22 @@ with col_out:
         st.markdown('<div class="rf-sec">Output · 9:16</div>', unsafe_allow_html=True)
         if st.session_state.processing_done and st.session_state.output_bytes:
             out_mb = len(st.session_state.output_bytes)/(1024**2)
+            stem = os.path.splitext(st.session_state.uploaded_file_name or "video")[0]
             st.markdown(f'<div class="rf-ok">✓ Done — {out_mb:.1f} MB</div>', unsafe_allow_html=True)
             st.video(st.session_state.output_bytes, format="video/mp4")
             if st.session_state.get("output_thumbnails"):
+                thumbs = st.session_state.output_thumbnails
                 st.markdown('<div class="rf-thumb-label">Thumbnails</div>', unsafe_allow_html=True)
-                thumb_cols = st.columns(len(st.session_state.output_thumbnails))
-                for tcol, tdata in zip(thumb_cols, st.session_state.output_thumbnails):
+                thumb_cols = st.columns(len(thumbs))
+                for tidx, (tcol, tdata) in enumerate(zip(thumb_cols, thumbs)):
                     with tcol:
-                        st.image(tdata, use_container_width=True)
+                        st.image(tdata, width="stretch")
+                        st.download_button("↓", data=tdata, file_name=f"{stem}_thumb_{tidx+1}.jpg",
+                            mime="image/jpeg", key=f"dl_thumb_{tidx}", width="stretch")
+                if len(thumbs) > 1:
+                    zip_data = _zip_bytes([(f"{stem}_thumb_{i+1}.jpg", d) for i, d in enumerate(thumbs)])
+                    st.download_button("↓  Download all thumbnails (.zip)", data=zip_data,
+                        file_name=f"{stem}_thumbnails.zip", mime="application/zip", width="stretch")
             if st.session_state.analytics_data:
                 a = st.session_state.analytics_data
                 if a.get("panel_mode"): st.markdown('<div class="rf-ok">🎛 Panel mode active</div>', unsafe_allow_html=True)
@@ -518,9 +539,8 @@ with col_out:
                     resource_html = f"""<div class="rf-an-item"><div class="rf-an-label">CPU Usage</div><div class="rf-an-val" style="color:{cpu_color}">{cpu_avg:.1f}% <span style="font-size:11px;color:var(--ink3)">(max {cpu_max:.1f}%)</span></div></div><div class="rf-an-item"><div class="rf-an-label">RAM Usage</div><div class="rf-an-val" style="color:{ram_color}">{ram_avg:.1f} MB <span style="font-size:11px;color:var(--ink3)">(max {ram_max:.1f} MB)</span></div></div><div class="rf-an-item"><div class="rf-an-label">Processing Time</div><div class="rf-an-val">{proc_time:.1f}s</div></div>"""
 
                 st.markdown(f'<div class="rf-analytics"><div class="rf-an-title">📊 Analytics</div><div class="rf-an-grid"><div class="rf-an-item"><div class="rf-an-label">Size Reduction</div><div class="rf-an-val">{a.get("file_size_reduction_pct",0):.1f}%</div><div class="rf-an-sub">{a.get("input_size_mb",0):.1f} → {a.get("output_size_mb",0):.1f} MB</div></div><div class="rf-an-item"><div class="rf-an-label">Smoothness</div><div class="rf-an-val" style="color:{sc_v}">{sp:.1f}%</div></div><div class="rf-an-item"><div class="rf-an-label">Resolution</div><div class="rf-an-val">{a.get("output_resolution","")}</div></div>{resource_html}</div></div>', unsafe_allow_html=True)
-            stem = os.path.splitext(st.session_state.uploaded_file_name or "video")[0]
-            st.download_button("↓  Download vertical video", data=st.session_state.output_bytes, file_name=f"{stem}_vertical.mp4", mime="video/mp4", use_container_width=True)
-            if st.session_state.srt_bytes: st.download_button("↓  Download subtitles (.srt)", data=st.session_state.srt_bytes, file_name=f"{stem}.srt", mime="text/plain", use_container_width=True)
+            st.download_button("↓  Download vertical video", data=st.session_state.output_bytes, file_name=f"{stem}_vertical.mp4", mime="video/mp4", width="stretch")
+            if st.session_state.srt_bytes: st.download_button("↓  Download subtitles (.srt)", data=st.session_state.srt_bytes, file_name=f"{stem}.srt", mime="text/plain", width="stretch")
         else:
             st.markdown('<div class="rf-empty"><div class="rf-empty-icon">📱</div><div class="rf-empty-h">Vertical output</div><div class="rf-empty-s">appears here after conversion</div></div>', unsafe_allow_html=True)
     else:
@@ -548,22 +568,35 @@ with col_out:
                 dt = "<div style='margin-top:5px;font-size:10px;color:var(--grn);font-weight:700;'>✓ Converted</div>" if is_d else ""
                 st.markdown(f'<div class="{cc}"><span class="rf-cscore {sc2}">{sp2}%</span><div class="rf-ctitle">Clip {ci+1}</div><div class="rf-cmeta">{ts}</div><span class="rf-cdur">{clip.duration:.0f}s</span><span class="rf-csoi">SOI: {clip.soi_region}</span>{dt}</div>', unsafe_allow_html=True)
                 if is_d:
-                    # Show thumbnail strip (min 3) for this converted clip, if available
+                    # Show thumbnail strip (min 3) for this converted clip, with
+                    # per-thumbnail download buttons plus a "download all" zip.
                     thumb_paths = rfc.get("thumbnail_paths") or []
                     existing_thumbs = [p for p in thumb_paths if p and os.path.exists(p)]
                     if existing_thumbs:
                         tcols = st.columns(len(existing_thumbs))
-                        for tcol, tpath in zip(tcols, existing_thumbs):
+                        thumb_zip_items = []
+                        for tidx, (tcol, tpath) in enumerate(zip(tcols, existing_thumbs)):
                             with tcol:
-                                st.image(tpath, use_container_width=True)
+                                st.image(tpath, width="stretch")
+                                try:
+                                    with open(tpath, "rb") as f: tbytes = f.read()
+                                    thumb_zip_items.append((os.path.basename(tpath), tbytes))
+                                    st.download_button("↓", data=tbytes, file_name=os.path.basename(tpath),
+                                        mime="image/jpeg", key=f"dl_thumb_{ci}_{tidx}", width="stretch")
+                                except Exception: pass
+                        if len(thumb_zip_items) > 1:
+                            zip_data = _zip_bytes(thumb_zip_items)
+                            st.download_button("↓ All thumbnails (.zip)", data=zip_data,
+                                file_name=f"clip_{ci+1}_thumbnails.zip", mime="application/zip",
+                                key=f"dl_thumb_zip_{ci}", width="stretch")
                     bc, dc = st.columns([1,1])
                     with bc:
-                        if st.button("⏹ Close" if is_p else "▶ Play 9:16", key=f"play_{ci}", type="secondary", use_container_width=True):
+                        if st.button("⏹ Close" if is_p else "▶ Play 9:16", key=f"play_{ci}", type="secondary", width="stretch"):
                             st.session_state.playing_clip_idx = -1 if is_p else ci; st.rerun()
                     with dc:
                         try:
                             with open(rfc["output_path"],"rb") as f: cb = f.read()
-                            st.download_button("↓ Download", data=cb, file_name=f"clip_{ci+1}_vertical.mp4", mime="video/mp4", key=f"dl_{ci}", use_container_width=True)
+                            st.download_button("↓ Download", data=cb, file_name=f"clip_{ci+1}_vertical.mp4", mime="video/mp4", key=f"dl_{ci}", width="stretch")
                         except Exception: pass
                     if is_p:
                         try:
@@ -592,14 +625,14 @@ if uploaded_file is not None and st.session_state.input_path:
     if app_mode == "single":
         if not st.session_state.processing_done:
             a1, a2, a3 = st.columns([4,5,2])
-            with a1: go = st.button("▶  Convert to Vertical", type="primary", use_container_width=True, disabled=not can_go)
+            with a1: go = st.button("▶  Convert to Vertical", type="primary", width="stretch", disabled=not can_go)
             with a2:
                 if info:
                     eff_w, eff_h = resolve_target_size(resolution_label, info["width"], info["height"])
                     mt = "Talking Head" if tracking_mode=="talking_head" else ("Sports" if tracking_mode=="sports_action" else ("Cinematic" if tracking_mode=="cinematic" else "Subject"))
                     st.markdown(f"<p style='color:var(--ink3);font-size:11px;margin-top:12px;'>{mt} · {eff_w}×{eff_h} · CRF {crf}</p>", unsafe_allow_html=True)
             with a3:
-                if st.button("Clear", type="secondary", use_container_width=True): _cleanup(); st.session_state.uploaded_file_name=None; st.rerun()
+                if st.button("Clear", type="secondary", width="stretch"): _cleanup(); st.session_state.uploaded_file_name=None; st.rerun()
             if go:
                 st.session_state.last_settings = current_settings
                 prog = st.progress(0.0); status = st.empty(); status.info("⚡ Starting…")
@@ -667,14 +700,14 @@ if uploaded_file is not None and st.session_state.input_path:
         else:
             r1, _, r2 = st.columns([2,5,2])
             with r1:
-                if st.button("← Start over", type="secondary", use_container_width=True): _cleanup(); st.session_state.uploaded_file_name=None; st.session_state.processing_done=False; st.rerun()
+                if st.button("← Start over", type="secondary", width="stretch"): _cleanup(); st.session_state.uploaded_file_name=None; st.session_state.processing_done=False; st.rerun()
     else:
         if st.session_state.detected_clips is None: st.session_state.scan_done = False
         if not st.session_state.scan_done:
             b1, b2, b3 = st.columns([4,4,2])
-            with b1: scan_btn = st.button("🔍  Scan for Clips", type="primary", use_container_width=True, disabled=not can_go)
+            with b1: scan_btn = st.button("🔍  Scan for Clips", type="primary", width="stretch", disabled=not can_go)
             with b3:
-                if st.button("Clear", type="secondary", use_container_width=True): _cleanup(); st.session_state.uploaded_file_name=None; st.rerun()
+                if st.button("Clear", type="secondary", width="stretch"): _cleanup(); st.session_state.uploaded_file_name=None; st.rerun()
             if scan_btn:
                 prog=st.progress(0.0); status=st.empty(); status.info("🔍 Scanning…")
                 try:
@@ -700,11 +733,11 @@ if uploaded_file is not None and st.session_state.input_path:
                 p1,p2,p3 = st.columns([4,3,2])
                 with p1:
                     ns = len(sel)
-                    pb = st.button(f"▶  Verticalize {ns} Clip{'s' if ns!=1 else ''}", type="primary", use_container_width=True, disabled=ns==0)
+                    pb = st.button(f"▶  Verticalize {ns} Clip{'s' if ns!=1 else ''}", type="primary", width="stretch", disabled=ns==0)
                 with p2:
-                    if st.button("🔄 Re-scan", type="secondary", use_container_width=True): st.session_state.scan_done=False; st.session_state.detected_clips=None; st.session_state.clip_results=None; st.rerun()
+                    if st.button("🔄 Re-scan", type="secondary", width="stretch"): st.session_state.scan_done=False; st.session_state.detected_clips=None; st.session_state.clip_results=None; st.rerun()
                 with p3:
-                    if st.button("Clear", type="secondary", use_container_width=True): _cleanup(); st.session_state.uploaded_file_name=None; st.rerun()
+                    if st.button("Clear", type="secondary", width="stretch"): _cleanup(); st.session_state.uploaded_file_name=None; st.rerun()
                 if pb and sel:
                     sc = [clips[i] for i in sorted(sel)]; od = tempfile.mkdtemp(); st.session_state.clip_out_dir = od
                     prog=st.progress(0.0); status=st.empty(); status.info(f"⚡ Processing {len(sc)} clips…")
@@ -737,11 +770,11 @@ if uploaded_file is not None and st.session_state.input_path:
                 if clips: st.markdown(f'<div class="rf-ok">✓ {nk} clip{"s" if nk!=1 else ""} ready — download from cards above</div>', unsafe_allow_html=True)
                 rc1,rc2,rc3 = st.columns(3)
                 with rc1:
-                    if st.button("← New scan", type="secondary", use_container_width=True): st.session_state.scan_done=False; st.session_state.detected_clips=None; st.session_state.clip_results=None; st.session_state.playing_clip_idx=-1; st.rerun()
+                    if st.button("← New scan", type="secondary", width="stretch"): st.session_state.scan_done=False; st.session_state.detected_clips=None; st.session_state.clip_results=None; st.session_state.playing_clip_idx=-1; st.rerun()
                 with rc2:
-                    if st.button("← New video", type="secondary", use_container_width=True): _cleanup(); st.session_state.uploaded_file_name=None; st.rerun()
+                    if st.button("← New video", type="secondary", width="stretch"): _cleanup(); st.session_state.uploaded_file_name=None; st.rerun()
                 with rc3:
-                    if st.button("🗑 Clear cache", type="secondary", use_container_width=True): _cleanup(); st.session_state.uploaded_file_name=None; st.cache_data.clear(); st.rerun()
+                    if st.button("🗑 Clear cache", type="secondary", width="stretch"): _cleanup(); st.session_state.uploaded_file_name=None; st.cache_data.clear(); st.rerun()
 else:
     st.markdown("""\n<div style='padding:0 20px 44px;margin-top:16px;'>\n<div style='background:var(--surf);border:2px dashed var(--bdr);border-radius:var(--r);padding:48px 28px;text-align:center;'>\n<div style='font-family:"DM Serif Display",serif;font-size:clamp(1.5rem,3.5vw,2.2rem);font-weight:400;color:var(--bdr2);letter-spacing:-0.03em;margin-bottom:10px;line-height:1.1;'>Drop a video to begin.</div>\n<p style='font-size:12px;color:var(--ink3);margin-bottom:16px;'>Landscape MP4 · MOV · AVI · MKV</p>\n</div></div>\n""", unsafe_allow_html=True)
 
