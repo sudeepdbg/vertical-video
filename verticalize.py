@@ -1795,6 +1795,41 @@ def _thumbnail_frame_score(frame: np.ndarray) -> float:
     return sharpness_score * 0.55 + sat_score * 0.20 + exposure_score * 0.25
 
 
+def _generate_thumbnails_fallback(path: str, n: int, orig_w: int, orig_h: int,
+                                  out_w: int, out_h: int, quality: int,
+                                  candidates_per_slot: int,
+                                  lo: float, hi: float) -> List[bytes]:
+    """
+    Slower per-timestamp fallback (the original approach) — only reached if
+    the single-pass sequential read in generate_thumbnails itself raises
+    (e.g. a genuinely unreadable/corrupt intermediate). Kept as a safety
+    net rather than the default path since it spawns one ffmpeg process per
+    candidate frame.
+    """
+    seg_bounds = list(np.linspace(lo, hi, n + 1)) if hi > lo else [lo] * (n + 1)
+    thumbs: List[bytes] = []
+    for i in range(n):
+        seg_lo, seg_hi = seg_bounds[i], seg_bounds[i + 1]
+        candidate_ts = [seg_lo] if seg_hi <= seg_lo else list(
+            np.linspace(seg_lo + (seg_hi - seg_lo) * 0.1,
+                       seg_hi - (seg_hi - seg_lo) * 0.1, candidates_per_slot))
+        best_buf: Optional[bytes] = None
+        best_score = -1e18
+        for t in candidate_ts:
+            frame = _read_frame_at(path, orig_w, orig_h, float(t), scale_w=out_w, scale_h=out_h)
+            if frame is None:
+                continue
+            score = _thumbnail_frame_score(frame)
+            if score > best_score:
+                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                if ok:
+                    best_score = score
+                    best_buf = buf.tobytes()
+        if best_buf is not None:
+            thumbs.append(best_buf)
+    return thumbs
+
+
 def generate_thumbnails(path: str, n: int = THUMBNAIL_MIN_COUNT,
                         width: int = THUMBNAIL_WIDTH,
                         quality: int = THUMBNAIL_JPEG_QUALITY,
@@ -1805,12 +1840,23 @@ def generate_thumbnails(path: str, n: int = THUMBNAIL_MIN_COUNT,
 
     Approach: divide the [5%, 95%] duration range into `n` equal time
     segments (this guarantees the thumbnails stay spread across the whole
-    clip — no clustering), then within each segment sample
-    `candidates_per_slot` frames and keep whichever scores best on
-    _thumbnail_frame_score (sharpness + exposure sanity + saturation).
-    This avoids landing on blurry whip-pans, cross-dissolve frames, or
-    near-black scene-cut frames, which is what pure `np.linspace` timestamp
-    sampling was prone to.
+    clip — no clustering), then score candidate frames within each segment
+    on _thumbnail_frame_score (sharpness + exposure sanity + saturation)
+    and keep whichever scores best per segment. This avoids landing on
+    blurry whip-pans, cross-dissolve frames, or near-black scene-cut
+    frames, which pure `np.linspace` timestamp sampling was prone to.
+
+    FIXED (performance): this used to call `_read_frame_at` once per
+    candidate — with the defaults that's `n * candidates_per_slot` (e.g.
+    3 * 4 = 12) independent `ffmpeg` subprocess launches per clip, which
+    measurably slowed down processing (especially in Auto-Clip batch mode,
+    where this runs once per clip). It now does a single sequential
+    FFmpegVideoReader pass over the clip's [5%, 95%] range and scores
+    frames as they stream by — exactly one ffmpeg process per clip
+    regardless of `n` or `candidates_per_slot` — matching the same
+    single-pass approach `_detect_panel_mode` already uses for the same
+    reason. Falls back to the slower per-timestamp method only if the
+    single-pass read itself fails outright.
 
     Falls back gracefully (returns fewer than `n` frames, never raises) if
     some segments can't be decoded at all — e.g. a truncated or
@@ -1826,6 +1872,7 @@ def generate_thumbnails(path: str, n: int = THUMBNAIL_MIN_COUNT,
 
     duration = info.get("duration_seconds", 0.0)
     orig_w, orig_h = info["width"], info["height"]
+    fps = max(float(info.get("fps", 0.0) or 0.0), 1.0)
     if duration <= 0 or orig_w <= 0 or orig_h <= 0:
         logger.warning("generate_thumbnails: invalid duration/dims for %s", path)
         return []
@@ -1836,41 +1883,50 @@ def generate_thumbnails(path: str, n: int = THUMBNAIL_MIN_COUNT,
     out_h = out_h - (out_h % 2) or 2
 
     if duration <= 1.0:
-        # Very short clip — not enough range to meaningfully segment;
-        # fall back to simple uniform sampling of whatever we have.
-        seg_bounds = list(np.linspace(0.0, max(duration - 0.05, 0.0), n + 1))
+        # Very short clip — not enough range to meaningfully segment.
+        lo, hi = 0.0, max(duration - 0.05, 0.0)
     else:
-        lo = duration * 0.05
-        hi = duration * 0.95
-        seg_bounds = list(np.linspace(lo, hi, n + 1))
+        lo, hi = duration * 0.05, duration * 0.95
 
-    thumbs: List[bytes] = []
-    for i in range(n):
-        seg_lo, seg_hi = seg_bounds[i], seg_bounds[i + 1]
-        if seg_hi <= seg_lo:
-            candidate_ts = [seg_lo]
-        else:
-            # Sample candidates_per_slot points inside this segment, nudged
-            # in from the very edges so we don't repeatedly hit a shared
-            # boundary frame between adjacent segments.
-            pad = (seg_hi - seg_lo) * 0.1
-            candidate_ts = list(np.linspace(seg_lo + pad, seg_hi - pad, candidates_per_slot))
+    if hi <= lo:
+        return _generate_thumbnails_fallback(path, n, orig_w, orig_h, out_w, out_h,
+                                             quality, candidates_per_slot, lo, hi)
 
-        best_buf: Optional[bytes] = None
-        best_score = -1e18
-        for t in candidate_ts:
-            frame = _read_frame_at(path, orig_w, orig_h, float(t), scale_w=out_w, scale_h=out_h)
-            if frame is None:
-                continue
-            score = _thumbnail_frame_score(frame)
-            if score > best_score:
-                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
-                if ok:
-                    best_score = score
-                    best_buf = buf.tobytes()
-        if best_buf is not None:
-            thumbs.append(best_buf)
+    span_frames = max(1, int(round((hi - lo) * fps)))
+    total_candidates = max(n, n * candidates_per_slot)
+    stride = max(1, span_frames // total_candidates)
 
+    best_score = [-1e18] * n
+    best_buf: List[Optional[bytes]] = [None] * n
+
+    def _seg_index(t: float) -> int:
+        idx = int((t - lo) / (hi - lo) * n)
+        return max(0, min(n - 1, idx))
+
+    try:
+        with FFmpegVideoReader(path, orig_w, orig_h, seek_sec=lo,
+                               scale_w=out_w, scale_h=out_h) as reader:
+            fi = 0
+            for frame in reader:
+                t = lo + fi / fps
+                if t > hi:
+                    break
+                if fi % stride == 0:
+                    seg = _seg_index(t)
+                    score = _thumbnail_frame_score(frame)
+                    if score > best_score[seg]:
+                        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                        if ok:
+                            best_score[seg] = score
+                            best_buf[seg] = buf.tobytes()
+                fi += 1
+    except Exception as exc:
+        logger.warning("generate_thumbnails: single-pass read failed for %s (%s); "
+                       "falling back to slower per-timestamp sampling", path, exc)
+        return _generate_thumbnails_fallback(path, n, orig_w, orig_h, out_w, out_h,
+                                             quality, candidates_per_slot, lo, hi)
+
+    thumbs = [b for b in best_buf if b is not None]
     if len(thumbs) < n:
         logger.warning("generate_thumbnails: only extracted %d/%d thumbnails for %s",
                        len(thumbs), n, path)
