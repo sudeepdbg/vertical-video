@@ -14,6 +14,7 @@ import os
 import io
 import shutil
 import zipfile
+import base64
 from verticalize import (
     process_video, process_sports_video, process_cinematic_video, get_video_info, detect_clips, process_clips_batch,
     RESOLUTION_PRESETS, SUBTITLE_STYLES, TRANSLATION_LANGUAGES,
@@ -97,8 +98,14 @@ html,body,[class*="css"]{font-family:'DM Sans',sans-serif!important;background:v
 [data-testid="stRadio"] label{font-size:12px!important;color:var(--ink2)!important}[data-testid="stRadio"] [data-testid="stMarkdownContainer"] p{font-size:12px!important}[data-testid="stRadio"] > div{gap:6px!important}
 .rf-vplayer{width:202px;flex-shrink:0}.rf-vplayer [data-testid="stVideo"]{border-radius:10px!important;overflow:hidden!important;height:360px!important}
 .rf-vplayer video{width:202px!important;height:360px!important;object-fit:cover!important;border-radius:10px!important;display:block!important}
-.rf-thumb-strip{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
-.rf-thumb-strip img{border-radius:6px;border:1px solid var(--bdr);width:72px;height:auto;object-fit:cover}
+.rf-output-player{display:flex;justify-content:center;margin-bottom:2px}
+.rf-output-player [data-testid="stVideo"]{max-width:100%!important}
+.rf-output-player video{max-height:520px!important;width:auto!important;max-width:100%!important;border-radius:var(--r)!important;display:block!important;margin:0 auto!important;box-shadow:0 2px 14px rgba(0,0,0,0.10)!important}
+.rf-thumbwrap{background:var(--surf2);border:1px solid var(--bdr);border-radius:var(--rs);padding:10px 10px 8px;margin-top:2px}
+.rf-thumb-strip{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-start}
+.rf-thumb-strip img{border-radius:8px;border:1px solid var(--bdr2);width:84px;height:149px;object-fit:cover;display:block;transition:transform .15s ease;box-shadow:0 1px 4px rgba(0,0,0,0.08)}
+.rf-thumb-strip img:hover{transform:scale(1.04)}
+.rf-thumb-hint{font-size:10px;color:var(--ink3);margin-top:7px}
 .rf-thumb-label{font-size:9px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--ink3);margin-top:10px;margin-bottom:4px}
 </style>
 """, unsafe_allow_html=True)
@@ -125,14 +132,32 @@ for _k, _v in _DEFAULTS.items():
 
 def _zip_bytes(items):
     """Bundle a list of (filename, bytes) pairs into an in-memory ZIP.
-    Used to give a single "download all thumbnails" button alongside the
-    individual per-thumbnail download buttons."""
+    Used to give a single "download all thumbnails" button."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for fname, data in items:
             zf.writestr(fname, data)
     buf.seek(0)
     return buf.getvalue()
+
+def _thumb_strip_html(items):
+    """Render a compact, fixed-size, properly-proportioned (9:16) thumbnail
+    filmstrip as raw HTML using the .rf-thumb-strip CSS class.
+
+    Replaces the previous approach (st.columns() + st.image(width="stretch")),
+    which stretched each portrait thumbnail to fill its column width —
+    looking squished/distorted rather than like clean phone-screen preview
+    cards. `items` is a list of raw JPEG bytes. Images are individually
+    right-click-saveable in the browser; bulk download is offered via a
+    single zip button rendered alongside this strip, rather than one
+    download button per image (which was the main source of button clutter,
+    especially per-clip in Auto-Clip mode).
+    """
+    tags = []
+    for data in items:
+        b64 = base64.b64encode(data).decode("ascii")
+        tags.append(f'<img src="data:image/jpeg;base64,{b64}" alt="thumbnail"/>')
+    return f'<div class="rf-thumb-strip">{"".join(tags)}</div>'
 
 def _cleanup():
     for key in ("input_path", "output_path"):
@@ -503,20 +528,9 @@ with col_out:
             out_mb = len(st.session_state.output_bytes)/(1024**2)
             stem = os.path.splitext(st.session_state.uploaded_file_name or "video")[0]
             st.markdown(f'<div class="rf-ok">✓ Done — {out_mb:.1f} MB</div>', unsafe_allow_html=True)
+            st.markdown('<div class="rf-output-player">', unsafe_allow_html=True)
             st.video(st.session_state.output_bytes, format="video/mp4")
-            if st.session_state.get("output_thumbnails"):
-                thumbs = st.session_state.output_thumbnails
-                st.markdown('<div class="rf-thumb-label">Thumbnails</div>', unsafe_allow_html=True)
-                thumb_cols = st.columns(len(thumbs))
-                for tidx, (tcol, tdata) in enumerate(zip(thumb_cols, thumbs)):
-                    with tcol:
-                        st.image(tdata, width="stretch")
-                        st.download_button("↓", data=tdata, file_name=f"{stem}_thumb_{tidx+1}.jpg",
-                            mime="image/jpeg", key=f"dl_thumb_{tidx}", width="stretch")
-                if len(thumbs) > 1:
-                    zip_data = _zip_bytes([(f"{stem}_thumb_{i+1}.jpg", d) for i, d in enumerate(thumbs)])
-                    st.download_button("↓  Download all thumbnails (.zip)", data=zip_data,
-                        file_name=f"{stem}_thumbnails.zip", mime="application/zip", width="stretch")
+            st.markdown('</div>', unsafe_allow_html=True)
             if st.session_state.analytics_data:
                 a = st.session_state.analytics_data
                 if a.get("panel_mode"): st.markdown('<div class="rf-ok">🎛 Panel mode active</div>', unsafe_allow_html=True)
@@ -539,6 +553,18 @@ with col_out:
                     resource_html = f"""<div class="rf-an-item"><div class="rf-an-label">CPU Usage</div><div class="rf-an-val" style="color:{cpu_color}">{cpu_avg:.1f}% <span style="font-size:11px;color:var(--ink3)">(max {cpu_max:.1f}%)</span></div></div><div class="rf-an-item"><div class="rf-an-label">RAM Usage</div><div class="rf-an-val" style="color:{ram_color}">{ram_avg:.1f} MB <span style="font-size:11px;color:var(--ink3)">(max {ram_max:.1f} MB)</span></div></div><div class="rf-an-item"><div class="rf-an-label">Processing Time</div><div class="rf-an-val">{proc_time:.1f}s</div></div>"""
 
                 st.markdown(f'<div class="rf-analytics"><div class="rf-an-title">📊 Analytics</div><div class="rf-an-grid"><div class="rf-an-item"><div class="rf-an-label">Size Reduction</div><div class="rf-an-val">{a.get("file_size_reduction_pct",0):.1f}%</div><div class="rf-an-sub">{a.get("input_size_mb",0):.1f} → {a.get("output_size_mb",0):.1f} MB</div></div><div class="rf-an-item"><div class="rf-an-label">Smoothness</div><div class="rf-an-val" style="color:{sc_v}">{sp:.1f}%</div></div><div class="rf-an-item"><div class="rf-an-label">Resolution</div><div class="rf-an-val">{a.get("output_resolution","")}</div></div>{resource_html}</div></div>', unsafe_allow_html=True)
+            if st.session_state.get("output_thumbnails"):
+                thumbs = st.session_state.output_thumbnails
+                with st.expander(f"🖼 Cover thumbnails ({len(thumbs)})", expanded=False):
+                    st.markdown('<div class="rf-thumbwrap">', unsafe_allow_html=True)
+                    st.markdown(_thumb_strip_html(thumbs), unsafe_allow_html=True)
+                    st.markdown('<div class="rf-thumb-hint">Right-click an image to save it, '
+                               'or download all at once:</div>', unsafe_allow_html=True)
+                    st.markdown('</div>', unsafe_allow_html=True)
+                    zip_data = _zip_bytes([(f"{stem}_thumb_{i+1}.jpg", d) for i, d in enumerate(thumbs)])
+                    st.download_button("↓  Download all thumbnails (.zip)", data=zip_data,
+                        file_name=f"{stem}_thumbnails.zip", mime="application/zip", width="stretch",
+                        key="dl_thumb_zip_single")
             st.download_button("↓  Download vertical video", data=st.session_state.output_bytes, file_name=f"{stem}_vertical.mp4", mime="video/mp4", width="stretch")
             if st.session_state.srt_bytes: st.download_button("↓  Download subtitles (.srt)", data=st.session_state.srt_bytes, file_name=f"{stem}.srt", mime="text/plain", width="stretch")
         else:
@@ -568,27 +594,6 @@ with col_out:
                 dt = "<div style='margin-top:5px;font-size:10px;color:var(--grn);font-weight:700;'>✓ Converted</div>" if is_d else ""
                 st.markdown(f'<div class="{cc}"><span class="rf-cscore {sc2}">{sp2}%</span><div class="rf-ctitle">Clip {ci+1}</div><div class="rf-cmeta">{ts}</div><span class="rf-cdur">{clip.duration:.0f}s</span><span class="rf-csoi">SOI: {clip.soi_region}</span>{dt}</div>', unsafe_allow_html=True)
                 if is_d:
-                    # Show thumbnail strip (min 3) for this converted clip, with
-                    # per-thumbnail download buttons plus a "download all" zip.
-                    thumb_paths = rfc.get("thumbnail_paths") or []
-                    existing_thumbs = [p for p in thumb_paths if p and os.path.exists(p)]
-                    if existing_thumbs:
-                        tcols = st.columns(len(existing_thumbs))
-                        thumb_zip_items = []
-                        for tidx, (tcol, tpath) in enumerate(zip(tcols, existing_thumbs)):
-                            with tcol:
-                                st.image(tpath, width="stretch")
-                                try:
-                                    with open(tpath, "rb") as f: tbytes = f.read()
-                                    thumb_zip_items.append((os.path.basename(tpath), tbytes))
-                                    st.download_button("↓", data=tbytes, file_name=os.path.basename(tpath),
-                                        mime="image/jpeg", key=f"dl_thumb_{ci}_{tidx}", width="stretch")
-                                except Exception: pass
-                        if len(thumb_zip_items) > 1:
-                            zip_data = _zip_bytes(thumb_zip_items)
-                            st.download_button("↓ All thumbnails (.zip)", data=zip_data,
-                                file_name=f"clip_{ci+1}_thumbnails.zip", mime="application/zip",
-                                key=f"dl_thumb_zip_{ci}", width="stretch")
                     bc, dc = st.columns([1,1])
                     with bc:
                         if st.button("⏹ Close" if is_p else "▶ Play 9:16", key=f"play_{ci}", type="secondary", width="stretch"):
@@ -598,6 +603,31 @@ with col_out:
                             with open(rfc["output_path"],"rb") as f: cb = f.read()
                             st.download_button("↓ Download", data=cb, file_name=f"clip_{ci+1}_vertical.mp4", mime="video/mp4", key=f"dl_{ci}", width="stretch")
                         except Exception: pass
+                    # Thumbnails are a secondary/optional utility (cover images
+                    # for social platforms) — tucked into a collapsed expander
+                    # per clip so the default card view stays compact instead
+                    # of stacking a strip of images + multiple download
+                    # buttons for every single clip in the batch.
+                    thumb_paths = rfc.get("thumbnail_paths") or []
+                    existing_thumbs = [p for p in thumb_paths if p and os.path.exists(p)]
+                    if existing_thumbs:
+                        with st.expander(f"🖼 Thumbnails ({len(existing_thumbs)})", expanded=False):
+                            thumb_bytes_list = []
+                            for tpath in existing_thumbs:
+                                try:
+                                    with open(tpath, "rb") as f: thumb_bytes_list.append(f.read())
+                                except Exception: pass
+                            if thumb_bytes_list:
+                                st.markdown('<div class="rf-thumbwrap">', unsafe_allow_html=True)
+                                st.markdown(_thumb_strip_html(thumb_bytes_list), unsafe_allow_html=True)
+                                st.markdown('<div class="rf-thumb-hint">Right-click an image to save it, '
+                                           'or download all at once:</div>', unsafe_allow_html=True)
+                                st.markdown('</div>', unsafe_allow_html=True)
+                                zip_data = _zip_bytes([(os.path.basename(p), d) for p, d in
+                                                       zip(existing_thumbs, thumb_bytes_list)])
+                                st.download_button("↓  Download all thumbnails (.zip)", data=zip_data,
+                                    file_name=f"clip_{ci+1}_thumbnails.zip", mime="application/zip",
+                                    key=f"dl_thumb_zip_{ci}", width="stretch")
                     if is_p:
                         try:
                             with open(rfc["output_path"],"rb") as f: cpb = f.read()
