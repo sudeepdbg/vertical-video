@@ -306,6 +306,17 @@ BALL_MAX_ASPECT             = 2.50
 BALL_MAX_GATE_PX            = 150
 BALL_COLOR_MATCH_THRESHOLD  = 0.30
 BALL_COLOR_MODEL_BUILD_FRAMES = 8
+# Default/reset value for the ball's expected on-screen area (px^2), used to
+# bias the HSV color-fallback detector toward plausible ball sizes. Also
+# used to reset that running estimate on scene cuts (see issue 1 below).
+BALL_DEFAULT_EXPECTED_AREA_PX2 = 400.0
+# "Possession" heuristic thresholds: the ball is only treated as genuinely
+# held (gravity integration disabled in BallKalmanFilter) when it has been
+# BOTH close to a player AND moving slower than this speed for a sustained
+# number of frames — this distinguishes a ball at rest in a player's hands
+# from an actively bouncing dribble (which should still obey gravity).
+BALL_POSSESSION_MAX_SPEED_PX_S  = 60.0
+BALL_POSSESSION_MIN_FRAMES_SEC  = 0.25
 
 # Ball-blend weights (previously magic numbers scattered in the code)
 BALL_BLEND_BALL_WEIGHT   = 0.55
@@ -819,7 +830,7 @@ class BallColorDetector:
     def detect(self, frame: np.ndarray,
                search_center: Optional[Tuple[float, float]],
                search_radius: int = 120,
-               expected_area: float = 400.0) -> Optional[Tuple[int, int, int, int]]:
+               expected_area: float = BALL_DEFAULT_EXPECTED_AREA_PX2) -> Optional[Tuple[int, int, int, int]]:
         h, w = frame.shape[:2]
         if search_center is not None:
             scx, scy = int(search_center[0]), int(search_center[1])
@@ -4690,7 +4701,16 @@ def _sports_tracking_pass_optimized(
     frames_since_yolo = 0
 
     ball_size_history:  deque = deque(maxlen=10)
-    expected_ball_area: float = 400.0
+    expected_ball_area: float = BALL_DEFAULT_EXPECTED_AREA_PX2
+    # FIXED (issue 2): tracks how many consecutive frames the ball has been
+    # BOTH close to a player (mot_tracker.ball_state.is_possessed) AND
+    # essentially stationary (low Kalman-estimated speed). Only once this
+    # sustains for BALL_POSSESSION_MIN_FRAMES_SEC do we treat the ball as
+    # genuinely "held" and tell BallKalmanFilter to stop integrating gravity
+    # — a brief bounce near a player's feet keeps its ballistic arc, but a
+    # ball held motionless in a player's hands no longer free-falls.
+    possession_still_frames = 0
+    possession_min_frames = max(1, int(round(fps * BALL_POSSESSION_MIN_FRAMES_SEC)))
 
     fi = 0
     try:
@@ -4718,9 +4738,36 @@ def _sports_tracking_pass_optimized(
                     tracker_lost_ball = False
                     ball_found_ever   = False
                     ball_size_history.clear()
+                    # FIXED (issue 1): expected_ball_area is DERIVED from
+                    # ball_size_history and is supposed to track the current
+                    # scene's ball size, but it was never reset here even
+                    # though its source data (ball_size_history) was just
+                    # cleared. A scene cut can change camera distance/zoom
+                    # entirely, so carrying over the old scene's ball-size
+                    # estimate biased the color-fallback detector toward the
+                    # wrong size until enough new YOLO hits overwrote it.
+                    expected_ball_area = BALL_DEFAULT_EXPECTED_AREA_PX2
+                    # FIXED (issue 2): reset the possession-stillness counter
+                    # too — a new scene has a new (unknown) possession state.
+                    possession_still_frames = 0
                     phase_detector.reset()
 
                 ball_kalman.new_frame()
+                # FIXED (issue 3): predict() now runs unconditionally here,
+                # for BOTH the YOLO and non-YOLO branches, instead of only
+                # inside the non-YOLO `else:` branch. Previously, on YOLO
+                # frames, `_validate_ball_detection`'s gate_distance() check
+                # compared each new detection against whatever position the
+                # filter was left at at the END of the PREVIOUS frame —
+                # never advanced by one time-step — instead of the current
+                # frame's properly motion-predicted position. That's a
+                # stale reference for gating a fast-moving ball. Calling
+                # predict() once here (before either branch) makes both
+                # paths consistent: gate checks and updates always compare
+                # against the current frame's predicted position. This is
+                # safe with update()'s existing "skip predict if already
+                # predicted this frame" guard, so there is no double-predict.
+                ball_kalman.predict()
 
                 run_yolo = (
                     fi == 0
@@ -4785,16 +4832,16 @@ def _sports_tracking_pass_optimized(
                             confidence=ball_conf_yolo,
                             source="yolo" if ball_box_orig is not None else "none",
                         )
+                        # FIXED (issue 5): this used to run an O(n) nearest-
+                        # person proximity loop every YOLO frame purely to
+                        # populate det_cache.ball_carrier — an index into
+                        # persons_orig that is never read anywhere else in
+                        # the codebase (verified: the *actually*-used
+                        # possession/carrier concept is `prev_ball_carrier`,
+                        # a separate MOT track-ID variable fed through
+                        # mot_tracker.get_primary_track() below). Left at -1
+                        # rather than computed, since nothing consumes it.
                         ball_carrier = -1
-                        if ball_box_orig is not None and persons_orig:
-                            bcx = (ball_box_orig[0]+ball_box_orig[2])/2
-                            bcy = (ball_box_orig[1]+ball_box_orig[3])/2
-                            min_d = float("inf")
-                            for i, p in enumerate(persons_orig):
-                                pcx = (p[0]+p[2])/2; pcy = (p[1]+p[3])/2
-                                d = math.hypot(pcx-bcx, pcy-bcy)
-                                if d < min_d and d < SPORTS_BALL_PROXIMITY_PX:
-                                    min_d, ball_carrier = d, i
                         det_cache.update(persons_orig, ball_box_orig, ball_carrier,
                                          None, p_confs, fi, ball_conf_yolo)
                         mot_tracker.update(persons_orig, ball_box_orig, det_frame, p_confs)
@@ -4806,9 +4853,9 @@ def _sports_tracking_pass_optimized(
                     ball_kalman.advance_if_needed()
 
                 else:
-                    # FIXED: Unconditional predict once per frame (after new_frame)
-                    ball_kalman.predict()
-
+                    # FIXED (issue 3): predict() for this frame already ran
+                    # once, unconditionally, right after new_frame() above —
+                    # removed the duplicate call that used to live here.
                     resolved = False
                     if use_ball_tracking and ball_tracker.is_active:
                         tracked_bb_det = ball_tracker.update(det_frame)
@@ -4889,7 +4936,17 @@ def _sports_tracking_pass_optimized(
                                            det_frame, [])
 
                 ball_records[fi]     = this_ball_rec
-                person_boxes_map[fi] = list(det_cache.persons)
+                # FIXED (issue 4): person_boxes_map used to copy
+                # det_cache.persons into a new dict entry every single
+                # frame (list(...) allocation + dict insert), but nothing
+                # downstream ever reads this map — verified via a full
+                # search of the codebase: process_sports_video unpacks it
+                # into a local variable and never references it again. The
+                # function still returns a dict of this shape for call-site
+                # compatibility (see padding/exception-fallback code below,
+                # which still populates it defensively in the rare case
+                # something starts consuming it), but the hot per-frame
+                # path no longer does the wasted copy.
 
                 current_phase = phase_detector.detect_phase(
                     det_cache.persons, det_cache.ball_box, orig_w, mot_tracker.ball_state)
@@ -4900,6 +4957,34 @@ def _sports_tracking_pass_optimized(
 
                 ball_center   = mot_tracker.ball_state.center
                 primary_track = mot_tracker.get_primary_track(prev_ball_carrier)
+
+                # FIXED (issue 2): BallKalmanFilter.set_possession()/
+                # set_on_ground() existed specifically to stop gravity
+                # integration "during dribble, rest, or possession" (per
+                # that method's own docstring) but were never actually
+                # called anywhere — the gravity-drift bug they were written
+                # to fix was still live. Wire it up here using a stillness
+                # + proximity heuristic (not proximity alone): the ball
+                # must be BOTH near a player (mot_tracker already computes
+                # this via is_possessed) AND moving slower than
+                # BALL_POSSESSION_MAX_SPEED_PX_S for a sustained run of
+                # frames. Proximity alone would be wrong — a ball actively
+                # bouncing in a dribble is also "close to a player" most of
+                # the time and should keep obeying gravity; only a ball
+                # that has come to rest in a player's hands should not.
+                # Scaled by det-frame height / 1080, matching the same
+                # resolution-invariance convention BallKalmanFilter already
+                # uses internally for its other velocity thresholds (e.g.
+                # _auto_ground_check's low_vy_thresh) — velocity here is in
+                # DetCoord (downscaled detection-frame) pixel space, which
+                # varies per source resolution.
+                ball_speed_est = math.hypot(*ball_kalman.velocity) if ball_kalman.initialized else 0.0
+                possession_speed_thresh = BALL_POSSESSION_MAX_SPEED_PX_S * (det_h / 1080.0)
+                if mot_tracker.ball_state.is_possessed and ball_speed_est < possession_speed_thresh:
+                    possession_still_frames = min(possession_still_frames + 1, 10_000)
+                else:
+                    possession_still_frames = 0
+                ball_kalman.set_possession(possession_still_frames >= possession_min_frames)
 
                 if primary_track is not None:
                     raw_cx = float(primary_track.center[0])
