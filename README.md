@@ -223,6 +223,83 @@ sports; `cinematic_config` for cinematic).
 
 ## Changelog (recent fixes)
 
+**v8.0** (backend, `verticalize.py`) — Sports ball-tracking evaluation and fixes:
+- **`expected_ball_area` was never reset on scene cuts.** `ball_size_history`
+  (the raw samples it's derived from) was correctly cleared, but the
+  derived scalar itself carried the previous scene's ball-size estimate
+  across the cut — a real camera-distance/zoom change could bias the
+  color-fallback detector toward the wrong ball size until enough new YOLO
+  hits overwrote it. Now reset to `BALL_DEFAULT_EXPECTED_AREA_PX2` alongside
+  the history clear.
+- **`BallKalmanFilter.set_possession()`/`set_on_ground()` were defined but
+  never called anywhere**, despite the code's own comment claiming this was
+  "FIXED (bug 5)" and that gravity no longer applies "during dribble, rest,
+  or possession." The described bug was still live. Wired up
+  `set_possession()` with a stillness-and-proximity heuristic (ball must be
+  BOTH close to a player AND moving below `BALL_POSSESSION_MAX_SPEED_PX_S`
+  for `BALL_POSSESSION_MIN_FRAMES_SEC` of sustained frames) — proximity
+  alone would have been wrong, since a ball mid-dribble is also "close to a
+  player" most of the time and should keep its real ballistic arc; only a
+  ball at genuine rest in a player's hands should stop free-falling.
+  Verified with unit tests: gravity accumulates normally, drops to exactly
+  zero once the sustained-stillness threshold is reached, and resumes
+  immediately on release.
+- **Kalman `predict()` timing was inconsistent between branches** — the
+  non-YOLO fallback branch predicted before gating a new position, but the
+  YOLO branch's `_validate_ball_detection` gated fresh detections against
+  whatever position the filter was left at at the end of the *previous*
+  frame, never advanced for the current frame. `predict()` now runs
+  unconditionally once per frame (right after `new_frame()`, before the
+  YOLO/non-YOLO split), so gating is always against the current frame's
+  properly-predicted position on both paths. Safe with the filter's
+  existing "skip predict if already predicted this frame" guard.
+- **Removed two pieces of confirmed-dead per-frame work**, found by tracing
+  every read site across the codebase: `person_boxes_map` was fully
+  rebuilt (dict + list copy) every single frame but never read by any
+  caller of `_sports_tracking_pass_optimized`; `det_cache.ball_carrier` was
+  computed via an O(n) nearest-player proximity loop every YOLO frame but
+  also never read anywhere (the actually-used possession/carrier signal is
+  the separate `prev_ball_carrier` MOT-track-ID variable, which was already
+  correct and untouched). Both no longer do the wasted work; return shapes
+  are unchanged for compatibility.
+- Noted but **not modified** (dead, unreachable, but harmless): `detect_subjects()`'s
+  `_cached_result` branch and the `SportsEventDetector`/`GameStateEngine`
+  classes are never actually invoked by the live sports pipeline
+  (`process_sports_video` uses `_sports_tracking_pass_optimized`
+  exclusively) — left alone since removing them adds risk for zero runtime
+  benefit, but worth knowing they aren't the live code path.
+
+**v7.9** (backend, `verticalize.py`) — Panel Mode performance pass:
+- Cached the Haar cascade classifier (`_get_haar_cascade`, same pattern as
+  the existing YOLO/YuNet caches) instead of reconstructing it from the XML
+  cascade file on every call. Affects `detect_faces()` (talking-head mode,
+  cinematic mode's Haar fallback) and `_detect_faces_for_panel()` (panel
+  mode's head-normalize/portrait-extraction features). Measured ~12.65ms
+  wasted per call, purely on reload, previously paid on every frame.
+- Panel-slot crops (`_crop_group_to_strip`) no longer use `INTER_LANCZOS4`
+  for the per-person resize — switched to `INTER_AREA`/`INTER_LINEAR`
+  (chosen adaptively by scale direction). Measured ~4.46ms (LANCZOS4) vs.
+  0.39–1.99ms per call; this runs once per visible person per frame, so a
+  4-person panel was paying up to 4x the resize cost of normal
+  single-subject tracking modes.
+- `_detect_panel_mode` now uses a duration-adaptive frame-collection
+  strategy: direct per-probe seeks for sources longer than
+  `PANEL_DETECT_SEEK_THRESHOLD_SEC` (90s), single continuous decode pass
+  for shorter/already-trimmed sources. Previously it always fully decoded
+  the entire source just to sample ~30 probe frames — measured 25.53s vs.
+  11.33s on just a 3-minute test clip, with the gap widening for longer
+  videos. This ran before tracking even started, on the **full uploaded
+  video** in Single-Clip Subject mode, so a long upload could burn well
+  over a minute just deciding whether to use panel mode.
+- **Not yet implemented** (flagged for follow-up): even with the cascade
+  cached, `detectMultiScale` itself still costs ~19ms per detected person
+  per frame in panel head-normalize/portrait mode — a frame-skip/reuse
+  pattern (similar to the existing sports-mode YOLO frame-skipping) would
+  cut this further but needs new state threaded through the render loop.
+  Lower-third banner detection (`_detect_lower_third_region`, ~2.95ms/frame)
+  could similarly be throttled since banners are near-static, but is lower
+  priority.
+
 **v7.8** (backend, `verticalize.py`):
 - Fixed a real performance regression in `generate_thumbnails`: it was
   spawning one `ffmpeg` subprocess per *candidate* frame (with defaults,
