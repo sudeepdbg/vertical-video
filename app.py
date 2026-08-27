@@ -115,6 +115,7 @@ _DEFAULTS = dict(
     app_mode="single", tracking_mode="subject", sport_type="auto",
     output_path=None, processing_done=False,
     output_bytes=None, srt_bytes=None, last_settings=None, analytics_data=None,
+    output_warnings=None,
     detected_clips=None, selected_clip_indices=None,
     clip_results=None, scan_done=False, clip_out_dir=None,
     playing_clip_idx=-1,
@@ -174,7 +175,8 @@ def _cleanup():
         srt_bytes=None, video_info=None, processing_done=False,
         detected_clips=None, selected_clip_indices=None,
         clip_results=None, scan_done=False, clip_out_dir=None,
-        playing_clip_idx=-1, analytics_data=None, output_thumbnails=None)
+        playing_clip_idx=-1, analytics_data=None, output_thumbnails=None,
+        output_warnings=None)
 
 def _new_out():
     fd, p = tempfile.mkstemp(suffix=".mp4"); os.close(fd); os.unlink(p)
@@ -187,6 +189,7 @@ def _invalidate_if_changed(cur):
         st.session_state.srt_bytes = None
         st.session_state.analytics_data = None
         st.session_state.output_thumbnails = None
+        st.session_state.output_warnings = None
 
 _whisper_ok = whisper_available()
 _translate_ok = translation_available()
@@ -528,6 +531,9 @@ with col_out:
             out_mb = len(st.session_state.output_bytes)/(1024**2)
             stem = os.path.splitext(st.session_state.uploaded_file_name or "video")[0]
             st.markdown(f'<div class="rf-ok">✓ Done — {out_mb:.1f} MB</div>', unsafe_allow_html=True)
+            if st.session_state.get("output_warnings"):
+                for w in st.session_state.output_warnings:
+                    st.markdown(f'<div class="rf-warn">⚠ {w}</div>', unsafe_allow_html=True)
             st.markdown('<div class="rf-output-player">', unsafe_allow_html=True)
             st.video(st.session_state.output_bytes, format="video/mp4")
             st.markdown('</div>', unsafe_allow_html=True)
@@ -594,6 +600,9 @@ with col_out:
                 dt = "<div style='margin-top:5px;font-size:10px;color:var(--grn);font-weight:700;'>✓ Converted</div>" if is_d else ""
                 st.markdown(f'<div class="{cc}"><span class="rf-cscore {sc2}">{sp2}%</span><div class="rf-ctitle">Clip {ci+1}</div><div class="rf-cmeta">{ts}</div><span class="rf-cdur">{clip.duration:.0f}s</span><span class="rf-csoi">SOI: {clip.soi_region}</span>{dt}</div>', unsafe_allow_html=True)
                 if is_d:
+                    clip_warnings = rfc.get("warnings") or []
+                    for cw in clip_warnings:
+                        st.markdown(f'<div class="rf-warn" style="margin-top:6px;">⚠ {cw}</div>', unsafe_allow_html=True)
                     bc, dc = st.columns([1,1])
                     with bc:
                         if st.button("⏹ Close" if is_p else "▶ Play 9:16", key=f"play_{ci}", type="secondary", width="stretch"):
@@ -719,6 +728,13 @@ if uploaded_file is not None and st.session_state.input_path:
                         # all now return a "thumbnails" list of JPEG bytes (min 3) generated
                         # from the finished output clip.
                         st.session_state.output_thumbnails = meta.get("thumbnails") or None
+                        # NEW: non-fatal processing warnings (e.g. subtitles
+                        # were requested but Whisper isn't installed, or a
+                        # very long source got truncated by an internal
+                        # safety limit) are now returned by verticalize.py
+                        # instead of only ever reaching a server log the
+                        # user never sees.
+                        st.session_state.output_warnings = meta.get("warnings") or None
                         srt_p = meta.get("subtitle_path")
                         if srt_p and os.path.exists(srt_p):
                             with open(srt_p,"rb") as f: st.session_state.srt_bytes = f.read()
