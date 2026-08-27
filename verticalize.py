@@ -99,6 +99,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -113,12 +114,16 @@ import cv2
 import json
 import numpy as np
 
-# ── GPU device management ─────────────────────────────────────────────────────
-try:
-    import torch
-    _TORCH_AVAILABLE = True
-except ImportError:
-    _TORCH_AVAILABLE = False
+# REMOVED (dead-code cleanup — see verticalize.py changelog): this module
+# used to unconditionally import `torch` purely to support `_get_device()`,
+# and unconditionally import `av` purely to support `PyAVVideoReader`.
+# Neither function/class was ever called or instantiated anywhere in this
+# codebase (verified via a full-file usage scan: every video read/write
+# path uses the FFmpeg-subprocess-based `FFmpegVideoReader` instead). Both
+# have been removed, which also removes these two now-pointless optional
+# imports — `torch` and `av` remain real transitive dependencies of
+# `ultralytics`/`openai-whisper`, but this module no longer needs to import
+# either of them directly for its own use.
 
 try:
     from scipy.signal import savgol_filter
@@ -144,32 +149,6 @@ try:
 except ImportError:
     _PSUTIL_AVAILABLE = False
 
-# --- PyAV decode backend (optional) ------------------------------------------------
-try:
-    import av
-    PYAV_AVAILABLE = True
-except ImportError:
-    PYAV_AVAILABLE = False
-
-class PyAVVideoReader:
-    '''PyAV-based video reader - faster than FFmpeg pipe for some codecs.'''
-    def __init__(self, path: str):
-        self.container = av.open(path)
-        self.stream = self.container.streams.video[0]
-
-    def __iter__(self):
-        for frame in self.container.decode(self.stream):
-            yield frame.to_ndarray(format="bgr24")
-
-    def close(self):
-        self.container.close()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        self.close()
-
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 logger = logging.getLogger("verticalize")
@@ -190,6 +169,54 @@ class ProcessingError(Exception):
     pass
 
 
+# ── Model-name validation (defense-in-depth) ──────────────────────────────────
+# FIXED (critical, defense-in-depth): whisper_model / yolo_weights ultimately
+# reach loaders (`whisper.load_model()`, `ultralytics.YOLO()`) that accept
+# either a known registered model name OR an arbitrary filesystem path/URL.
+# If either parameter is ever populated from untrusted input — e.g. a bug in
+# an API layer in front of this module, or a future caller that forwards a
+# client-supplied dict without validating it first — an attacker-controlled
+# path here is a real deserialization risk (a client could upload a
+# malicious file to a predictable path, then ask the pipeline to "load" it
+# as a model checkpoint).
+#
+# This module has no way to know whether its caller already validated
+# input, so it validates unconditionally at every public entry point below:
+# whisper_model must be one of Whisper's own registered model names (never
+# a path), and yolo_weights must be a bare filename ending in .pt with no
+# path separators (never a path or URL). This is defense-in-depth on top
+# of whatever an API layer in front of this module does — see main.py's
+# JobConfigIn / worker.py's _sanitize_config for the corresponding
+# allowlists at the API/worker boundary.
+_SAFE_WHISPER_MODELS = {
+    "tiny", "tiny.en", "base", "base.en", "small", "small.en",
+    "medium", "medium.en", "large", "large-v1", "large-v2", "large-v3", "turbo",
+}
+_SAFE_YOLO_WEIGHTS_RE = re.compile(r"^[A-Za-z0-9_-]+\.pt$")
+
+
+def _validate_model_names(whisper_model: Optional[str] = None,
+                          yolo_weights: Optional[str] = None) -> None:
+    """Raise ValueError if either parameter isn't a safe, known model
+    identifier. Called at the top of every public process_*/detect_clips/
+    process_clips_batch entry point. Pass None (or "") to skip checking a
+    given parameter — used for tracking modes where it isn't relevant."""
+    if whisper_model:
+        if whisper_model not in _SAFE_WHISPER_MODELS:
+            raise ValueError(
+                f"whisper_model={whisper_model!r} is not a recognized Whisper "
+                f"model name. This must be one of Whisper's own registered "
+                f"names (never a file path) — allowed: {sorted(_SAFE_WHISPER_MODELS)}"
+            )
+    if yolo_weights:
+        if not _SAFE_YOLO_WEIGHTS_RE.match(yolo_weights):
+            raise ValueError(
+                f"yolo_weights={yolo_weights!r} must be a bare filename ending "
+                f"in '.pt' with no path separators (e.g. 'yolov8n.pt') — "
+                f"paths and URLs are not accepted"
+            )
+
+
 # ── Enums ─────────────────────────────────────────────────────────────────────
 class PlayPhase(Enum):
     FAST_BREAK = auto()
@@ -197,13 +224,6 @@ class PlayPhase(Enum):
     REBOUND    = auto()
     STATIC     = auto()
     TRANSITION = auto()
-
-class GameState(Enum):
-    LIVE_PLAY  = auto()
-    TIMEOUT    = auto()
-    REPLAY     = auto()
-    FREE_THROW = auto()
-    UNKNOWN    = auto()
 
 class TrackingStatus(Enum):
     ACTIVE   = auto()
@@ -263,8 +283,6 @@ SPORTS_SCENE_CUT_MIN_FRAMES       = 2
 SPORTS_SWITCH_BALL_BONUS          = 200
 SPORTS_BALL_CONFIDENCE            = 0.30
 SPORTS_BALL_PROXIMITY_PX          = 120
-SPORTS_EVENT_EXPAND_FRAMES        = 15
-SPORTS_EVENT_EXPAND_FACTOR        = 1.25
 
 AVS_BASE_WINDOW_SEC          = 0.25
 AVS_MAX_WINDOW_SEC           = 0.80
@@ -385,8 +403,15 @@ VIGNETTE_FALLOFF     = 1.8
 COLOR_GRADES         = ("none", "warm", "cool", "vibrant", "matte")
 PANEL_SLOT_EMA       = 0.07
 PANEL_SLOT_MAX_JUMP  = 0.08
-KEN_BURNS_MAX_ZOOM   = 1.04
-KEN_BURNS_PERIOD     = 8.0
+# REMOVED (dead-code cleanup + misleading-API fix): KEN_BURNS_MAX_ZOOM /
+# KEN_BURNS_PERIOD and apply_ken_burns() (below) implemented a subtle
+# zoom effect that was never actually called from anywhere — worse,
+# process_video() accepted a `ken_burns: bool = False` parameter that a
+# caller could reasonably expect to enable this effect, but the parameter
+# was never read anywhere in that function's body. Passing
+# `ken_burns=True` silently did nothing, which is worse than the parameter
+# not existing at all. Removed both the dead effect function and the
+# no-op parameter from process_video's signature.
 DISSOLVE_FRAMES      = 3
 # ── Two-pass encoding (NEW) ───────────────────────────────────────────────────
 # When enabled, encoder pipes frames to a lossless MKV intermediate first,
@@ -1129,41 +1154,49 @@ def translation_available() -> bool:
     except ImportError:
         return False
 
-def yolo_available() -> bool:
-    if not _YOLO_AVAILABLE:
-        return False
-    try:
-        import urllib.request
-        urllib.request.urlopen("https://github.com", timeout=3)
-        return True
-    except Exception:
-        return (os.path.exists("yolov8n.pt") or
-                os.path.exists("yolov8s.pt") or
-                os.path.exists("yolo11n.pt"))
-
+# REMOVED (dead-code cleanup): yolo_available() — a network-connectivity +
+# local-weights-file check — was never called anywhere in this codebase
+# (app.py has no equivalent of its whisper_available()/translation_available()
+# gating for YOLO). _get_model() already handles YOLO unavailability
+# gracefully on its own (falls back through several weight names, then
+# returns None), so nothing relied on this existing.
 
 # ── Visual Effects ────────────────────────────────────────────────────────────
 # FIXED: bounded LRU-style caches to prevent unbounded memory growth
 _vignette_cache: Dict[Tuple, np.ndarray] = {}
 _vignette_insert_order: List[Tuple]      = []
+# FIXED (thread-safety): dedicated lock for the vignette/LUT caches (kept
+# separate from _cache_lock used for model caches, since these are on the
+# hot per-frame render path and we want the smallest possible critical
+# section). Uses a double-checked pattern: the actual mask/LUT computation
+# happens OUTSIDE the lock (it's a pure function of its inputs, so two
+# threads computing the same key concurrently just do harmless duplicate
+# work), and only the dict read/write/eviction is guarded — this keeps
+# per-frame lock hold time negligible even under concurrent renders (e.g.
+# multiple Streamlit sessions rendering different videos at once).
+_effects_cache_lock = threading.Lock()
 
 def _build_vignette(w: int, h: int, strength: float = VIGNETTE_STRENGTH,
                     falloff: float = VIGNETTE_FALLOFF) -> np.ndarray:
     key = (w, h, round(strength, 3), round(falloff, 3))
-    if key in _vignette_cache:
-        return _vignette_cache[key]
-    # Evict oldest if at capacity
-    if len(_vignette_cache) >= _CACHE_MAX_ENTRIES:
-        old = _vignette_insert_order.pop(0)
-        _vignette_cache.pop(old, None)
+    with _effects_cache_lock:
+        if key in _vignette_cache:
+            return _vignette_cache[key]
     xs   = np.linspace(-1, 1, w, dtype=np.float32)
     ys   = np.linspace(-1, 1, h, dtype=np.float32)
     xg, yg = np.meshgrid(xs, ys)
     dist = np.sqrt(xg**2 + yg**2)
     dist /= dist.max()
     mask = np.clip(1.0 - strength * (dist**falloff), 0.0, 1.0)[:, :, np.newaxis]
-    _vignette_cache[key] = mask
-    _vignette_insert_order.append(key)
+    with _effects_cache_lock:
+        # Evict oldest if at capacity (checked again under lock, since
+        # another thread may have inserted between our miss above and now)
+        if key not in _vignette_cache and len(_vignette_cache) >= _CACHE_MAX_ENTRIES:
+            old = _vignette_insert_order.pop(0)
+            _vignette_cache.pop(old, None)
+        _vignette_cache[key] = mask
+        if key not in _vignette_insert_order:
+            _vignette_insert_order.append(key)
     return mask
 
 def apply_vignette(frame: np.ndarray, strength: float = VIGNETTE_STRENGTH) -> np.ndarray:
@@ -1175,11 +1208,12 @@ def apply_vignette(frame: np.ndarray, strength: float = VIGNETTE_STRENGTH) -> np
     # The cache key includes (w, h) so a true key hit should always match,
     # but if the cache was corrupted we force a rebuild.
     if mask.shape[:2] != (h, w) or mask.shape[2] != 1:
-        stale_keys = [k for k in list(_vignette_cache.keys()) if k[0] == w and k[1] == h]
-        for sk in stale_keys:
-            _vignette_cache.pop(sk, None)
-            if sk in _vignette_insert_order:
-                _vignette_insert_order.remove(sk)
+        with _effects_cache_lock:
+            stale_keys = [k for k in list(_vignette_cache.keys()) if k[0] == w and k[1] == h]
+            for sk in stale_keys:
+                _vignette_cache.pop(sk, None)
+                if sk in _vignette_insert_order:
+                    _vignette_insert_order.remove(sk)
         mask = _build_vignette(w, h, strength)
     return (frame.astype(np.float32) * mask).clip(0, 255).astype(np.uint8)
 
@@ -1188,12 +1222,14 @@ _SHARPEN_KERNEL_CACHE: Dict[Tuple[float, int], np.ndarray] = {}
 
 def _make_sharpen_kernel(strength: float, radius: int) -> np.ndarray:
     key = (round(strength, 3), radius)
-    if key in _SHARPEN_KERNEL_CACHE:
-        return _SHARPEN_KERNEL_CACHE[key]
+    with _effects_cache_lock:
+        if key in _SHARPEN_KERNEL_CACHE:
+            return _SHARPEN_KERNEL_CACHE[key]
     size = radius * 2 + 1
     k    = -strength * np.ones((size, size), dtype=np.float32) / (size * size - 1)
     k[radius, radius] = 1.0 + strength
-    _SHARPEN_KERNEL_CACHE[key] = k
+    with _effects_cache_lock:
+        _SHARPEN_KERNEL_CACHE[key] = k
     return k
 
 def apply_sharpen(frame: np.ndarray, strength: float = 0.6, radius: int = 1) -> np.ndarray:
@@ -1205,8 +1241,9 @@ def apply_sharpen(frame: np.ndarray, strength: float = 0.6, radius: int = 1) -> 
 _lut_cache: Dict[str, np.ndarray] = {}
 
 def _build_lut(grade: str) -> np.ndarray:
-    if grade in _lut_cache:
-        return _lut_cache[grade]
+    with _effects_cache_lock:
+        if grade in _lut_cache:
+            return _lut_cache[grade]
     x = np.arange(256, dtype=np.float32)
     if grade == "warm":
         r = np.clip(x * 1.06 + 5, 0, 255); g = np.clip(x * 1.02 + 2, 0, 255)
@@ -1225,10 +1262,11 @@ def _build_lut(grade: str) -> np.ndarray:
     else:
         r = g = b = x.copy()
     lut = np.stack([b, g, r], axis=1).astype(np.uint8).reshape(256, 1, 3)
-    # LRU eviction for lut cache
-    if len(_lut_cache) >= _CACHE_MAX_ENTRIES:
-        _lut_cache.pop(next(iter(_lut_cache)))
-    _lut_cache[grade] = lut
+    with _effects_cache_lock:
+        # LRU eviction for lut cache
+        if grade not in _lut_cache and len(_lut_cache) >= _CACHE_MAX_ENTRIES:
+            _lut_cache.pop(next(iter(_lut_cache)))
+        _lut_cache[grade] = lut
     return lut
 
 def apply_color_grade(frame: np.ndarray, grade: str = "none") -> np.ndarray:
@@ -1324,21 +1362,6 @@ def _draw_tracking_overlays(
                 cv2.putText(out, label, (bx1c, max(0, by1c - 4)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
     return out
-
-
-def apply_ken_burns(frame: np.ndarray, frame_idx: int, fps: float,
-                    max_zoom: float = KEN_BURNS_MAX_ZOOM,
-                    period: float = KEN_BURNS_PERIOD) -> np.ndarray:
-    if max_zoom <= 1.0:
-        return frame
-    t     = (frame_idx / max(fps, 1)) % period
-    scale = 1.0 + (max_zoom - 1.0) * 0.5 * (1 - math.cos(2 * math.pi * t / period))
-    if abs(scale - 1.0) < 1e-4:
-        return frame
-    h, w = frame.shape[:2]
-    nw = max(int(w / scale), 2); nh = max(int(h / scale), 2)
-    x0 = (w - nw) // 2; y0 = (h - nh) // 2
-    return cv2.resize(frame[y0:y0+nh, x0:x0+nw], (w, h), interpolation=cv2.INTER_LINEAR)
 
 
 class DissolveBuffer:
@@ -1761,14 +1784,10 @@ def get_video_info(path: str) -> Dict[str, Any]:
         "has_audio":        has_audio,
     }
 
-def extract_thumbnail(path: str, t: float = 1.0) -> Optional[bytes]:
-    info  = get_video_info(path)
-    frame = _read_frame_at(path, info["width"], info["height"], t, scale_w=320, scale_h=180)
-    if frame is None:
-        return None
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    return buf.tobytes() if ok else None
-
+# REMOVED (dead-code cleanup): extract_thumbnail() was an early single-frame
+# thumbnail extractor, fully superseded by generate_thumbnails()/
+# save_clip_thumbnails() below (quality-scored, multi-frame, single-pass).
+# Never called anywhere after the newer functions were added.
 
 # ── Thumbnail generation ───────────────────────────────────────────────────────
 THUMBNAIL_CANDIDATES_PER_SLOT = 4     # frames sampled per time-segment before picking the best
@@ -2022,11 +2041,22 @@ def calculate_crop_dims(orig_w: int, orig_h: int, tw: int, th: int) -> Tuple[int
 # ── Model Cache & Face Detection ──────────────────────────────────────────────
 _model_cache: Dict[str, Any] = {}
 _yunet_detector: Optional[Any] = None
+# FIXED (thread-safety): these module-level caches are populated lazily on
+# first use with a plain "check dict, then populate dict" pattern, which
+# is not safe if two threads race to populate the same cache for the first
+# time — e.g. app.py running as a multi-session Streamlit server (each
+# active session can run on its own thread), or any future multi-threaded
+# host of this module. A lock around the check-and-populate section makes
+# first-use lazy-loading safe without meaningfully affecting the hot path
+# (every subsequent call still just reads the already-populated dict).
+_cache_lock = threading.Lock()
 
 def _get_model(weights: str = "yolov8n.pt") -> Optional[Any]:
     if not _YOLO_AVAILABLE:
         return None
-    if weights not in _model_cache:
+    with _cache_lock:
+        if weights in _model_cache:
+            return _model_cache[weights]
         for w in [weights, "yolo11n.pt", "yolov8n.pt", "yolov8s.pt"]:
             try:
                 m = _YOLO(w)
@@ -2037,21 +2067,21 @@ def _get_model(weights: str = "yolov8n.pt") -> Optional[Any]:
                 continue
         logger.warning("YOLO unavailable")
         return None
-    return _model_cache[weights]
 
 def _get_yunet() -> Optional[Any]:
     global _yunet_detector
-    if _yunet_detector is not None:
-        return _yunet_detector
-    for p in ["face_detection_yunet_2023mar.onnx", "yunet.onnx"]:
-        if os.path.exists(p):
-            try:
-                net = cv2.dnn.readNet(p)
-                _yunet_detector = net
-                return net
-            except (cv2.error, OSError, ValueError):
-                pass
-    return None
+    with _cache_lock:
+        if _yunet_detector is not None:
+            return _yunet_detector
+        for p in ["face_detection_yunet_2023mar.onnx", "yunet.onnx"]:
+            if os.path.exists(p):
+                try:
+                    net = cv2.dnn.readNet(p)
+                    _yunet_detector = net
+                    return net
+                except (cv2.error, OSError, ValueError):
+                    pass
+        return None
 
 # FIXED (performance): cv2.CascadeClassifier(haar_path) was being
 # reconstructed from the XML cascade file on EVERY call to detect_faces()
@@ -2064,12 +2094,13 @@ def _get_yunet() -> Optional[Any]:
 _haar_cascade_cache: Dict[str, Any] = {}
 
 def _get_haar_cascade(cascade_filename: str = "haarcascade_frontalface_default.xml") -> Optional[Any]:
-    if cascade_filename in _haar_cascade_cache:
-        return _haar_cascade_cache[cascade_filename]
-    haar_path = cv2.data.haarcascades + cascade_filename
-    cascade = cv2.CascadeClassifier(haar_path) if os.path.exists(haar_path) else None
-    _haar_cascade_cache[cascade_filename] = cascade
-    return cascade
+    with _cache_lock:
+        if cascade_filename in _haar_cascade_cache:
+            return _haar_cascade_cache[cascade_filename]
+        haar_path = cv2.data.haarcascades + cascade_filename
+        cascade = cv2.CascadeClassifier(haar_path) if os.path.exists(haar_path) else None
+        _haar_cascade_cache[cascade_filename] = cascade
+        return cascade
 
 def detect_faces(frame: np.ndarray,
                  confidence_thresh: float = 0.6) -> List[Tuple[int, int, int, int]]:
@@ -2522,48 +2553,17 @@ class IntelligentCropStrategy:
         return left, top, right, bottom
 
 
-# ── Game State Engine ─────────────────────────────────────────────────────────
-class GameStateEngine:
-    def __init__(self, fps: float, frame_w: int, frame_h: int) -> None:
-        self.fps = fps; self.frame_w = frame_w; self.frame_h = frame_h
-        self.current_state   = GameState.UNKNOWN
-        self.prev_gray:      Optional[np.ndarray] = None
-        self.freeze_frame_count = 0
-        self.motion_history: deque = deque(maxlen=int(fps * 2))
-
-    def update(self, persons: List[Tuple], gray_frame: np.ndarray) -> GameState:
-        if self.prev_gray is not None:
-            # FIXED: guard against shape mismatch before absdiff
-            if self.prev_gray.shape == gray_frame.shape:
-                diff = float(cv2.absdiff(self.prev_gray, gray_frame).mean())
-                self.motion_history.append(diff)
-                if diff < 1.0: self.freeze_frame_count += 1
-                else:          self.freeze_frame_count = max(0, self.freeze_frame_count - 2)
-            else:
-                self.motion_history.append(0.0)
-                self.freeze_frame_count = max(0, self.freeze_frame_count - 1)
-        self.prev_gray = gray_frame.copy()
-        if self.freeze_frame_count > self.fps:
-            self.current_state = GameState.TIMEOUT
-            return self.current_state
-        if len(persons) >= 2:
-            cy_list  = [(p[1]+p[3])/2 for p in persons]
-            cx_list  = [(p[0]+p[2])/2 for p in persons]
-            near_line = sum(1 for y in cy_list if y < self.frame_h * 0.4)
-            spread    = float(np.std(cx_list)) / self.frame_w if len(cx_list) > 1 else 0.0
-            if near_line >= 1 and spread > 0.2 and len(persons) <= 5:
-                self.current_state = GameState.FREE_THROW
-                return self.current_state
-        self.current_state = GameState.LIVE_PLAY
-        return self.current_state
-
-    def get_zoom_factor(self) -> float:
-        if self.current_state == GameState.FREE_THROW: return 1.1
-        if self.current_state in (GameState.TIMEOUT, GameState.REPLAY): return 1.0
-        return 1.15
+# REMOVED (dead-code cleanup): GameStateEngine (and the GameState enum it
+# was the sole user of) implemented timeout/free-throw/live-play detection
+# via frame-freeze + player-spread heuristics, but was never instantiated
+# anywhere — the actually-used sports pipeline (_sports_tracking_pass_optimized)
+# relies on SportsPlayPhaseDetector below instead, which is a different,
+# independently-maintained heuristic. Keeping an entire untested,
+# never-exercised class in a sports-critical code path is itself a risk
+# (bugs here would never surface until someone wired it in and hit them
+# for the first time in production) — removed rather than left dormant.
 
 
-# ── Sports Play Phase Detector ────────────────────────────────────────────────
 class SportsPlayPhaseDetector:
     def __init__(self, fps: float) -> None:
         self.fps = fps
@@ -2726,12 +2726,10 @@ def detect_field_of_play(frame: np.ndarray,
     return None
 
 
-def get_court_center_of_mass(field_mask: np.ndarray) -> Optional[Tuple[float, float]]:
-    if field_mask is None: return None
-    m = cv2.moments(field_mask)
-    if m["m00"] == 0: return None
-    return m["m10"] / m["m00"], m["m01"] / m["m00"]
-
+# REMOVED (dead-code cleanup): get_court_center_of_mass() computed a
+# field-mask centroid but was never called — detect_field_of_play()'s
+# output (field_mask) is only ever used directly by the ball-tracking
+# fallback paths, never through this centroid helper.
 
 # ── Optical flow & Saliency ───────────────────────────────────────────────────
 def sports_optical_flow_center(prev: np.ndarray, curr: np.ndarray, w: int, h: int,
@@ -2852,39 +2850,12 @@ def is_scene_change(prev: Optional[np.ndarray], curr: np.ndarray,
 
 
 # ── Sports Event Detector ─────────────────────────────────────────────────────
-class SportsEventDetector:
-    def __init__(self, fps: float = 30.0) -> None:
-        self.fps = fps
-        self.recent_ball_heights: List[float] = []
-        self.event_active    = False
-        self.event_end_frame = 0
-        self._frame_count    = 0
-        self._event_flags:   Dict[int, bool] = {}
-
-    def update(self, ball_box: Optional[Tuple], primary_person: Optional[Tuple],
-               record_frame: Optional[int] = None) -> bool:
-        self._frame_count += 1
-        active = False
-        if self._frame_count < self.event_end_frame:
-            active = True
-        elif ball_box is not None and primary_person is not None:
-            bx1,by1,bx2,by2 = ball_box; px1,py1,px2,py2 = primary_person
-            r = (py1-by1) / max(py2-py1, 1) if py2 > py1 else 0
-            self.recent_ball_heights.append(r)
-            if len(self.recent_ball_heights) > int(self.fps * 0.5):
-                self.recent_ball_heights.pop(0)
-            if (len(self.recent_ball_heights) >= 3 and r < -0.3 and
-                    self.recent_ball_heights[-1] < self.recent_ball_heights[-2]):
-                self.event_end_frame = self._frame_count + SPORTS_EVENT_EXPAND_FRAMES
-                active = True
-        self.event_active = active
-        if record_frame is not None:
-            self._event_flags[record_frame] = active
-        return active
-
-    def event_active_for(self, fi: int) -> bool:
-        return self._event_flags.get(fi, False)
-
+# REMOVED (dead-code cleanup): SportsEventDetector implemented a
+# "shot attempt" heuristic (ball height trending upward-then-down near a
+# player) but was never instantiated anywhere in the sports pipeline —
+# _sports_tracking_pass_optimized has no equivalent concept of a discrete
+# "event" at all. Removed along with the two constants
+# (SPORTS_EVENT_EXPAND_FRAMES/_FACTOR) that existed solely to configure it.
 
 # ── Subject detection ─────────────────────────────────────────────────────────
 DetectionResult = namedtuple("DetectionResult",
@@ -2913,34 +2884,28 @@ def detect_subjects(frame: np.ndarray, model: Any, confidence: float = 0.45,
                     prev_center: Optional[Tuple] = None,
                     prev_ball_carrier: Optional[int] = None,
                     tracking_mode: str = "subject",
-                    _cached_result: Optional[DetectionCache] = None,
-                    det_scale: float = 1.0,   # FIXED: added for correct coord conversion
                     ) -> Tuple[Optional[DetectionResult], Optional[Tuple], int]:
     """
     Returns DetectionResult with coordinates in OrigCoord space.
-    det_scale: ratio of det_frame / orig_frame (used when _cached_result is supplied).
+
+    FIXED (dead code removal): this used to accept an optional
+    `_cached_result: DetectionCache` + `det_scale` pair meant to let a
+    caller pass in already-computed detections instead of running YOLO
+    again. Verified via a full-codebase search that no call site anywhere
+    ever passed `_cached_result` — every real caller always ran the
+    `model is None` / `model(frame, ...)` path below. Removed the branch
+    entirely rather than leave an untested, unreachable code path in a
+    detection-critical function (unreachable code here specifically risks
+    silently diverging from the live path if either one is edited without
+    the other — better to have exactly one path that's actually exercised).
     """
-    if _cached_result is not None:
-        # FIXED: convert from det-space to orig-space using the caller-supplied scale
-        inv = 1.0 / max(det_scale, 1e-6)
-        persons_raw = [
-            (int(p[0]*inv), int(p[1]*inv), int(p[2]*inv), int(p[3]*inv),
-             int((p[0]+p[2])//2*inv), int((p[1]+p[3])//2*inv), 0.5)
-            for p in _cached_result.persons
-        ]
-        balls: List[Tuple] = []
-        if _cached_result.ball_box is not None:
-            bb = _cached_result.ball_box
-            balls = [(int(bb[0]*inv), int(bb[1]*inv), int(bb[2]*inv), int(bb[3]*inv),
-                      int((bb[0]+bb[2])//2*inv), int((bb[1]+bb[3])//2*inv), 0.6)]
-    else:
-        if model is None: return None, None, -1
-        try:
-            results = model(frame, verbose=False, conf=confidence)[0]
-        except Exception as e:
-            logger.warning("Detection error: %s", e); return None, None, -1
-        persons_raw, balls, _ = _parse_yolo_results(
-            results.boxes if results.boxes is not None else [], 1.0, confidence)
+    if model is None: return None, None, -1
+    try:
+        results = model(frame, verbose=False, conf=confidence)[0]
+    except Exception as e:
+        logger.warning("Detection error: %s", e); return None, None, -1
+    persons_raw, balls, _ = _parse_yolo_results(
+        results.boxes if results.boxes is not None else [], 1.0, confidence)
 
     if not persons_raw: return None, None, -1
 
@@ -3952,12 +3917,17 @@ _whisper_model_cache: Dict[str, Any] = {}
 def _get_whisper_model(model_name: str) -> Any:
     """Load (and cache) a Whisper model by name so repeated calls — e.g.
     across every clip in a batch — reuse the same in-memory model instead
-    of reloading it from disk each time."""
-    if model_name not in _whisper_model_cache:
-        import whisper as _w
-        logger.info("Loading Whisper model '%s' (will be cached for reuse)", model_name)
-        _whisper_model_cache[model_name] = _w.load_model(model_name)
-    return _whisper_model_cache[model_name]
+    of reloading it from disk each time.
+
+    FIXED (thread-safety): guarded by the same _cache_lock used for the
+    YOLO/YuNet/Haar caches above — see that comment for why this matters.
+    """
+    with _cache_lock:
+        if model_name not in _whisper_model_cache:
+            import whisper as _w
+            logger.info("Loading Whisper model '%s' (will be cached for reuse)", model_name)
+            _whisper_model_cache[model_name] = _w.load_model(model_name)
+        return _whisper_model_cache[model_name]
 
 
 def _seconds_to_srt_time(s: float) -> str:
@@ -4020,7 +3990,9 @@ def translate_srt(srt_path: str, target_language: str, source_language: str = "a
     if not os.path.exists(srt_path):
         logger.warning("translate_srt: file not found: %s", srt_path)
         return False
-    import re
+    # `re` is now imported at module level (needed there for model-name
+    # validation) — removed the redundant local `import re` that used to
+    # live here.
     try:
         with open(srt_path, "r", encoding="utf-8") as f: content = f.read()
         blocks = re.split(r"\n\n+", content.strip())
@@ -4039,39 +4011,12 @@ def translate_srt(srt_path: str, target_language: str, source_language: str = "a
 
 
 # ── Clip detection ────────────────────────────────────────────────────────────
-def _compute_audio_energy(input_path: str, duration: float,
-                          sample_rate: int = 16000) -> Optional[np.ndarray]:
-    """Extract audio -> compute per-second RMS energy, normalized to [0, 1]."""
-    if not _has_audio(input_path):
-        return None
-    fd, wav_path = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
-    try:
-        if not _extract_audio_wav(input_path, wav_path):
-            return None
-        cmd = ["ffmpeg", "-y", "-i", wav_path, "-f", "s16le", "-acodec", "pcm_s16le",
-               "-ar", str(sample_rate), "-ac", "1", "pipe:1"]
-        r = subprocess.run(cmd, capture_output=True, timeout=120)
-        if r.returncode != 0 or len(r.stdout) < sample_rate * 2:
-            return None
-        pcm = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
-        n_seconds = max(1, int(duration))
-        energy = np.zeros(n_seconds, dtype=np.float32)
-        for i in range(n_seconds):
-            s = i * sample_rate; e = min(s + sample_rate, len(pcm))
-            if s >= len(pcm): break
-            energy[i] = float(np.sqrt(np.mean(pcm[s:e] ** 2)))
-        mx = energy.max()
-        if mx > 0: energy /= mx
-        return energy
-    except Exception as exc:
-        logger.debug("Audio energy extraction failed: %s", exc)
-        return None
-    finally:
-        if os.path.exists(wav_path):
-            try: os.unlink(wav_path)
-            except OSError: pass
-
+# REMOVED (dead-code cleanup): _compute_audio_energy() computed per-second
+# RMS audio loudness, seemingly intended to combine with visual saliency
+# for clip detection, but detect_clips() only ever uses the purely visual
+# _compute_frame_scores() below — this was never wired in. Kept as
+# reference in git history if audio-aware clip scoring is worth building
+# properly later, rather than half-alive here.
 
 def _frame_saliency_score(frame: np.ndarray,
                           prev_frame: Optional[np.ndarray]) -> float:
@@ -4252,18 +4197,37 @@ def _build_analytics(input_path: str, output_path: str, orig_w: int, orig_h: int
 
 
 # ── Shared pipeline setup helper (DRY) ───────────────────────────────────────
-def _get_device(device="auto"):
-    '''Return compute device string for torch operations.'''
-    if device == "auto":
-        if _TORCH_AVAILABLE and torch.cuda.is_available():
-            return "cuda"
-        return "cpu"
-    return device
+# REMOVED (dead-code cleanup): _get_device() (a "cuda"/"cpu" selector for
+# manual torch device placement) and seconds_to_frame() (a trivial
+# int(round(ts*fps)) helper) were both never called anywhere — every
+# timestamp->frame conversion in this file is done inline at each call
+# site instead, and nothing in this module ever explicitly places a torch
+# tensor on a device (ultralytics/whisper manage their own device
+# placement internally). Removing _get_device also removes this module's
+# last use of `torch`/`_TORCH_AVAILABLE`, so that optional import was
+# removed too (see top of file).
 
 
-def seconds_to_frame(ts: float, fps: float) -> int:
-    '''Convert timestamp (seconds) to frame index with rounding.'''
-    return int(round(ts * fps))
+def _frame_truncation_warning(info: Dict[str, Any]) -> Optional[str]:
+    """
+    NEW: user-facing warning when get_video_info's total_frames was capped
+    by MAX_FRAMES_GUARD (a safety limit against pathologically long
+    inputs — e.g. a corrupt duration field or a genuinely multi-hour
+    upload). Without this, such a video would silently render only its
+    first N frames with no indication anywhere why the output is shorter
+    than the source. Returns None when no truncation occurred.
+    """
+    duration = info.get("duration_seconds", 0.0)
+    fps = info.get("fps", 0.0)
+    if duration <= 0 or fps <= 0:
+        return None
+    raw_frames = int(duration * fps)
+    if raw_frames > MAX_FRAMES_GUARD:
+        capped_sec = MAX_FRAMES_GUARD / fps
+        return (f"Source video ({duration:.0f}s) exceeds the internal safety "
+               f"limit of {MAX_FRAMES_GUARD} frames — output was truncated to "
+               f"the first ~{capped_sec:.0f}s.")
+    return None
 
 
 def _common_pipeline_setup(input_path: str, target_preset_label: str,
@@ -4317,19 +4281,36 @@ def _render_video(input_path: str, output_path: str,
                                             else None)
     eff_fps = output_fps or fps
     srt_path: Optional[str] = None
-    if burn_subtitles and whisper_available():
-        fd, srt_path = tempfile.mkstemp(suffix=".srt"); os.close(fd)
-        _p(0.02, "Transcribing...")
-        ok = transcribe_to_srt(input_path, srt_path, whisper_model=whisper_model,
-                               language=whisper_language, max_chars_per_line=subtitle_max_chars,
-                               progress_callback=lambda v, m: _p(0.02+v*0.08, m))
-        if ok and subtitle_translate_to:
-            translate_srt(srt_path, subtitle_translate_to,
-                          progress_callback=lambda v, m: _p(0.10+v*0.03, m))
-        if not ok:
-            try: os.unlink(srt_path)
-            except OSError: pass
-            srt_path = None
+    # NEW: surfaced back to the caller (process_video/process_sports_video/
+    # process_cinematic_video -> their `warnings` list -> ultimately shown
+    # in app.py) when subtitles were requested but couldn't actually be
+    # produced. Previously this failed silently: the output video would
+    # just have no subtitles with zero indication why, which is confusing
+    # given burn_subtitles=True was explicitly requested.
+    subtitle_warning: Optional[str] = None
+    if burn_subtitles:
+        if not whisper_available():
+            subtitle_warning = (
+                "Subtitles were requested but the 'openai-whisper' package is "
+                "not installed on this server — output has no subtitles."
+            )
+        else:
+            fd, srt_path = tempfile.mkstemp(suffix=".srt"); os.close(fd)
+            _p(0.02, "Transcribing...")
+            ok = transcribe_to_srt(input_path, srt_path, whisper_model=whisper_model,
+                                   language=whisper_language, max_chars_per_line=subtitle_max_chars,
+                                   progress_callback=lambda v, m: _p(0.02+v*0.08, m))
+            if ok and subtitle_translate_to:
+                translate_srt(srt_path, subtitle_translate_to,
+                              progress_callback=lambda v, m: _p(0.10+v*0.03, m))
+            if not ok:
+                try: os.unlink(srt_path)
+                except OSError: pass
+                srt_path = None
+                subtitle_warning = (
+                    "Subtitle transcription failed — output has no subtitles "
+                    "despite being requested. Check server logs for details."
+                )
 
     extra_vf       = _build_ffmpeg_vf(color_grade, ffmpeg_sharpen)
     subtitle_style = SUBTITLE_STYLES.get(subtitle_style_name,
@@ -4504,41 +4485,72 @@ def _render_video(input_path: str, output_path: str,
                 if fi % max(1, total_frames//50) == 0:
                     _p(0.15 + ((fi/total_frames) if total_frames > 0 else 0.0)*0.80, f"Rendering {fi}/{total_frames}...")
     finally:
-        # FIXED (issue 2): encoder-close error handling is isolated from
-        # subtitle-file cleanup below. We no longer clean up srt_path inside
-        # this try/except — that happens in a separate, unconditional
-        # finally block immediately after, so it always runs exactly once
-        # regardless of whether _close_ffmpeg_encoder raises, whether a
-        # RuntimeError from a broken pipe is already propagating, or both.
+        # FIXED (real bug, found while wiring the new warnings feature):
+        # the previous version of this cleanup lived as plain code
+        # textually AFTER this try/finally statement, with a comment
+        # claiming it "always executes... including when the render loop
+        # raised". That claim was actually wrong: in Python, code after a
+        # try/finally is skipped entirely whenever an exception is still
+        # propagating once the finally block finishes (verified directly:
+        # a minimal repro shows the line after the block never executes on
+        # the exception path). The practical effect was the exact opposite
+        # of the intended fix — a failed render LEAKED the temp .srt file
+        # indefinitely, while a *successful* render deleted it right
+        # before an unconditional `return {}` that never included it
+        # anyway. Net result: the "download subtitles" feature has never
+        # actually returned a usable path to any caller. Fixed by moving
+        # the decision inside this finally block, keyed off whether any
+        # exception is currently propagating — clean up only on the
+        # failure path; hand the path back to the caller on success
+        # instead of deleting it (the caller is responsible for reading it
+        # into bytes and deleting it once done, exactly as app.py's
+        # existing subtitle-handling code already assumed).
+        #
+        # FIXED (second, separate bug found while verifying the above):
+        # `sys.exc_info()` INSIDE an `except ProcessingError as _e:` block
+        # always reflects that just-caught exception itself — never the
+        # enclosing scope's exception state — so the previous version's
+        # `_active_exc = sys.exc_info()[1]` check *inside* the except
+        # block was always truthy (it was always seeing `_e`), meaning the
+        # `else: _enc_error = _e` branch could never run. Net effect: a
+        # genuine encoder failure (e.g. empty/corrupt output) with NO
+        # render-loop error already active was silently logged and
+        # swallowed instead of raised — a real encode failure would be
+        # reported back to the caller as success. Fixed by capturing the
+        # enclosing exception state ONCE, at the very top of this finally
+        # block, *before* entering the nested try/except — verified
+        # empirically that this capture point (and only this one) correctly
+        # reflects "was some other exception already propagating" rather
+        # than the nested block's own exception.
+        _outer_exc = sys.exc_info()[1]
         _enc_error: Optional[Exception] = None
         try:
             _close_ffmpeg_encoder(enc, output_path)
         except ProcessingError as _e:
-            # Only raise "empty output" if we actually wrote zero frames AND
-            # no other exception is active. Otherwise preserve the original error.
-            import sys
-            _active_exc = sys.exc_info()[1]
-            if _active_exc is not None:
-                # An exception is already active (e.g., RuntimeError from BrokenPipeError)
-                # Log the encoder error but don't mask the original
+            if _outer_exc is not None:
+                # A render-loop exception is already propagating (e.g. the
+                # BrokenPipeError -> RuntimeError above); log the encoder
+                # failure too, but don't mask the original error with it.
                 logger.error("Encoder also failed: %s", _e)
             else:
                 _enc_error = _e
+        _will_raise = _enc_error is not None or _outer_exc is not None
+        if _will_raise and srt_path and os.path.exists(srt_path):
+            try:
+                os.unlink(srt_path)
+            except OSError:
+                pass
         if _enc_error:
             raise _enc_error
 
-    # FIXED (issue 2): unconditional subtitle temp-file cleanup, split out of
-    # the encoder try/except above so it always executes — including when
-    # the render loop raised (BrokenPipeError -> RuntimeError) *and* the
-    # encoder close also raised. Without this separation, a broken pipe
-    # could leave the .srt tempfile behind indefinitely.
-    if srt_path and os.path.exists(srt_path):
-        try:
-            os.unlink(srt_path)
-        except OSError:
-            pass
-
-    return {}
+    # Reaching this point means no exception propagated out of the block
+    # above — a genuine success. Hand the subtitle path back to the
+    # caller rather than deleting it: process_video/process_sports_video/
+    # process_cinematic_video forward it as meta["subtitle_path"], and
+    # app.py reads it into bytes for the "Download subtitles (.srt)"
+    # button before deleting it itself.
+    return {"subtitle_path": srt_path if (srt_path and os.path.exists(srt_path)) else None,
+            "subtitle_warning": subtitle_warning}
 
 
 # ── First-pass tracking ───────────────────────────────────────────────────────
@@ -5450,9 +5462,20 @@ def process_cinematic_video(
     def _p(v, msg=""):
         progress_callback and progress_callback(v, msg)
 
+    # FIXED (critical, defense-in-depth): see _validate_model_names docstring.
+    _validate_model_names(whisper_model if burn_subtitles else None, yolo_weights)
+
     cfg = cinematic_config or CinematicConfig()
     (info, orig_w, orig_h, out_w, out_h, fps, total_frames,
      model, res_mon) = _common_pipeline_setup(input_path, target_preset_label, yolo_weights, load_model=True)
+    # NEW: user-facing warnings collected across the pipeline and returned
+    # in the final meta dict (see _frame_truncation_warning /
+    # _render_video's subtitle_warning) instead of only ever reaching a
+    # server log that the end user never sees.
+    warnings: List[str] = []
+    trunc_warning = _frame_truncation_warning(info)
+    if trunc_warning:
+        warnings.append(trunc_warning)
     crop_w, crop_h = calculate_crop_dims(orig_w, orig_h, out_w, out_h)
     if vignette_strength is None:
         vignette_strength = cfg.default_vignette_strength
@@ -5509,8 +5532,10 @@ def process_cinematic_video(
         "cinematic_actor_frames": int(mode_counts.get("cinematic_actor", 0)),
         "cinematic_saliency_frames": int(mode_counts.get("cinematic_saliency", 0)),
     })
+    if render_meta.get("subtitle_warning"):
+        warnings.append(render_meta["subtitle_warning"])
     return {"analytics": analytics, "subtitle_path": render_meta.get("subtitle_path"),
-            "thumbnails": thumbnail_jpegs}
+            "thumbnails": thumbnail_jpegs, "warnings": warnings}
 
 # ── process_video — main public API ──────────────────────────────────────────
 def process_video(input_path: str, output_path: str,
@@ -5527,12 +5552,16 @@ def process_video(input_path: str, output_path: str,
                   subtitle_max_chars: int = 42, subtitle_translate_to: Optional[str] = None,
                   color_grade: str = "none", vignette_strength: float = 0.0,
                   sharpen_strength: float = 0.0, ffmpeg_sharpen: bool = False,
-                  ken_burns: bool = False, use_kalman: bool = False,
+                  use_kalman: bool = False,
                   panel_config: Optional[PanelModeConfig] = None,
                   generate_thumbs: bool = True,
                   thumbnail_count: int = THUMBNAIL_MIN_COUNT,
                   progress_callback=None) -> Dict[str, Any]:
     def _p(v, msg=""): progress_callback and progress_callback(v, msg)
+    # FIXED (critical, defense-in-depth): reject unsafe whisper_model /
+    # yolo_weights before anything else runs. See _validate_model_names
+    # docstring for the full rationale.
+    _validate_model_names(whisper_model if burn_subtitles else None, yolo_weights)
     if tracking_mode in ("cinematic", "cinematic_mode"):
         return process_cinematic_video(
             input_path=input_path,
@@ -5565,6 +5594,11 @@ def process_video(input_path: str, output_path: str,
         yolo_weights if tracking_mode != "talking_head" else "",
         load_model=(tracking_mode != "talking_head"),
     )
+    # NEW: see process_cinematic_video for the rationale.
+    warnings: List[str] = []
+    trunc_warning = _frame_truncation_warning(info)
+    if trunc_warning:
+        warnings.append(trunc_warning)
     crop_w, crop_h = calculate_crop_dims(orig_w, orig_h, out_w, out_h)
     panel_config      = panel_config or PanelModeConfig()
     use_panel_mode = False
@@ -5619,8 +5653,10 @@ def process_video(input_path: str, output_path: str,
         smooth_metrics=smooth_metrics, panel_mode=use_panel_mode,
         kalman_predictions=smooth_metrics.get("kalman_prediction_frames", 0),
         resource_stats=res_mon.get_stats())
+    if render_meta.get("subtitle_warning"):
+        warnings.append(render_meta["subtitle_warning"])
     return {"analytics": analytics, "subtitle_path": render_meta.get("subtitle_path"),
-            "thumbnails": thumbnail_jpegs}
+            "thumbnails": thumbnail_jpegs, "warnings": warnings}
 
 
 # ── process_sports_video — optimized sports pipeline ─────────────────────────
@@ -5648,10 +5684,17 @@ def process_sports_video(input_path: str, output_path: str,
                          thumbnail_count: int = THUMBNAIL_MIN_COUNT,
                          progress_callback=None) -> Dict[str, Any]:
     def _p(v, msg=""): progress_callback and progress_callback(v, msg)
+    # FIXED (critical, defense-in-depth): see _validate_model_names docstring.
+    _validate_model_names(whisper_model if burn_subtitles else None, yolo_weights)
 
     (info, orig_w, orig_h, out_w, out_h, fps, total_frames,
      model, res_mon) = _common_pipeline_setup(
         input_path, target_preset_label, yolo_weights)
+    # NEW: see process_cinematic_video for the rationale.
+    warnings: List[str] = []
+    trunc_warning = _frame_truncation_warning(info)
+    if trunc_warning:
+        warnings.append(trunc_warning)
     crop_w, crop_h = calculate_crop_dims(orig_w, orig_h, out_w, out_h)
 
     sample_frame = _read_frame_at(input_path, orig_w, orig_h, 2.0)
@@ -5718,8 +5761,10 @@ def process_sports_video(input_path: str, output_path: str,
         input_path, output_path, orig_w=orig_w, orig_h=orig_h,
         out_w=out_w, out_h=out_h, smooth_metrics=final_smooth_metrics,
         panel_mode=False, resource_stats=res_mon.get_stats())
+    if render_meta.get("subtitle_warning"):
+        warnings.append(render_meta["subtitle_warning"])
     return {"analytics": analytics, "subtitle_path": render_meta.get("subtitle_path"),
-            "thumbnails": thumbnail_jpegs}
+            "thumbnails": thumbnail_jpegs, "warnings": warnings}
 
 
 # ── process_clips_batch ───────────────────────────────────────────────────────
@@ -5748,6 +5793,10 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
                         thumbnail_count: int = THUMBNAIL_MIN_COUNT,
                         progress_callback=None) -> List[Dict[str, Any]]:
     def _p(v, msg=""): progress_callback and progress_callback(v, msg)
+    # FIXED (critical, defense-in-depth): fail fast, before trimming any
+    # clips, rather than discovering an unsafe whisper_model/yolo_weights
+    # value partway through a batch. See _validate_model_names docstring.
+    _validate_model_names(whisper_model if burn_subtitles else None, yolo_weights)
     os.makedirs(output_dir, exist_ok=True)
     results: List[Dict[str, Any]] = []; n = len(clips)
     for i, clip in enumerate(clips):
@@ -5759,7 +5808,8 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
                          crf=crf, preset=encoder_preset)
         if not ok:
             results.append({"clip": clip, "output_path": None,
-                            "error": "Trim failed", "analytics": {}, "thumbnail_paths": []})
+                            "error": "Trim failed", "analytics": {}, "thumbnail_paths": [],
+                            "warnings": []})
             if os.path.exists(trim_path):
                 try: os.unlink(trim_path)
                 except OSError: pass
@@ -5815,11 +5865,13 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
                 n=max(THUMBNAIL_MIN_COUNT, thumbnail_count)) if generate_thumbs else []
             results.append({"clip": clip, "output_path": out_path,
                             "analytics": meta.get("analytics", {}),
-                            "thumbnail_paths": thumb_paths})
+                            "thumbnail_paths": thumb_paths,
+                            "warnings": meta.get("warnings", [])})
         except Exception as e:
             logger.error("[batch] Clip %d error: %s", i+1, e)
             results.append({"clip": clip, "output_path": None,
-                            "error": str(e), "analytics": {}, "thumbnail_paths": []})
+                            "error": str(e), "analytics": {}, "thumbnail_paths": [],
+                            "warnings": []})
         finally:
             if os.path.exists(trim_path):
                 try: os.unlink(trim_path)
@@ -5827,18 +5879,13 @@ def process_clips_batch(input_path: str, output_dir: str, clips: List[ClipSegmen
     _p(1.0, f"Batch done: {sum(1 for r in results if not r.get('error'))}/{n} clips")
     return results
 
-# --- Processor architecture ---------------------------------------------------------
-class VerticalProcessor:
-    '''High-level API wrapper for batch/queued processing.'''
-    def __init__(self):
-        self.audio_cache = {}
-        self.model_cache = {}
-
-    def process_video(self, *args, **kwargs):
-        return process_video(*args, **kwargs)
-
-    def process_sports_video(self, *args, **kwargs):
-        return process_sports_video(*args, **kwargs)
-
-    def process_cinematic_video(self, *args, **kwargs):
-        return process_cinematic_video(*args, **kwargs)
+# REMOVED (dead-code cleanup): VerticalProcessor was a thin class wrapper
+# around the module-level process_video/process_sports_video/
+# process_cinematic_video functions — its methods did nothing but forward
+# args/kwargs to those functions unchanged, and the `audio_cache`/
+# `model_cache` attributes it declared were never populated or read by
+# anything (the real caches — _model_cache, _whisper_model_cache, etc. —
+# are module-level, not per-instance). No caller anywhere (app.py,
+# main.py, worker.py) ever instantiated this class; every real caller
+# already uses the module-level functions directly, which is also the
+# documented public API in README.md.
