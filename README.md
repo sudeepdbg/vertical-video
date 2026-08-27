@@ -13,6 +13,25 @@ Two entry points:
   It has no Streamlit dependency and can be imported/used standalone (see
   [Using the engine directly](#using-the-engine-directly)).
 
+Optionally, an async API layer for offloading heavy jobs off the request
+path:
+
+- **`api/main.py`** — a FastAPI service exposing `/upload`, `/jobs`, and
+  `/jobs/{job_id}`, backed by S3 (uploads/outputs), SQS (job queue), and
+  DynamoDB (job status).
+- **`api/worker.py`** — a long-running SQS consumer that downloads the
+  uploaded video, runs it through `verticalize.py`, uploads the result,
+  and writes back a presigned download URL + status.
+
+**Security note:** job configuration submitted through `/jobs` is validated
+against a strict allowlist (`JobConfigIn` in `main.py`) before it ever
+reaches SQS, and independently re-validated in `worker.py` before being
+passed to `verticalize.py` — neither layer trusts client input to name a
+Whisper model or YOLO weights file, since those ultimately reach model
+loaders that can be pointed at a filesystem path. See the module docstring
+at the top of `main.py` for the full rationale, and the v8.1 changelog
+entry below.
+
 ---
 
 ## Features
@@ -222,6 +241,118 @@ sports; `cinematic_config` for cinematic).
 ---
 
 ## Changelog (recent fixes)
+
+**v5.3** (`app.py`) — output/thumbnail UI redesign:
+- The `.rf-thumb-strip` CSS class (fixed-width, bordered, rounded thumbnail
+  tiles) was written earlier but never actually used — thumbnail rendering
+  used `st.columns()` + `st.image(width="stretch")` instead, which
+  stretched each 9:16 thumbnail to fill its column width, looking squished
+  and distorted rather than like clean preview cards. Thumbnails now render
+  via a small `_thumb_strip_html()` helper (base64-embedded `<img>` tags)
+  that actually uses that CSS, at a fixed, correctly-proportioned size.
+- Thumbnails are now tucked into a collapsed `st.expander` (single-clip
+  mode: below the analytics card; Auto-Clip mode: at the bottom of each
+  clip card, after Play/Download) instead of always being shown inline.
+  They're a secondary/optional utility (cover images for social platforms),
+  not core output, and showing them expanded by default — especially per
+  clip across an entire Auto-Clip batch — was the main source of visual
+  clutter.
+- Removed the individual per-thumbnail download buttons (up to 3-4 extra
+  buttons per section) in favor of a single "download all (.zip)" button;
+  individual images remain right-click-saveable directly from the
+  rendered strip, which is standard browser behavior.
+- The primary single-clip output video previously had no size constraint
+  (unlike the small preview player used elsewhere, `.rf-vplayer`, which was
+  deliberately boxed to 202×360px) — a 9:16 video in a wide desktop column
+  could render very tall, pushing everything else far down the page. Added
+  a matching `.rf-output-player` class (capped height, centered, subtle
+  shadow) so the main output gets the same disciplined sizing treatment.
+
+**v8.1** — critical security fix (`api/main.py` + `api/worker.py`) and a
+major hardening/cleanup pass on `verticalize.py`:
+
+- **Critical, fixed**: `main.py` used to accept an arbitrary client-supplied
+  `config` dict and forward it unmodified through SQS into
+  `verticalize.process_video(**config)` on the worker. Two reachable
+  parameters — `whisper_model` and `yolo_weights` — are ultimately passed
+  to model loaders (`whisper.load_model()`, `ultralytics.YOLO()`) that
+  accept either a registered name or an arbitrary filesystem
+  path/URL. Since the worker downloads client-uploaded files to a
+  **predictable path** (`/tmp/{job_id}_in.mp4`), a client could upload an
+  arbitrary file and then ask the pipeline to "load" it as a model
+  checkpoint. Closed with **three independent layers**, each verified with
+  the exact attack payload:
+  1. `main.py`'s `JobConfigIn` — a strict Pydantic allowlist
+     (`extra="forbid"`, closed `Literal` sets, numeric bounds).
+     `whisper_model`/`yolo_weights` are not client-settable fields at all.
+  2. `worker.py`'s `_sanitize_config()` — re-applies the same allowlist
+     independently, in case anything ever reaches the queue without going
+     through `main.py`.
+  3. `verticalize.py`'s `_validate_model_names()` — runs at the top of
+     every public entry point (`process_video`, `process_sports_video`,
+     `process_cinematic_video`, `process_clips_batch`) and rejects
+     anything that isn't a real Whisper model name or a bare `*.pt`
+     filename, regardless of what called it.
+- `worker.py` reliability fixes: temp file cleanup now runs in `finally`
+  (previously any exception — bad download, processing crash, upload
+  failure — leaked the downloaded input/output in `/tmp` forever); added
+  an SQS visibility-timeout heartbeat so long jobs can't be silently
+  redelivered and processed twice; failed jobs are no longer
+  unconditionally deleted from the queue (let the queue's own redrive
+  policy handle retry/DLQ instead of masking every failure as
+  identical-and-final).
+- `main.py`: sanitizes uploaded filenames before using them in S3 keys;
+  validates `job_id` shape; returns a clean 409 instead of an unhandled
+  500 when an item is missing `s3_key`.
+- **`verticalize.py` thread-safety**: all lazily-populated module-level
+  caches (YOLO, YuNet, Haar cascade, Whisper, vignette masks, sharpen
+  kernels, color-grade LUTs) are now guarded by locks. Previously a
+  "check dict, then populate dict" pattern with no locking — safe only if
+  this module is never used from more than one thread at a time, which
+  isn't guaranteed once anything (e.g. a multi-session Streamlit server)
+  calls into it concurrently. Verified with a 12–16 thread concurrent
+  stress test hammering all caches simultaneously — zero errors.
+- **Two more real bugs found and fixed** while wiring a new warnings
+  feature (below), both in `_render_video`'s subtitle-file handling:
+  1. Code that was supposed to run "unconditionally" actually only ran on
+     the success path (Python skips code after a `try/finally` once an
+     exception is propagating) — so a failed render leaked the temp
+     `.srt` file, and a successful render deleted it right before an
+     unconditional `return {}` that never returned it anyway. Net effect:
+     the "download subtitles" feature had never actually worked.
+  2. Separately, `sys.exc_info()` checked from *inside* an
+     `except ProcessingError as _e:` block always reflects that exception
+     itself, never whatever else might be propagating from the enclosing
+     scope — so a genuine encoder failure (e.g. empty output) with no
+     other error active was being silently logged and swallowed instead
+     of raised, meaning a failed encode could be reported back as
+     success. Both verified with targeted control-flow repros covering
+     all 4 success/failure combinations before and after the fix.
+- **New: non-fatal processing warnings.** `process_video`,
+  `process_sports_video`, `process_cinematic_video`, and
+  `process_clips_batch` now return a `warnings: List[str]` — covering
+  subtitles requested but not produced (Whisper missing or transcription
+  failed) and source videos truncated by the internal `MAX_FRAMES_GUARD`
+  safety limit — instead of these conditions only ever reaching a server
+  log the end user never sees. `app.py` now displays them.
+- Removed the dead `_cached_result`/`det_scale` branch from
+  `detect_subjects()` (verified zero callers ever used it).
+- **Dead-code audit**: systematically checked every top-level
+  function/class against actual usage across the whole codebase (plus a
+  check for dynamic/reflective references) and removed 12 confirmed-dead
+  items, cutting real complexity out of a 5,800+ line file:
+  `PyAVVideoReader` (+ the `av`/`torch` optional imports that existed
+  solely to support it and `_get_device`), `yolo_available()`,
+  `apply_ken_burns()` **and** the `ken_burns` parameter it was meant to
+  back (which silently did nothing — a worse problem than plain dead
+  code, since a caller could reasonably expect it to work),
+  `extract_thumbnail()` (superseded by `generate_thumbnails`),
+  `GameStateEngine` + the `GameState` enum, `get_court_center_of_mass()`,
+  `SportsEventDetector` (+ 2 related constants), `_compute_audio_energy()`,
+  `_get_device()`, `seconds_to_frame()`, and `VerticalProcessor`. Verified
+  with a full regression suite (all 3 process_* entry points, the cache
+  concurrency stress test, and explicit assertions that all 12 removed
+  symbols are gone) — zero regressions.
 
 **v8.0** (backend, `verticalize.py`) — Sports ball-tracking evaluation and fixes:
 - **`expected_ball_area` was never reset on scene cuts.** `ball_size_history`
